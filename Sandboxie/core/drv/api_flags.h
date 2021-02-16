@@ -1,5 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
+ * Copyright 2020-2021 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -40,7 +41,7 @@
 #define DUPLICATE_INHERIT           0x00040000
 #define DUPLICATE_INTO_OTHER        0x00080000  // otherwise DUP_FROM_OTHER
 
-
+#define MONITOR_SYSCALL				0x000B
 #define MONITOR_PIPE                0x011B
 #define MONITOR_IPC                 0x022B
 #define MONITOR_WINCLASS            0x033B
@@ -48,10 +49,18 @@
 #define MONITOR_COMCLASS            0x055B
 #define MONITOR_IGNORE              0x066B
 #define MONITOR_IMAGE               0x077B
-#define MONITOR_FILE_OR_KEY         0x088B
-#define MONITOR_OTHER				0x099B
+#define MONITOR_FILE                0x088B
+#define MONITOR_KEY					0x099B
+#define MONITOR_OTHER				0x0AAB
+//#define MONITOR_					0x0BBB
+//#define MONITOR_					0x0CCB
+//#define MONITOR_					0x0DDB
+//#define MONITOR_					0x0EEB
+//#define MONITOR_					0x0FFB
 #define MONITOR_OPEN                0x1000
 #define MONITOR_DENY                0x2000
+//#define MONITOR_					0x4000
+#define MONITOR_TRACE               0x8000
 
 
 #define DISABLE_JUST_THIS_PROCESS   0x0123ABC0

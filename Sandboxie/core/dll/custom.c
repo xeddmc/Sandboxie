@@ -1,5 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
+ * Copyright 2020-2021 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -22,6 +23,7 @@
 
 #include "dll.h"
 #include "common/my_version.h"
+#include "core/svc/SbieIniWire.h"
 #include <stdio.h>
 
 
@@ -155,7 +157,7 @@ _FX UCHAR GetSetCustomLevel(UCHAR SetLevel)
 
         if (! NT_SUCCESS(status)) {
             value_info.Data[0] = 0;
-            Sbie_swprintf(path, L"%d [%08X]", -2, status);
+            Sbie_snwprintf(path, 256, L"%d [%08X]", -2, status);
             SbieApi_Log(2206, path);
         }
 
@@ -174,7 +176,7 @@ _FX UCHAR GetSetCustomLevel(UCHAR SetLevel)
 
         if (! NT_SUCCESS(status)) {
 
-            Sbie_swprintf(path, L"%d [%08X]", -3, status);
+            Sbie_snwprintf(path, 256, L"%d [%08X]", -3, status);
             SbieApi_Log(2206, path);
         }
     }
@@ -231,7 +233,7 @@ _FX BOOLEAN Custom_CreateRegLinks(void)
     }
 
     if (! NT_SUCCESS(status)) {
-        Sbie_swprintf(err, L"[11 / %08X]", status);
+        Sbie_snwprintf(err, 64, L"[11 / %08X]", status);
         SbieApi_Log(2326, err);
         return FALSE;
     }
@@ -255,7 +257,7 @@ _FX BOOLEAN Custom_CreateRegLinks(void)
 
     } else if (status != STATUS_OBJECT_NAME_COLLISION) {
 
-        Sbie_swprintf(err, L"[22 / %08X]", status);
+		Sbie_snwprintf(err, 64, L"[22 / %08X]", status);
         SbieApi_Log(2326, err);
         NtClose(hkey1);
         return FALSE;
@@ -273,7 +275,7 @@ _FX BOOLEAN Custom_CreateRegLinks(void)
     NtClose(hkey1);
 
     if (! NT_SUCCESS(status)) {
-        Sbie_swprintf(err, L"[33 / %08X]", status);
+		Sbie_snwprintf(err, 64, L"[33 / %08X]", status);
         SbieApi_Log(2326, err);
     }
 
@@ -312,7 +314,7 @@ _FX BOOLEAN DisableDCOM(void)
         if (status != STATUS_BAD_INITIAL_PC &&
             status != STATUS_OBJECT_NAME_NOT_FOUND) {
 
-            Sbie_swprintf(err, L"[21 / %08X]", status);
+			Sbie_snwprintf(err, 64, L"[21 / %08X]", status);
             SbieApi_Log(2309, err);
         }
 
@@ -322,7 +324,7 @@ _FX BOOLEAN DisableDCOM(void)
         RtlInitUnicodeString(&objname, L"EnableDCOM");
         status = NtSetValueKey(handle, &objname, 0, REG_SZ, &no, sizeof(no));
         if (! NT_SUCCESS(status)) {
-            Sbie_swprintf(err, L"[22 / %08X]", status);
+			Sbie_snwprintf(err, 64, L"[22 / %08X]", status);
             SbieApi_Log(2309, err);
         }
 
@@ -853,7 +855,7 @@ _FX void AutoExec(void)
 
     status = SbieApi_EnumProcess(Dll_BoxName, (ULONG *)buf1);
     if (status != 0) {
-        Sbie_swprintf(error_str, L"%d [%08X]", -1, status);
+        Sbie_snwprintf(error_str, 16, L"%d [%08X]", -1, status);
         SbieApi_Log(2206, error_str);
         Dll_Free(buf1);
         return;
@@ -906,7 +908,7 @@ _FX void AutoExec(void)
                 SbieDll_ExpandAndRunProgram(buf2);
 
             } else {
-                Sbie_swprintf(error_str, L"%d [%08X]", index, status);
+                Sbie_snwprintf(error_str, 16, L"%d [%08X]", index, status);
                 SbieApi_Log(2206, error_str);
             }
         }
@@ -1472,4 +1474,112 @@ _FX void Custom_Load_UxTheme(void)
             SystemParametersInfo(SPI_GETFONTSMOOTHING, 0, &v, 0);
         }
     }
+}
+
+
+
+//---------------------------------------------------------------------------
+// SbieDll_MatchImage
+//---------------------------------------------------------------------------
+
+
+BOOLEAN SbieDll_MatchImage_Impl(const WCHAR* pat_str, ULONG pat_len, const WCHAR* test_str, const WCHAR* BoxName, ULONG depth)
+{
+    if (*pat_str == L'<') {
+
+        ULONG index;
+        WCHAR buf[CONF_LINE_LEN];
+
+        if (depth >= 6)
+            return FALSE;
+
+        for (index = 0; ; ++index) {
+
+            //
+            // get next process group setting, compare to passed group name.
+            // if the setting is <passed_group_name>= then we accept it.
+            //
+
+            NTSTATUS status = SbieApi_QueryConfAsIs(
+                BoxName, L"ProcessGroup", index, buf, CONF_LINE_LEN * sizeof(WCHAR));
+            if (!NT_SUCCESS(status))
+                break;
+            WCHAR* value = buf;
+
+            ULONG value_len = wcslen(value);
+            if (value_len <= pat_len + 1)
+                continue;
+            if (_wcsnicmp(value, pat_str, pat_len) != 0)
+                continue;
+
+            value += pat_len;
+            if (*value != L',')
+                continue;
+            ++value;
+
+            //
+            // value now points at the comma-separated
+            // list of processes in this process group
+            //
+
+            while (*value) {
+                WCHAR* ptr = wcschr(value, L',');
+                if (ptr)
+                    value_len = (ULONG)(ULONG_PTR)(ptr - value);
+                else
+                    value_len = wcslen(value);
+
+                if (value_len) {
+
+                    if (SbieDll_MatchImage_Impl(value, value_len, test_str, BoxName, depth + 1))
+                        return TRUE;
+                }
+
+                value += value_len;
+                while (*value == L',')
+                    ++value;
+            }
+        }
+
+    }
+    else {
+
+        ULONG test_len = wcslen(test_str);
+        if (test_len == pat_len)
+            return (_wcsnicmp(test_str, pat_str, test_len) == 0);
+
+    }
+
+    return FALSE;
+}
+
+
+BOOLEAN SbieDll_MatchImage(const WCHAR* pat_str, const WCHAR* test_str, const WCHAR* BoxName)
+{
+    ULONG pat_len = wcslen(pat_str);
+    return SbieDll_MatchImage_Impl(pat_str, pat_len, test_str, BoxName, 1);
+}
+
+
+//---------------------------------------------------------------------------
+// CheckStringInList
+//---------------------------------------------------------------------------
+
+
+BOOLEAN SbieDll_CheckStringInList(const WCHAR* string, const WCHAR* boxname, const WCHAR* setting)
+{
+    WCHAR buf[66];
+    ULONG index = 0;
+    while (1) {
+        NTSTATUS status = SbieApi_QueryConfAsIs(boxname, setting, index, buf, 64 * sizeof(WCHAR));
+        ++index;
+        if (NT_SUCCESS(status)) {
+            if (_wcsicmp(buf, string) == 0) {
+                return TRUE;
+            }
+        }
+        else if (status != STATUS_BUFFER_TOO_SMALL)
+            break;
+    }
+    return FALSE;
 }

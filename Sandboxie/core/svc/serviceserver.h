@@ -1,5 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
+ * Copyright 2020-2021 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -53,8 +54,10 @@ public:
 
 private:
 
-    bool CanCallerDoElevation(
+    static bool CanCallerDoElevation(
             HANDLE idProcess, const WCHAR *ServiceName, ULONG *pSessionId);
+
+    static bool CanAccessSCM(HANDLE idProcess);
 
     static void ReportError2218(HANDLE idProcess, ULONG errlvl);
 
@@ -65,11 +68,9 @@ private:
     MSG_HEADER *RunHandler(MSG_HEADER *msg, HANDLE idProcess);
 
     ULONG RunHandler2(
-        HANDLE idProcess, ULONG idSession,
+        HANDLE idProcess, ULONG idSession, ULONG type,
         const WCHAR *devmap, const WCHAR *svcname, const WCHAR *path);
-
-    void SetTokenDefaultDacl(HANDLE hNewToken, HANDLE idProcess);
-
+	
     MSG_HEADER *UacHandler(
         MSG_HEADER *msg, HANDLE idProcess, HANDLE idThread);
 

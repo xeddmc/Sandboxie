@@ -1,5 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
+ * Copyright 2020-2021 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -28,6 +29,7 @@
 #include "common/win32_ntddk.h"
 #include "core/svc/ServiceWire.h"
 #include "common/my_version.h"
+#include "../../apps/com/header.h" //SC_HANDLE_...
 
 
 //---------------------------------------------------------------------------
@@ -847,12 +849,11 @@ _FX BOOL Scm_CloseServiceHandle(SC_HANDLE hSCObject)
 _FX WCHAR *Scm_GetHandleName(SC_HANDLE hService)
 {
     WCHAR *name = NULL;
-	// fix-me: refactory include of SC_HANDLE_
-	if (hService == /*SC_HANDLE_RPCSS*/((SC_HANDLE)0x12345672))
+	if (hService == SC_HANDLE_RPCSS)
 		return L"RpcSs";
-	if (hService == /*SC_HANDLE_MSISERVER*/((SC_HANDLE)0x12345673))
+	if (hService == SC_HANDLE_MSISERVER)
 		return L"MSIServer";
-	if (hService == /*SC_HANDLE_EVENTSYSTEM*/((SC_HANDLE)0x12345674))
+	if (hService == SC_HANDLE_EVENTSYSTEM)
 		return L"EventSystem";
     __try {
         if (hService && *(ULONG *)hService == tzuk)
@@ -886,6 +887,9 @@ _FX BOOLEAN Scm_IsBoxedService(const WCHAR *ServiceName)
     }
 
     Dll_Free(names);
+
+    if (SbieDll_CheckStringInList(ServiceName, NULL, L"SandboxService"))
+        found = TRUE;
 
     /*
     if (_wcsicmp(ServiceName, _eventsystem) == 0) {
