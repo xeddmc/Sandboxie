@@ -24,38 +24,7 @@
 #include <windows.h>
 #include "core/svc/IpHlpWire.h"
 #include "dll.h"
-
-
-//---------------------------------------------------------------------------
-// Structures and Types
-//---------------------------------------------------------------------------
-
-
-typedef USHORT ADDRESS_FAMILY;
-
-typedef struct {
-    union {
-        struct {
-            ULONG Zone : 28;
-            ULONG Level : 4;
-        };
-        ULONG Value;
-    };
-} SCOPE_ID, *PSCOPE_ID;
-
-typedef struct sockaddr_in6 {
-    ADDRESS_FAMILY sin6_family; // AF_INET6.
-    USHORT sin6_port;           // Transport level port number.
-    ULONG  sin6_flowinfo;       // IPv6 flow information.
-    IN6_ADDR sin6_addr;         // IPv6 address.
-    union {
-        ULONG sin6_scope_id;     // Set of interfaces for a scope.
-        SCOPE_ID sin6_scope_struct;
-    };
-} SOCKADDR_IN6_LH, *PSOCKADDR_IN6_LH, FAR *LPSOCKADDR_IN6_LH;
-
-typedef void (*PIPFORWARD_CHANGE_CALLBACK)
-    (void *CallerContext, void *Row, ULONG NotificationType);
+#include "common/my_wsa.h"
 
 
 //---------------------------------------------------------------------------
@@ -221,7 +190,7 @@ _FX BOOLEAN IpHlp_Init(HMODULE module)
     void *NotifyRouteChange2;
     void *CancelMibChangeNotify2;
 
-    if (Dll_OsBuild < 6000) {
+    if (Dll_CompartmentMode || Dll_OsBuild < 6000) { // in compartment mode we have a full token so no need to hook anything here
 
         //
         // earlier than Windows Vista, don't hook
@@ -478,7 +447,9 @@ _FX ULONG IpHlp_CommonSend(         ULONG_PTR IcmpHandle,
     req->h.length = len;
     req->h.msgid = MSGID_IPHLP_SEND_ECHO;
 
+#ifndef _WIN64
     req->iswow64 = Dll_IsWow64;
+#endif
 
     req->ip6 = ip6;
     req->ex2 = ex2;
@@ -526,17 +497,12 @@ _FX ULONG IpHlp_CommonSend(         ULONG_PTR IcmpHandle,
 
     error = rpl->h.status;
 
-    if (error != ERROR_SUCCESS)
-        len = 0;
-    else {
+    len = rpl->reply_size;
+    if (len > ReplySize)
+        len = ReplySize;
+    memcpy(ReplyBuffer, rpl->reply_data, len);
 
-        len = rpl->reply_size;
-        if (len > ReplySize)
-            len = ReplySize;
-        memcpy(ReplyBuffer, rpl->reply_data, len);
-
-        len = rpl->num_replies;
-    }
+    len = rpl->num_replies;
 
     Dll_Free(rpl);
 
@@ -564,10 +530,12 @@ _FX ULONG IpHlp_CommonSend(         ULONG_PTR IcmpHandle,
 
     if ((! error) && Event) {
         ((ICMP_ECHO_REPLY *)ReplyBuffer)->Reserved = (USHORT)len;
-        len = 0;
         error = ERROR_IO_PENDING;
         SetEvent(Event);
     }
+	
+    if (error != ERROR_SUCCESS)
+        len = 0;
 
     SetLastError(error);
     return len;

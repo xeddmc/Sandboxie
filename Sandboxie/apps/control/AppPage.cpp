@@ -1,5 +1,5 @@
 /*
- * Copyright 2004-2020 Sandboxie Holdings, LLC 
+ * Copyright 2004-2020 Sandboxie Holdings, LLC
  * Copyright 2020-2021 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
@@ -545,16 +545,19 @@ void CAppPage::Template_Filter()
         BOOL ff = (name.Find(L"Firefox_") != -1)
                || (name.Find(L"Waterfox_") != -1)
                || (name.Find(L"PaleMoon_") != -1)
-               || (name.Find(L"SeaMonkey_") != -1);
+               || (name.Find(L"SeaMonkey_") != -1)
+               || (name.Find(L"LibreWolf_") != -1);
         BOOL ch = (name.Find(L"Chrome_") != -1);
-        BOOL other = (name.Find(L"Dragon_") != -1)
-                  || (name.Find(L"Iron_") != -1)
-                  || (name.Find(L"Ungoogled_") != -1)
-                  || (name.Find(L"Vivaldi_") != -1)
+        BOOL other = (name.Find(L"Vivaldi_") != -1)
                   || (name.Find(L"Brave_") != -1)
-                  || (name.Find(L"Maxthon_6_") != -1)
                   || (name.Find(L"Opera_") != -1)
-                  || (name.Find(L"Yandex_") != -1);
+                  || (name.Find(L"Yandex_") != -1)
+                  || (name.Find(L"Ungoogled_") != -1)
+                  || (name.Find(L"Iron_") != -1)
+                  || (name.Find(L"Maxthon_6_") != -1)
+                  || (name.Find(L"Dragon_") != -1)
+                  || (name.Find(L"Osiris_") != -1)
+                  || (name.Find(L"Slimjet_") != -1);
 
         BOOL keep = FALSE;
 
@@ -770,7 +773,7 @@ void CAppPage::Folders_OnInitDialog(CBox &box)
 
     while (! tmpl_names.IsEmpty()) {
         CString tmpl_name = tmpl_names.RemoveHead();
-        CString varname = ini.GetTemplateVariable(tmpl_name);
+        CString varname = ini.GetTemplateVariable(tmpl_name); // fix-me: there may be more than one folder per template
         if (varname.IsEmpty())
             continue;
 
@@ -1042,6 +1045,20 @@ void CAppPage::AddPages(CPropertySheet &sheet, const CString &BoxName)
     info.WithCreate = FALSE;
     m_app_pages.AddTail(new CAppPage(&info, BoxName));
 
+    info.ClassName = L"MediaPlayer";
+    info.TitleId = MSG_4393;
+    info.LabelId = MSG_4394;
+    info.WithLink = FALSE;
+    info.WithCreate = FALSE;
+    m_app_pages.AddTail(new CAppPage(&info, BoxName));
+
+    info.ClassName = L"TorrentClient";
+    info.TitleId = MSG_4396;
+    info.LabelId = MSG_4397;
+    info.WithLink = FALSE;
+    info.WithCreate = FALSE;
+    m_app_pages.AddTail(new CAppPage(&info, BoxName));
+
     info.ClassName = L"Download";
     info.TitleId = MSG_4230;
     info.LabelId = MSG_4207;
@@ -1191,7 +1208,7 @@ void CAppPage::UpdateWebTemplates(CBox &box)
     //
     // replace with:    Template=Opera_Bookmarks_DirectAccess
     //
-    
+
     const CString &OperaBookmarksTmpl(L"Opera_Bookmarks_DirectAccess");
     const CString &OperaBookmarks1(L"%AppData%\\Opera Software\\Opera Stable\\Bookmarks");
     const CString &OperaBookmarks2(L"%AppData%\\Opera Software\\Opera Stable\\Bookmarks.bak");
@@ -1202,16 +1219,6 @@ void CAppPage::UpdateWebTemplates(CBox &box)
 
     UpdateTemplates2(
         box, L"opera.exe", OperaBookmarksTmpl, OperaBookmarks3, OperaBookmarks3);
-
-    //
-    // find and remove invalid OpenFilePath reference:
-    //      OpenFilePath=bookmarks.exe,bookmarks*
-    //
-    
-    const CString &InvalidEntry1(L"bookmarks*");
-
-    UpdateTemplates2(
-        box, L"bookmarks.exe", L'\0', InvalidEntry1, InvalidEntry1);
 }
 
 
@@ -1512,8 +1519,8 @@ void CAppPage::UpdateTemplates3(CBox &box,
 void CAppPage::SetDefaultTemplates6(CBox &box)
 {
     box.EnableTemplate(L"AutoRecoverIgnore", TRUE);
-    box.EnableTemplate(L"Firefox_Phishing_DirectAccess", TRUE);
-    box.EnableTemplate(L"Chrome_Phishing_DirectAccess", TRUE);
+    //box.EnableTemplate(L"Firefox_Phishing_DirectAccess", TRUE);
+    //box.EnableTemplate(L"Chrome_Phishing_DirectAccess", TRUE);
     box.EnableTemplate(L"LingerPrograms", TRUE);
     SetDefaultTemplates7(box);
 }
@@ -1532,6 +1539,7 @@ void CAppPage::SetDefaultTemplates7(CBox &box)
     SetDefaultTemplates8(box);
 }
 
+
 //---------------------------------------------------------------------------
 // SetDefaultTemplates8
 //---------------------------------------------------------------------------
@@ -1541,4 +1549,52 @@ void CAppPage::SetDefaultTemplates8(CBox& box)
 {
     box.EnableTemplate(L"FileCopy", TRUE);
     box.EnableTemplate(L"SkipHook", TRUE);
+    SetDefaultTemplates9(box);
+}
+
+
+//---------------------------------------------------------------------------
+// SetDefaultTemplates9
+//---------------------------------------------------------------------------
+
+
+void CAppPage::SetDefaultTemplates9(CBox& box)
+{
+    CSbieIni &ini = CSbieIni::GetInstance();
+
+    // fix the unfortunate typo
+    if (box.IsTemplateEnabled(L"FileCppy")) {
+        box.EnableTemplate(L"FileCopy", TRUE);
+        box.EnableTemplate(L"FileCppy", FALSE);
+    }
+
+    box.EnableTemplate(L"WindowsFontCache", FALSE);
+
+    BOOL bHardened = FALSE;
+    ini.GetBool(box.GetName(), L"DropAdminRights", bHardened, FALSE);
+    if (!bHardened) {
+        // enable those templates only for non hardened boxes
+        box.EnableTemplate(L"OpenBluetooth", TRUE);
+        box.EnableTemplate(L"OpenSmartCard", TRUE);
+    }
+
+    SetDefaultTemplates10(box);
+}
+
+
+//---------------------------------------------------------------------------
+// SetDefaultTemplates10
+//---------------------------------------------------------------------------
+
+
+void CAppPage::SetDefaultTemplates10(CBox& box)
+{
+    CSbieIni &ini = CSbieIni::GetInstance();
+
+    BOOL bOpenProtectedStorage = FALSE;
+    ini.GetBool(box.GetName(), L"OpenProtectedStorage", bOpenProtectedStorage, FALSE);
+    if (bOpenProtectedStorage) {
+        ini.DelText(box.GetName(), L"OpenProtectedStorage", L"y");
+        box.EnableTemplate(L"OpenProtectedStorage", TRUE);
+    }
 }

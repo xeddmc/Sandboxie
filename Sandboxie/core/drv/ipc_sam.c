@@ -68,8 +68,6 @@ _FX NTSTATUS Ipc_CheckPortRequest_Sam(
 
             ULONG  len = msg->u1.s1.DataLength;
             UCHAR* ptr = (UCHAR*)((UCHAR*)msg + sizeof(PORT_MESSAGE));
-            int i = 0;
-            int rc = -2;
 
             ProbeForRead(ptr, len, sizeof(WCHAR));
 
@@ -101,7 +99,7 @@ _FX BOOLEAN Ipc_Filter_Sam_Msg(PROCESS* proc, UCHAR uMsg)
     {
     //case 0x00: //SamConnect
     //case 0x01: //SamCloseHandle
-    case 0x02: //SamSetSecurityObject
+    case 0x02: //SamSetSecurityObject // fixme: SandboxieCrypto.exe needs this some times #740 //if(proc->image_sbie) break;
     //case 0x03: //SamQuerySecurityObject
     //case 0x05: //SamLookupDomainInSamServer
     //case 0x06: //SamEnumerateDomainsInSamServer
@@ -169,7 +167,7 @@ _FX BOOLEAN Ipc_Filter_Sam_Msg(PROCESS* proc, UCHAR uMsg)
 
     if (Session_MonitorCount && (proc->ipc_trace & (TRACE_ALLOW | TRACE_DENY))) {
 
-        USHORT mon_type = MONITOR_IPC;
+        ULONG mon_type = MONITOR_IPC;
 
         if (filter && (proc->ipc_trace & TRACE_DENY))
             mon_type |= MONITOR_DENY;
@@ -180,9 +178,8 @@ _FX BOOLEAN Ipc_Filter_Sam_Msg(PROCESS* proc, UCHAR uMsg)
 
         if (mon_type) {
             WCHAR msg_str[24];
-            swprintf(msg_str, L" Msg: %02X", (ULONG)uMsg);
-            const WCHAR* strings[3] = { L"\\RPC Control\\samss lpc", msg_str, NULL };
-            Session_MonitorPutEx(mon_type, strings, NULL, PsGetCurrentProcessId(), PsGetCurrentThreadId());
+            RtlStringCbPrintfW(msg_str, sizeof(msg_str), L"Msg: %02X", (ULONG)uMsg);
+            Log_Debug_Msg(mon_type, msg_str, L"\\RPC Control\\samss lpc");
         }
     }
 

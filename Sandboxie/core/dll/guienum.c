@@ -44,7 +44,7 @@ typedef struct _GUI_ENUM_PROC_PARM {
 //---------------------------------------------------------------------------
 
 
-static BOOLEAN Gui_HookQueryWindow(void);
+static BOOLEAN Gui_HookQueryWindow(HMODULE module);
 
 static ULONG_PTR Gui_NtUserQueryWindow(HWND hWnd, ULONG_PTR type);
 
@@ -111,9 +111,9 @@ static HWND Gui_FindWindowExA(
 
 //---------------------------------------------------------------------------
 
-static void Gui_MonitorW(const WCHAR *clsnm, USHORT monflag, HWND hwnd);
+static void Gui_MonitorW(const WCHAR *clsnm, ULONG monflag, HWND hwnd);
 
-static void Gui_MonitorA(const UCHAR *clsnm, USHORT monflag, HWND hwnd);
+static void Gui_MonitorA(const UCHAR *clsnm, ULONG monflag, HWND hwnd);
 
 //---------------------------------------------------------------------------
 
@@ -163,6 +163,9 @@ P_D3D11CreateDevice D3D11CreateDevice = NULL;
 /*
 extern P_D3D11CreateDevice D3D11CreateDevice;
 */
+
+ULONGLONG GetTickCount64();
+
 //---------------------------------------------------------------------------
 // Variables
 //---------------------------------------------------------------------------
@@ -170,7 +173,7 @@ extern P_D3D11CreateDevice D3D11CreateDevice;
 
 static BOOLEAN Gui_D3D9_Loaded = FALSE;
 
-static ULONG Gui_GetShellWindow_LastTicks = 0;
+static ULONG64 Gui_GetShellWindow_LastTicks = 0;
 
 
 //---------------------------------------------------------------------------
@@ -178,7 +181,7 @@ static ULONG Gui_GetShellWindow_LastTicks = 0;
 //---------------------------------------------------------------------------
 
 
-_FX BOOLEAN Gui_InitEnum(void)
+_FX BOOLEAN Gui_InitEnum(HMODULE module)
 {
     //
     // hook EnumWindow* and FindWindow* family of functions
@@ -186,10 +189,10 @@ _FX BOOLEAN Gui_InitEnum(void)
 
     if (! Gui_OpenAllWinClasses) {
 
-        if (! Gui_HookQueryWindow())
+        if (Gui_UseProxyService && !Gui_HookQueryWindow(module))
             return FALSE;
 
-        if (! Dll_SkipHook(L"enumwin")) {
+        if (Gui_UseProxyService && !Dll_SkipHook(L"enumwin")) {
 
             SBIEDLL_HOOK_GUI(EnumWindows);
             SBIEDLL_HOOK_GUI(EnumChildWindows);
@@ -197,7 +200,7 @@ _FX BOOLEAN Gui_InitEnum(void)
             SBIEDLL_HOOK_GUI(EnumDesktopWindows);
         }
 
-        if (! Dll_SkipHook(L"findwin")) {
+        if (!Dll_SkipHook(L"findwin")) {
 
             SBIEDLL_HOOK_GUI(FindWindowA);
             SBIEDLL_HOOK_GUI(FindWindowW);
@@ -222,9 +225,17 @@ _FX BOOLEAN Gui_InitEnum(void)
         }
     }
 
+	// NoSbieDesk BEGIN
+    if (Dll_CompartmentMode || SbieApi_QueryConfBool(NULL, L"NoSandboxieDesktop", FALSE))
+        return TRUE;
+	// NoSbieDesk END
+
     //
     // hook desktop APIs
     //
+
+    if (SbieApi_QueryConfBool(NULL, L"OpenWndStation", FALSE))
+        return TRUE;
 
     SBIEDLL_HOOK_GUI(EnumDesktopsW);
     SBIEDLL_HOOK_GUI(EnumDesktopsA);
@@ -236,16 +247,13 @@ _FX BOOLEAN Gui_InitEnum(void)
     // raises an error when CreateDesktop is call.  This hook
     // is removed for chrome.  See advapi.c: AdvApi_GetSecurityInfo
 
-    if ((Dll_ImageType != DLL_IMAGE_GOOGLE_CHROME) &&
-        (Dll_ImageType != DLL_IMAGE_MOZILLA_FIREFOX)) {
-        SBIEDLL_HOOK_GUI(CreateDesktopW);
-        SBIEDLL_HOOK_GUI(CreateDesktopA);
-    }
-    else {
-        SBIEDLL_HOOK_GUI(CreateWindowStationW);
-        SBIEDLL_HOOK_GUI(CreateWindowStationA);
-    }    
-return TRUE;
+    SBIEDLL_HOOK_GUI(CreateDesktopW);
+    SBIEDLL_HOOK_GUI(CreateDesktopA);
+    
+    SBIEDLL_HOOK_GUI(CreateWindowStationW);
+    SBIEDLL_HOOK_GUI(CreateWindowStationA);
+
+    return TRUE;
 }
 
 
@@ -254,96 +262,101 @@ return TRUE;
 //---------------------------------------------------------------------------
 
 
-_FX BOOLEAN Gui_HookQueryWindow(void)
+_FX BOOLEAN Gui_HookQueryWindow(HMODULE module)
 {
     static const WCHAR *_ProcName = L"IsHungAppWindow";
     static char *_ProcNameA = "IsHungAppWindow";
     UCHAR *code;
     BOOLEAN ok = FALSE;
 
-    code = Ldr_GetProcAddrNew(DllName_user32, _ProcName,_ProcNameA);
+    //Windows 10 RS1 now exports win32k functions in win32u.dll
+    code = Ldr_GetProcAddrNew(L"win32u.dll", L"NtUserQueryWindow","NtUserQueryWindow");
     if (code) {
-
-        //
-        // IsHungAppWindow should start with a call to NtUserQueryWindow
-        //
-
-#ifdef _WIN64
-        const ULONG _E8_Offset = 9;
-#else ! _WIN64
-        const ULONG _E8_Offset = 10;
-#endif _WIN64
-
-        if (code[_E8_Offset] == 0xE8) {
-
-            code = code + _E8_Offset + 5
-                + (LONG_PTR)*(LONG *)(code + _E8_Offset + 1);
-
-            //
-            // make sure the address we think is NtUserQueryWindow
-            // actually looks like a syscall stub
-            //
-
-#ifdef _WIN64
-
-            if (    *(ULONG *)code == 0xB8D18B4C
-                && (*(USHORT *)(code + 8) == 0x050F) || *(USHORT *)(code + 8) == 0x04F6)
-                ok = TRUE;
-
-#else ! _WIN64
-
-            if (Dll_IsWow64) {
-
-                // 64-bit prior Windows 7
-                if ( (code[0] == 0xb8) && (code[5] == 0xba) && (*(USHORT *)(code + 10) == 0xd2ff)) {
-                    ok = TRUE;
-                }
-                else if (code[0] == 0xB8 && code[5] == 0x8D && code[9] == 0xB9 && code[14] == 0x64) {
-                    ok = TRUE;
-                }
-                // 64-bit prior Windows 7
-                else if (code[0] == 0xB8 && code[5] == 0xB9 && code[10] == 0x8D && code[14] == 0x64) {
-                    ok = TRUE;
-                }
-                // 64-bit Windows 8
-                else if (code[0] == 0xB8 && code[12] == 0xC2 && *(USHORT *)(code + 5) == 0xFF64) {
-                    ok = TRUE;
-                }
-                // 64-bit Windows 10
-                else if(code[0] == 0xB8 && code[12] == 0xC2 && *(USHORT *)(code + 5) == 0x40BA) {
-                    ok = TRUE;
-                }
-
-            } else {
-                //OutputDebugStringA("32 bit code\n");
-                // 32-bit prior to Windows 8
-                if (    code[0] == 0xB8 && code[5] == 0xBA
-                    && *(USHORT *)(code + 10) == 0x12FF)
-                    ok = TRUE;
-
-                // 32-bit Windows 8
-                if (    code[0] == 0xB8 && code[5] == 0xE8
-                    && *(SHORT *)(code + 10) == 0x08C2)
-                    ok = TRUE;
-
-                // 32-bit Windows 10
-                if (    code[0] == 0xB8 && code[5] == 0xBA
-                    && *(USHORT *)(code + 10) == 0xD2FF)
-                    ok = TRUE;
-            }
-
-#endif _WIN64
-
-        }
+        ok = TRUE;
     }
+#ifndef _M_ARM64
+    else {
 
-    if (! ok) {
-        //Windows 10 RS1 now exports win32k functions in win32u.dll
-        code = Ldr_GetProcAddrNew(L"win32u.dll", L"NtUserQueryWindow","NtUserQueryWindow");
+        code = Ldr_GetProcAddrNew(DllName_user32, _ProcName, _ProcNameA);
         if (code) {
-            ok = TRUE;
+
+            //
+            // IsHungAppWindow should start with a call to NtUserQueryWindow
+            //
+
+            // $HookHack$ - Custom, not automated, Hook
+#ifdef _WIN64
+            const ULONG _E8_Offset = 9;
+#else ! _WIN64
+            const ULONG _E8_Offset = 10;
+#endif _WIN64
+
+            if (code[_E8_Offset] == 0xE8) {
+
+                code = code + _E8_Offset + 5
+                    + (LONG_PTR) * (LONG*)(code + _E8_Offset + 1);
+
+                //
+                // make sure the address we think is NtUserQueryWindow
+                // actually looks like a syscall stub
+                //
+
+#ifdef _WIN64
+
+                if (*(ULONG*)code == 0xB8D18B4C
+                    && (*(USHORT*)(code + 8) == 0x050F) || *(USHORT*)(code + 8) == 0x04F6)
+                    ok = TRUE;
+
+#else ! _WIN64
+
+                if (Dll_IsWow64) {
+
+                    // 64-bit prior Windows 7
+                    if ((code[0] == 0xb8) && (code[5] == 0xba) && (*(USHORT*)(code + 10) == 0xd2ff)) {
+                        ok = TRUE;
+                    }
+                    else if (code[0] == 0xB8 && code[5] == 0x8D && code[9] == 0xB9 && code[14] == 0x64) {
+                        ok = TRUE;
+                    }
+                    // 64-bit prior Windows 7
+                    else if (code[0] == 0xB8 && code[5] == 0xB9 && code[10] == 0x8D && code[14] == 0x64) {
+                        ok = TRUE;
+                    }
+                    // 64-bit Windows 8
+                    else if (code[0] == 0xB8 && code[12] == 0xC2 && *(USHORT*)(code + 5) == 0xFF64) {
+                        ok = TRUE;
+                    }
+                    // 64-bit Windows 10
+                    else if (code[0] == 0xB8 && code[12] == 0xC2 && *(USHORT*)(code + 5) == 0x40BA) {
+                        ok = TRUE;
+                    }
+
+                }
+                else {
+                    //OutputDebugStringA("32 bit code\n");
+                    // 32-bit prior to Windows 8
+                    if (code[0] == 0xB8 && code[5] == 0xBA
+                        && *(USHORT*)(code + 10) == 0x12FF)
+                        ok = TRUE;
+
+                    // 32-bit Windows 8
+                    if (code[0] == 0xB8 && code[5] == 0xE8
+                        && *(SHORT*)(code + 10) == 0x08C2)
+                        ok = TRUE;
+
+                    // 32-bit Windows 10
+                    if (code[0] == 0xB8 && code[5] == 0xBA
+                        && *(USHORT*)(code + 10) == 0xD2FF)
+                        ok = TRUE;
+                }
+
+#endif _WIN64
+
+            }
         }
     }
+#endif
+
     if (!ok ){
         SbieApi_Log(2303, L"%S (0)", _ProcName);
     }
@@ -553,6 +566,7 @@ _FX HDESK Gui_OpenDesktopW(
     void *lpszDesktop, ULONG dwFlags, BOOL fInherit,
     ACCESS_MASK dwDesiredAccess)
 {
+    SbieApi_Log(2205, L"OpenDesktop");
     return CreateEvent(NULL, FALSE, FALSE, NULL);
 }
 
@@ -566,33 +580,53 @@ _FX HDESK Gui_OpenDesktopA(
     void *lpszDesktop, ULONG dwFlags, BOOL fInherit,
     ACCESS_MASK dwDesiredAccess)
 {
+    SbieApi_Log(2205, L"OpenDesktop");
     return CreateEvent(NULL, FALSE, FALSE, NULL);
 }
 
 //---------------------------------------------------------------------------
 //Gui_CreateWindowStationW
 //---------------------------------------------------------------------------
-extern HANDLE Sandboxie_WinSta ;
 
-_FX HANDLE Gui_CreateWindowStationW (void *lpwinsta, DWORD dwFlags, ACCESS_MASK dwDesiredAccess, LPSECURITY_ATTRIBUTES lpsa) {
+
+_FX HANDLE Gui_CreateWindowStationW (void *lpwinsta, DWORD dwFlags, ACCESS_MASK dwDesiredAccess, LPSECURITY_ATTRIBUTES lpsa) 
+{
     HANDLE myHandle = 0;
 
     myHandle =  __sys_CreateWindowStationW(lpwinsta, dwFlags, dwDesiredAccess, lpsa);
-    if (!myHandle) {
-        return Sandboxie_WinSta;
-    }
-    return myHandle;
+    if (myHandle)
+        return myHandle;
+
+    extern HANDLE Gui_Dummy_WinSta;
+    if(Gui_Dummy_WinSta && (Config_GetSettingsForImageName_bool(L"UseSbieWndStation", TRUE) || (Dll_ImageType == DLL_IMAGE_GOOGLE_CHROME) || (Dll_ImageType == DLL_IMAGE_MOZILLA_FIREFOX)))
+        return Gui_Dummy_WinSta;
+
+    SbieApi_Log(2205, L"CreateWindowStation");
+    return 0;
 }
 
-_FX HANDLE Gui_CreateWindowStationA (void *lpwinsta, DWORD dwFlags, ACCESS_MASK dwDesiredAccess, LPSECURITY_ATTRIBUTES lpsa) {
+
+//---------------------------------------------------------------------------
+//Gui_CreateWindowStationA
+//---------------------------------------------------------------------------
+
+
+_FX HANDLE Gui_CreateWindowStationA (void *lpwinsta, DWORD dwFlags, ACCESS_MASK dwDesiredAccess, LPSECURITY_ATTRIBUTES lpsa) 
+{
     HANDLE myHandle = 0;
 
     myHandle =  __sys_CreateWindowStationA(lpwinsta, dwFlags, dwDesiredAccess, lpsa);
-    if (!myHandle) {
-        return Sandboxie_WinSta;
-    }
-    return myHandle;
+    if (myHandle)
+        return myHandle;
+    
+    extern HANDLE Gui_Dummy_WinSta;
+    if(Gui_Dummy_WinSta && (Config_GetSettingsForImageName_bool(L"UseSbieWndStation", TRUE) || (Dll_ImageType == DLL_IMAGE_GOOGLE_CHROME) || (Dll_ImageType == DLL_IMAGE_MOZILLA_FIREFOX)))
+        return Gui_Dummy_WinSta;
+
+    SbieApi_Log(2205, L"CreateWindowStation");
+    return 0;
 }
+
 //---------------------------------------------------------------------------
 // Gui_CreateDesktopW
 //---------------------------------------------------------------------------
@@ -603,17 +637,45 @@ _FX HDESK Gui_CreateDesktopW(
     ACCESS_MASK dwDesiredAccess, void *SecurityAttributes)
 {
     HANDLE rc = 0;
-    //Call the system CreateDesktopW without a security context. 
-    //This works in tandem with the Ntmarta_GetSecurityInfo hook (see in advapi.c).
-
-    //Also see comment in Ntmarta_Init at SBIEDLL_HOOK2(Ntmarta_,GetSecurityInfo) for
-    //Acrobat Reader.  This is needed to allow this process to create a desktop with
-    //the sandboxie restricted token by dropping the security context.  This won't
-    //work without the GetSecrityInfo hook.
-    rc = __sys_CreateDesktopW(lpszDesktop, NULL, NULL, dwFlags, dwDesiredAccess, NULL);
-    if (rc) {
+    
+    rc = __sys_CreateDesktopW(lpszDesktop, lpszDevice, DevMode, dwFlags, dwDesiredAccess, SecurityAttributes);
+    if (rc)
         return rc;
+
+    HWINSTA current_winsta = NULL;
+
+    HMODULE User32 = GetModuleHandle(DllName_user32);
+    P_SetProcessWindowStation _SetProcessWindowStation = (P_SetProcessWindowStation)GetProcAddress(User32, "SetProcessWindowStation");
+    P_GetProcessWindowStation _GetProcessWindowStation = (P_GetProcessWindowStation)GetProcAddress(User32, "GetProcessWindowStation");
+
+    extern HANDLE Gui_Dummy_WinSta;
+    if (Gui_Dummy_WinSta)
+    {
+        current_winsta = _GetProcessWindowStation();
+        _SetProcessWindowStation(Gui_Dummy_WinSta);
     }
+
+    rc = __sys_CreateDesktopW(lpszDesktop, lpszDevice, DevMode, dwFlags, dwDesiredAccess, SecurityAttributes);
+
+    if (!rc && (Config_GetSettingsForImageName_bool(L"UseSbieDeskHack", TRUE)
+        || (Dll_ImageType == DLL_IMAGE_GOOGLE_CHROME) || (Dll_ImageType == DLL_IMAGE_MOZILLA_FIREFOX) || (Dll_ImageType == DLL_IMAGE_ACROBAT_READER)))
+    {
+        //Call the system CreateDesktopW without a security context. 
+        //This works in tandem with the Ntmarta_GetSecurityInfo hook (see in advapi.c).
+
+        //Also see comment in Ntmarta_Init at SBIEDLL_HOOK2(Ntmarta_,GetSecurityInfo) for
+        //Acrobat Reader.  This is needed to allow this process to create a desktop with
+        //the sandboxie restricted token by dropping the security context.  This won't
+        //work without the GetSecurityInfo hook.
+
+        rc = __sys_CreateDesktopW(lpszDesktop, NULL, NULL, dwFlags, dwDesiredAccess, NULL);
+    }
+
+    if(current_winsta)
+        _SetProcessWindowStation(current_winsta);
+
+    if (rc)
+        return rc;
 
     SbieApi_Log(2205, L"CreateDesktop");
     return CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -630,10 +692,37 @@ _FX HDESK Gui_CreateDesktopA(
     ACCESS_MASK dwDesiredAccess, void *SecurityAttributes)
 {
     HANDLE rc = 0;
-    rc = __sys_CreateDesktopA(lpszDesktop, NULL, NULL, dwFlags, dwDesiredAccess, NULL);
-    if (rc) {
+    
+    rc = __sys_CreateDesktopA(lpszDesktop, lpszDevice, DevMode, dwFlags, dwDesiredAccess, SecurityAttributes);
+    if (rc)
         return rc;
+
+    HWINSTA current_winsta = NULL;
+
+    HMODULE User32 = GetModuleHandle(DllName_user32);
+    P_SetProcessWindowStation _SetProcessWindowStation = (P_SetProcessWindowStation)GetProcAddress(User32, "SetProcessWindowStation");
+    P_GetProcessWindowStation _GetProcessWindowStation = (P_GetProcessWindowStation)GetProcAddress(User32, "GetProcessWindowStation");
+
+    extern HANDLE Gui_Dummy_WinSta;
+    if (Gui_Dummy_WinSta)
+    {
+        current_winsta = _GetProcessWindowStation();
+        _SetProcessWindowStation(Gui_Dummy_WinSta);
     }
+
+    rc = __sys_CreateDesktopA(lpszDesktop, lpszDevice, DevMode, dwFlags, dwDesiredAccess, SecurityAttributes);
+
+    if (!rc && (Config_GetSettingsForImageName_bool(L"UseSbieDeskHack", TRUE)
+        || (Dll_ImageType == DLL_IMAGE_GOOGLE_CHROME) || (Dll_ImageType == DLL_IMAGE_MOZILLA_FIREFOX) || (Dll_ImageType == DLL_IMAGE_ACROBAT_READER)))
+    {
+        rc = __sys_CreateDesktopA(lpszDesktop, NULL, NULL, dwFlags, dwDesiredAccess, NULL);
+    }
+
+    if(current_winsta)
+        _SetProcessWindowStation(current_winsta);
+
+    if (rc)
+        return rc;
 
     SbieApi_Log(2205, L"CreateDesktop");
     return CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -722,7 +811,7 @@ _FX HWND Gui_FindWindowW(
     WCHAR *clsnm;
     WCHAR *winnm;
     HWND hwndResult;
-    USHORT monflag = 0;
+    ULONG monflag = 0;
 
 #ifdef DEBUG_FINDWINDOW
     WCHAR txt[256];
@@ -748,7 +837,7 @@ _FX HWND Gui_FindWindowW(
         }
     }
 
-    if (! hwndResult) {
+    if (Gui_UseProxyService && ! hwndResult) {
         hwndResult = Gui_FindWindowCommon(
                         'fw w', NULL, NULL, lpClassName, lpWindowName);
     }
@@ -781,7 +870,7 @@ _FX HWND Gui_FindWindowA(
     UCHAR *clsnm;
     UCHAR *winnm;
     HWND hwndResult;
-    USHORT monflag = 0;
+    ULONG monflag = 0;
 
 #ifdef DEBUG_FINDWINDOW
     WCHAR txt[256];
@@ -806,7 +895,7 @@ _FX HWND Gui_FindWindowA(
         }
     }
 
-    if (! hwndResult) {
+    if (Gui_UseProxyService && ! hwndResult) {
         hwndResult = Gui_FindWindowCommon(
                         'fw a', NULL, NULL, lpClassName, lpWindowName);
     }
@@ -840,7 +929,7 @@ _FX HWND Gui_FindWindowExW(
     WCHAR *clsnm;
     WCHAR *winnm;
     HWND hwndResult;
-    USHORT monflag = 0;
+    ULONG monflag = 0;
 
 #ifdef DEBUG_FINDWINDOW
     WCHAR txt[256];
@@ -867,7 +956,7 @@ _FX HWND Gui_FindWindowExW(
         }
     }
 
-    if (! hwndResult) {
+    if (Gui_UseProxyService && ! hwndResult) {
         hwndResult = Gui_FindWindowCommon(
             'fwxw', hwndParent, hwndChildAfter, lpClassName, lpWindowName);
     }
@@ -901,7 +990,7 @@ _FX HWND Gui_FindWindowExA(
     UCHAR *clsnm;
     UCHAR *winnm;
     HWND hwndResult;
-    USHORT monflag = 0;
+    ULONG monflag = 0;
 
 #ifdef DEBUG_FINDWINDOW
     WCHAR txt[256];
@@ -928,7 +1017,7 @@ _FX HWND Gui_FindWindowExA(
         }
     }
 
-    if (! hwndResult) {
+    if (Gui_UseProxyService && ! hwndResult) {
         hwndResult = Gui_FindWindowCommon(
             'fwxa', hwndParent, hwndChildAfter, lpClassName, lpWindowName);
     }
@@ -955,7 +1044,7 @@ _FX HWND Gui_FindWindowExA(
 //---------------------------------------------------------------------------
 
 
-_FX void Gui_MonitorW(const WCHAR *clsnm, USHORT monflag, HWND hwnd)
+_FX void Gui_MonitorW(const WCHAR *clsnm, ULONG monflag, HWND hwnd)
 {
     WCHAR text[130];
     if (((ULONG_PTR)clsnm & (LONG_PTR)0xFFFF0000) != 0) {
@@ -965,7 +1054,7 @@ _FX void Gui_MonitorW(const WCHAR *clsnm, USHORT monflag, HWND hwnd)
         Sbie_snwprintf(text, 130, L"#%d", PtrToUlong(clsnm) & 0xFFFF);
     if ((! hwnd) && (! monflag))
         monflag |= MONITOR_DENY;
-    SbieApi_MonitorPut(MONITOR_WINCLASS | monflag, text);
+    SbieApi_MonitorPut2(MONITOR_WINCLASS | monflag, text, FALSE);
 }
 
 
@@ -974,7 +1063,7 @@ _FX void Gui_MonitorW(const WCHAR *clsnm, USHORT monflag, HWND hwnd)
 //---------------------------------------------------------------------------
 
 
-_FX void Gui_MonitorA(const UCHAR *clsnm, USHORT monflag, HWND hwnd)
+_FX void Gui_MonitorA(const UCHAR *clsnm, ULONG monflag, HWND hwnd)
 {
     if (((ULONG_PTR)clsnm & (LONG_PTR)0xFFFF0000) != 0) {
         NTSTATUS status;
@@ -1002,7 +1091,7 @@ _FX HWND Gui_GetShellWindow(void)
     static HWND _LastHwnd = NULL;
     HWND hwnd;
 
-    ULONG TicksNow = GetTickCount();
+    ULONG64 TicksNow = GetTickCount64();
     if (TicksNow - Gui_GetShellWindow_LastTicks <= 5000)
         return _LastHwnd;
     Gui_GetShellWindow_LastTicks = TicksNow;
@@ -1010,8 +1099,12 @@ _FX HWND Gui_GetShellWindow(void)
     hwnd = NULL;
     if (Gui_RenameClasses)
         hwnd = Gui_FindWindowW(_Progman, NULL);
-    if ((! hwnd) && Gui_D3D9_Loaded && __sys_FindWindowW)
-        hwnd = Gui_FindWindowCommon('fw w', NULL, NULL, _Progman, NULL);
+    if ((!hwnd) && Gui_D3D9_Loaded && __sys_FindWindowW) {
+        if (!Gui_UseProxyService)
+            hwnd = __sys_FindWindowW(_Progman, NULL);
+        else
+            hwnd = Gui_FindWindowCommon('fw w', NULL, NULL, _Progman, NULL); 
+    }
     _LastHwnd = hwnd;
     return hwnd;
 }

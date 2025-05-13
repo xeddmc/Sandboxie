@@ -1,6 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
- * Copyright 2020 David Xanatos, xanasoft.com
+ * Copyright 2020-2023 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -22,7 +22,8 @@
 
 
 #include "common/pool.h"
-
+#include "common/map.h"
+#include "common/pattern.h"
 
 //---------------------------------------------------------------------------
 // Structures and Types
@@ -43,6 +44,7 @@ typedef struct _FILE_MERGE_CACHE_FILE {
 typedef struct _FILE_MERGE_FILE {
 
     HANDLE handle;
+    FILE_SNAPSHOT* snapshot;
     FILE_ID_BOTH_DIR_INFORMATION *info;
     ULONG info_len;
     WCHAR *name;
@@ -142,10 +144,13 @@ static NTSTATUS File_MergeCacheWin2000(
     FILE_MERGE_FILE *qfile, UNICODE_STRING *FileMask,
     FILE_ID_BOTH_DIR_INFORMATION *info_area, ULONG info_area_len);
 
+static NTSTATUS File_MergeDummy(
+    WCHAR *TruePath, FILE_MERGE_FILE *qfile, UNICODE_STRING *FileMask);
+
 static void File_MergeFree(FILE_MERGE *merge);
 
 static NTSTATUS File_GetMergedInformation(
-    FILE_MERGE *merge,
+    FILE_MERGE *merge, WCHAR *TruePath, WCHAR *CopyPath,
     IO_STATUS_BLOCK *IoStatusBlock,
     void *FileInformation,
     ULONG Length,
@@ -165,14 +170,6 @@ static NTSTATUS File_DeleteDirectory(
         const WCHAR *FilePath, BOOLEAN JustCheck);
 
 static NTSTATUS File_MarkChildrenDeleted(const WCHAR *ParentTruePath);
-
-static void File_InitRecoverList(
-    const WCHAR *setting, LIST *list, BOOLEAN MustBeValidPath,
-    WCHAR *buf, ULONG buf_len);
-
-static void File_NotifyRecover(HANDLE FileHandle, MSG_HEADER **out_req);
-
-static BOOLEAN File_IsRecoverable(const WCHAR *TruePath);
 
 static ULONG File_RtlGetCurrentDirectory_U(ULONG buf_len, WCHAR *buf_ptr);
 
@@ -195,30 +192,14 @@ static NTSTATUS File_NtQueryVolumeInformationFile(
     ULONG Length,
     ULONG FsInformationClass);
 
-static void File_DoAutoRecover_2(BOOLEAN force, ULONG ticks);
-
-static ULONG File_DoAutoRecover_3(
-    const WCHAR *PathToFind, WCHAR *PathBuf1024,
-    SYSTEM_HANDLE_INFORMATION *info, FILE_GET_ALL_HANDLES_RPL *rpl,
-    UCHAR *FileObjectTypeNumber);
-
-static ULONG File_DoAutoRecover_4(
-    const WCHAR *PathToFind, WCHAR *PathBuf1024,
-    HANDLE FileHandle, UCHAR ObjectTypeNumber, UCHAR *FileObjectTypeNumber);
-
 NTSTATUS File_NtCloseImpl(HANDLE FileHandle);
+
+VOID File_NtCloseDir(HANDLE FileHandle, void* CloseParams);
 
 //---------------------------------------------------------------------------
 // Variables
 //---------------------------------------------------------------------------
 
-
-static LIST File_RecoverFolders;
-static LIST File_RecoverIgnores;
-
-static HANDLE *File_RecHandles = NULL;
-static LIST File_RecPaths;
-static CRITICAL_SECTION File_RecHandles_CritSec;
 
 static CRITICAL_SECTION File_CurDir_CritSec;
 static WCHAR *File_CurDir_LastInput = NULL;
@@ -227,7 +208,7 @@ static WCHAR *File_CurDir_LastOutput = NULL;
 static LIST File_DirHandles;
 static CRITICAL_SECTION File_DirHandles_CritSec;
 
-static BOOLEAN File_MsoDllLoaded = FALSE;
+
 
 
 //---------------------------------------------------------------------------
@@ -327,10 +308,12 @@ _FX NTSTATUS File_NtQueryDirectoryFile(
 
         ULONG mp_flags = File_MatchPath(TruePath, &FileFlags);
 
+        BOOLEAN use_rule_specificity = (Dll_ProcessFlags & SBIE_FLAG_RULE_SPECIFICITY) != 0;
+
         if (PATH_IS_CLOSED(mp_flags))
             status = STATUS_ACCESS_DENIED;
 
-        else if (PATH_IS_WRITE(mp_flags))
+        else if (PATH_IS_WRITE(mp_flags) && !use_rule_specificity) 
             status = STATUS_BAD_INITIAL_PC;
 
         else if (PATH_IS_OPEN(mp_flags))
@@ -400,7 +383,7 @@ _FX NTSTATUS File_NtQueryDirectoryFile(
     merge_lock = TRUE;
 
     status = File_GetMergedInformation(
-        merge, IoStatusBlock,
+        merge, TruePath, CopyPath, IoStatusBlock,
         FileInformation, Length, FileInformationClass, ReturnSingleEntry);
 
     if (merge->first_request) {
@@ -501,6 +484,7 @@ _FX NTSTATUS File_Merge(
 
             } else {
 
+                Handle_UnRegisterHandler(merge->handle, File_NtCloseDir, NULL);
                 List_Remove(&File_DirHandles, merge);
                 File_MergeFree(merge);
             }
@@ -543,17 +527,8 @@ _FX NTSTATUS File_Merge(
 			merge->files[0].no_file_ids = TRUE;
         }
 
-        if (File_Windows2000) {
-            //
-            // Windows 2000 SP 4 seems to include support for info class
-            // FileIdBothDirectoryInformation, although according to
-            // documentation it is only supported on Windows XP and later
-            //
-			for(ULONG i = 0; i < 2 + File_Snapshot_Count; i++)
-				merge->files[i].no_file_ids = TRUE;
-        }
-
         List_Insert_After(&File_DirHandles, NULL, merge);
+        Handle_RegisterHandler(merge->handle, File_NtCloseDir, NULL, FALSE);
     }
 
     //
@@ -617,7 +592,13 @@ _FX NTSTATUS File_OpenForMerge(
 	WCHAR *ptr;
 	// BOOLEAN TruePathIsRoot;
 	BOOLEAN TruePathDeleted = FALSE; // indicates that one of the parent snapshots deleted the true directory
+    WCHAR* OriginalPath = NULL;
+    ULONG TruePathFlags = 0;
 	BOOLEAN NoCopyPath = FALSE;
+
+    THREAD_DATA *TlsData = Dll_GetTlsData(NULL);
+
+    Dll_PushTlsNameBuffer(TlsData);
 
 	InitializeObjectAttributes(
 		&objattrs, &objname, OBJ_CASE_INSENSITIVE, NULL, NULL);
@@ -626,8 +607,39 @@ _FX NTSTATUS File_OpenForMerge(
 	// open the copy file
 	//
 
-	if (File_CheckDeletedParent(CopyPath))
-		return STATUS_OBJECT_PATH_NOT_FOUND;
+    if (File_Delete_v2) {
+
+        //
+        // test if the path is deleted and find the oldest snapshot with a relocation
+        //
+
+        WCHAR* OldTruePath = File_ResolveTruePath(TruePath, NULL, &TruePathFlags);
+        if (FILE_PATH_DELETED(TruePathFlags) && !FILE_PATH_RELOCATED(TruePathFlags))
+            TruePathDeleted = TRUE;
+        else if (OldTruePath) {
+
+            OriginalPath = TruePath;
+
+            if (File_Snapshot != NULL) {
+
+                //
+                // note: File_ResolveTruePath returns a buffer from the TMPL_NAME_BUFFER slot, 
+                // which is reused byFile_MakeSnapshotPath, so we need to make non reusable copy
+                // 
+
+        	    TruePath = Dll_GetTlsNameBuffer(TlsData, MISC_NAME_BUFFER, (wcslen(OldTruePath) + 1) * sizeof(WCHAR));
+                wcscpy(TruePath, OldTruePath);
+            }
+            else
+                TruePath = OldTruePath;
+        }
+    }
+    else {
+        if (File_CheckDeletedParent(CopyPath)) {
+            status = STATUS_OBJECT_PATH_NOT_FOUND;
+            goto finish;
+        }
+    }
 
 	RtlInitUnicodeString(&objname, CopyPath);
 
@@ -658,6 +670,7 @@ _FX NTSTATUS File_OpenForMerge(
 
 		if (NT_SUCCESS(status)) {
 
+            // if (!File_Delete_v2 &&
 			if (IS_DELETE_MARK(&info.basic.CreationTime)) {
 
 				status = STATUS_OBJECT_NAME_NOT_FOUND;
@@ -674,10 +687,10 @@ _FX NTSTATUS File_OpenForMerge(
 
 			__sys_NtClose(merge->files[0].handle);
 			merge->files[0].handle = NULL;
-			return status;
+			goto finish;
 		}
 
-		//
+        //
 		// copy file passed all checks;  indicate it is ready for use
 		//
 
@@ -699,7 +712,7 @@ _FX NTSTATUS File_OpenForMerge(
 			NoCopyPath = TRUE;
 		}
 		else
-			return status;
+			goto finish;
 	}
 
 	//
@@ -708,6 +721,8 @@ _FX NTSTATUS File_OpenForMerge(
 
 	if (File_Snapshot != NULL)
 	{
+        WCHAR* TempPath = TruePath;
+
 		for (FILE_SNAPSHOT* Cur_Snapshot = File_Snapshot; Cur_Snapshot != NULL; Cur_Snapshot = Cur_Snapshot->Parent)
 		{
 			WCHAR* TmplName = File_MakeSnapshotPath(Cur_Snapshot, CopyPath);
@@ -737,14 +752,13 @@ _FX NTSTATUS File_OpenForMerge(
 				// make sure it is a directory file
 				//
 
-				// todo reduce redundant code, combine with the code for the copy_file
-
 				status = __sys_NtQueryInformationFile(
 					merge->files[merge->files_count].handle, &IoStatusBlock, &info,
 					sizeof(FILE_BASIC_INFORMATION), FileBasicInformation);
 
 				if (NT_SUCCESS(status)) {
 
+                    // if (!File_Delete_v2 &&
 					if (IS_DELETE_MARK(&info.basic.CreationTime)) {
 
 						status = STATUS_OBJECT_NAME_NOT_FOUND;
@@ -763,10 +777,12 @@ _FX NTSTATUS File_OpenForMerge(
 					merge->files[merge->files_count].handle = NULL;
 
 					TruePathDeleted = TRUE;
-					break; // dont look any further
+					break; // don't look any further
 				}
 
-				//
+                merge->files[merge->files_count].snapshot = Cur_Snapshot;
+
+                //
 				// copy file passed all checks;  indicate it is ready for use
 				//
 
@@ -776,13 +792,46 @@ _FX NTSTATUS File_OpenForMerge(
 				merge->files_count++;
 
 			}
-			else {
+            // else: ignore the error, proceed to next snapshot
 
-				//
-				// Ignroe errors here for now // todo
-				//
+            //
+            // check if we have a relocation and update CopyPath for the next snapshot accordingly
+            // since we don't need opypath anyware anymore we can alter it
+            //
 
-			}
+            if (File_Delete_v2) {
+
+                WCHAR* Relocation = NULL;
+			    ULONG Flags = File_GetPathFlags_internal(&Cur_Snapshot->PathRoot, TempPath, &Relocation, TRUE);
+                if (FILE_PATH_DELETED(Flags))
+                    break;
+
+			    if (Relocation) {
+
+				    if (!Cur_Snapshot->Parent) 
+					    break; // take a shortcut
+
+				    TempPath = Dll_GetTlsNameBuffer(TlsData, TRUE_NAME_BUFFER, (wcslen(Relocation) + 1) * sizeof(WCHAR));
+				    wcscpy(TempPath, Relocation);
+
+				    //
+				    // update the copy file name
+				    //
+
+				    Dll_PushTlsNameBuffer(TlsData);
+
+				    WCHAR* TruePath2, *CopyPath2;
+				    RtlInitUnicodeString(&objname, Relocation);
+				    File_GetName(NULL, &objname, &TruePath2, &CopyPath2, NULL);
+
+				    Dll_PopTlsNameBuffer(TlsData);
+
+				    // note: pop leaves TruePath2 valid we can still use it
+
+				    CopyPath = Dll_GetTlsNameBuffer(TlsData, COPY_NAME_BUFFER, (wcslen(CopyPath2) + 1) * sizeof(WCHAR));
+				    wcscpy(CopyPath, CopyPath2);
+			    }
+		    }
 		}
 	}
 
@@ -791,11 +840,12 @@ _FX NTSTATUS File_OpenForMerge(
 	// and can let the system work directly on the true file
 	//
 
-	if (merge->files_count == 0) {
+    if ((TruePathFlags & FILE_CHILDREN_DELETED_FLAG) == 0) // we need to do full merge if children ar marked deleted
+    if (merge->files_count == 0) {
 
 		status = STATUS_BAD_INITIAL_PC;
 
-		return status;
+		goto finish;
 	}
 
 	if (TruePathDeleted)
@@ -824,7 +874,8 @@ _FX NTSTATUS File_OpenForMerge(
 	else
 		ptr = NULL;
 
-	objname.Length = (USHORT)len;
+    // RtlInitUnicodeString(&objname, );
+    objname.Length = (USHORT)len;
 	objname.MaximumLength = objname.Length + sizeof(WCHAR);
 	objname.Buffer = TruePath;
 
@@ -858,6 +909,28 @@ _FX NTSTATUS File_OpenForMerge(
 	// for any other error opening the true directory, we abort.
 	//
 
+    if (status == STATUS_OBJECT_NAME_NOT_FOUND ||
+        status == STATUS_OBJECT_PATH_NOT_FOUND ||
+        status == STATUS_ACCESS_DENIED) {
+
+        BOOLEAN use_rule_specificity = (Dll_ProcessFlags & SBIE_FLAG_RULE_SPECIFICITY) != 0;
+
+        //
+        // if rule specificity is enabled we may not have access to this true path
+        // but still have access to some sub paths, in this case instead of listing the
+        // true directory we parse the rule list and construct a cached dummy directory
+        //
+
+        if (use_rule_specificity) {
+
+            if (File_MergeDummy(TruePath, merge->true_ptr, &merge->file_mask) == STATUS_SUCCESS) {
+
+                merge->true_ptr->handle = NULL;
+                status = STATUS_SUCCESS;
+            }
+        }
+    }
+
 	if (!NT_SUCCESS(status)) {
 
 		merge->true_ptr->handle = NULL;
@@ -875,7 +948,7 @@ _FX NTSTATUS File_OpenForMerge(
 			if (status == STATUS_ACCESS_DENIED)
 				status = STATUS_BAD_INITIAL_PC;
 
-			return status;
+			goto finish;
 		}
 
 		status = STATUS_SUCCESS;
@@ -921,9 +994,16 @@ skip_true_file:
             ForceCache = TRUE;
         }
 
-        status = File_MergeCache(
-                    merge->true_ptr, &merge->file_mask, ForceCache);
+        //
+        // true dir may be actually a dummy dir 
+        //
 
+        if (merge->true_ptr->handle) {
+
+            status = File_MergeCache(
+                merge->true_ptr, &merge->file_mask, ForceCache);
+        }
+        
         if (NT_SUCCESS(status)) {
 
             BOOLEAN HaveTrueCache = (merge->true_ptr->cache_pool != NULL);
@@ -955,6 +1035,9 @@ skip_true_file:
 			}
         }
     }
+
+finish:
+    Dll_PopTlsNameBuffer(TlsData);
 
 	return status;
 }
@@ -1263,6 +1346,232 @@ _FX NTSTATUS File_MergeCacheWin2000(
 
 
 //---------------------------------------------------------------------------
+// File_MergeDummy
+//---------------------------------------------------------------------------
+
+
+_FX NTSTATUS File_MergeDummy(
+    WCHAR *TruePath, FILE_MERGE_FILE *qfile, UNICODE_STRING *FileMask)
+{
+    NTSTATUS status;
+    FILE_ID_BOTH_DIR_INFORMATION *info_area;
+    FILE_ID_BOTH_DIR_INFORMATION *info_ptr;
+    LIST *cache_list;
+    FILE_MERGE_CACHE_FILE *cache_file;
+    FILE_MERGE_CACHE_FILE *ins_point;
+    ULONG len;
+    const ULONG INFO_AREA_LEN = 0x10000;  // the size used by cmd.exe
+
+
+    if (qfile->cache_pool) {
+        Pool_Delete(qfile->cache_pool);
+        qfile->cache_pool = NULL;
+    }
+
+    //
+    // prepare the cache pool
+    //
+
+    qfile->cache_pool = Pool_Create();
+    if (! qfile->cache_pool)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    cache_list = &qfile->cache_list;
+    List_Init(cache_list);
+
+    info_area = Pool_Alloc(qfile->cache_pool, INFO_AREA_LEN);
+    if (! info_area)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    //
+    // create a dummy directory, build a sorted files list
+    //
+
+    PATTERN* mask = NULL;
+    if (FileMask->Buffer) 
+        mask = Pattern_Create(qfile->cache_pool, FileMask->Buffer, TRUE, 0);
+    WCHAR* test_buf = Pool_Alloc(qfile->cache_pool, 0x1000);
+
+    LIST* lists[4];
+    SbieDll_GetReadablePaths(L'f', lists);
+
+    ULONG TruePathLen = wcslen(TruePath);
+    if (TruePathLen > 1 && TruePath[TruePathLen - 1] == L'\\')
+        TruePathLen--; // never take last \ into account
+
+    ULONG* PrevEntry = NULL;
+    info_ptr = info_area;
+    for (int i=0; lists[i] != NULL; i++) {
+
+        PATTERN* pat = List_Head(lists[i]);
+        while (pat) {
+
+            const WCHAR* patstr = Pattern_Source(pat);
+
+            if (_wcsnicmp(TruePath, patstr, TruePathLen) == 0 && patstr[TruePathLen] == L'\\') {
+
+                const WCHAR* ptr = &patstr[TruePathLen + 1];
+                WCHAR* end = wcschr(ptr, L'\\');
+                if(end == NULL) end = wcschr(ptr, L'*');
+                if(end == NULL) end = wcschr(ptr, L'\0');
+                ULONG name_len = (ULONG)(end - ptr);
+
+                if (mask) {
+                    
+                    memcpy(test_buf, ptr, (name_len + 1) * sizeof(WCHAR));
+                    _wcslwr(test_buf);
+
+                    if (!Pattern_Match(mask, test_buf, name_len))
+                        goto next;
+                }
+
+                //
+                // check if the true path exists
+                //
+
+                WCHAR* FakePath = Dll_AllocTemp(TruePathLen * sizeof(WCHAR) + 1 + name_len * sizeof(WCHAR) + 10);
+
+                wmemcpy(FakePath, TruePath, TruePathLen);
+                FakePath[TruePathLen] = L'\\';
+                end = &FakePath[TruePathLen + 1];
+                *end = L'\0';
+                wmemcpy(end, ptr, name_len);
+                end[name_len] = L'\0';
+
+                FILE_NETWORK_OPEN_INFORMATION info;
+                status = File_QueryFullAttributesDirectoryFile(FakePath, &info);
+
+                Dll_Free(FakePath);
+
+                //
+                // add directory entry
+                //
+
+                if (NT_SUCCESS(status)) {
+
+                    info_ptr->FileNameLength = name_len * sizeof(WCHAR);
+                    memcpy(info_ptr->FileName, ptr, info_ptr->FileNameLength);
+                    info_ptr->FileName[info_ptr->FileNameLength] = L'\0';
+
+                    info_ptr->CreationTime = info.CreationTime;
+                    info_ptr->LastAccessTime = info.LastAccessTime;
+                    info_ptr->LastWriteTime = info.LastWriteTime;
+                    info_ptr->ChangeTime = info.ChangeTime;
+                    info_ptr->AllocationSize = info.AllocationSize;
+                    info_ptr->EndOfFile = info.EndOfFile;
+                    info_ptr->FileAttributes = info.FileAttributes;
+
+                    
+    //ULONG           NextEntryOffset;
+    //ULONG           FileIndex;
+    //ULONG           EaInformationLength;
+    //CCHAR           ShortNameLength;
+    //WCHAR           ShortName[12];
+    //LARGE_INTEGER   FileId;
+                    
+
+                    info_ptr->FileId.QuadPart = -1;
+
+                    PrevEntry = &info_ptr->NextEntryOffset;
+
+                    info_ptr->NextEntryOffset = sizeof(FILE_ID_BOTH_DIR_INFORMATION) + info_ptr->FileNameLength + sizeof(WCHAR) + 16; // +16 some buffer space
+
+                    ULONG tmp = (info_ptr->NextEntryOffset & 0x07);
+                    if (tmp != 0) // fix alignment when needed
+                        info_ptr->NextEntryOffset += 0x8 - tmp;
+
+                    info_ptr = (FILE_ID_BOTH_DIR_INFORMATION*)
+                        ((UCHAR*)info_ptr + info_ptr->NextEntryOffset);
+
+                    // todo: fix-me possible info_area buffer overflow!!!!
+                }
+            }
+
+        next:
+            pat = List_Next(pat);
+        }
+    }
+
+    Pool_Free(test_buf, 0x1000);
+
+    status = STATUS_SUCCESS;
+
+    SbieDll_ReleaseFilePathLock();
+
+    if(mask)
+        Pattern_Free(mask);
+
+    if (PrevEntry == NULL) {
+        
+        // no dummys created
+
+        Pool_Delete(qfile->cache_pool);
+        qfile->cache_pool = NULL;
+
+        return STATUS_NO_MORE_ENTRIES;
+    }
+    *PrevEntry = 0;
+
+    qfile->RestartScan = FALSE;
+
+    info_ptr = info_area;
+    while (1) {
+        int cmp;
+
+        len = sizeof(FILE_MERGE_CACHE_FILE)
+            + info_ptr->FileNameLength;
+
+        cache_file = Pool_Alloc(qfile->cache_pool, len);
+        if (! cache_file) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+
+        len = sizeof(FILE_ID_BOTH_DIR_INFORMATION)
+            - sizeof(WCHAR)     // the [1] from FileName[1]
+            + info_ptr->FileNameLength;
+        memcpy(&cache_file->info, info_ptr, len);
+        cache_file->info.NextEntryOffset = 0;
+        cache_file->info_len = len;
+
+        cache_file->name_uni.Length = (USHORT)info_ptr->FileNameLength;
+        cache_file->name_uni.MaximumLength = cache_file->name_uni.Length;
+        cache_file->name_uni.Buffer = cache_file->info.FileName;
+
+        // insert file into the ordered list
+
+        ins_point = List_Head(cache_list);
+        cmp = -1;
+        while (ins_point) {
+            cmp = RtlCompareUnicodeString(
+                &ins_point->name_uni, &cache_file->name_uni,
+                TRUE);                      // CaseInSensitive
+            if ( (cmp > 0) || (cmp == 0) )
+                break;
+            ins_point = List_Next(ins_point);
+        }
+
+        if (cmp != 0) { // skip duplicates
+
+            if (ins_point)
+                List_Insert_Before(cache_list, ins_point, cache_file);
+            else
+                List_Insert_After(cache_list, NULL, cache_file);
+        }
+
+        if (info_ptr->NextEntryOffset == 0)
+            break;
+        info_ptr = (FILE_ID_BOTH_DIR_INFORMATION *)
+            ((UCHAR *)info_ptr + info_ptr->NextEntryOffset);
+    }
+
+    Pool_Free(info_area, INFO_AREA_LEN);
+
+    return status;
+}
+
+
+//---------------------------------------------------------------------------
 // File_MergeFree
 //---------------------------------------------------------------------------
 
@@ -1298,7 +1607,7 @@ _FX void File_MergeFree(FILE_MERGE *merge)
 
 
 _FX NTSTATUS File_GetMergedInformation(
-    FILE_MERGE *merge,
+    FILE_MERGE *merge, WCHAR *TruePath, WCHAR *CopyPath,
     IO_STATUS_BLOCK *IoStatusBlock,
     void *FileInformation,
     ULONG Length,
@@ -1312,6 +1621,8 @@ _FX NTSTATUS File_GetMergedInformation(
     PVOID next_entry;
     WCHAR *name_ptr;
     ULONG len;
+    ULONG TruePathLen = wcslen(TruePath);
+    ULONG CopyPathLen = wcslen(CopyPath);
 
     info_entry_length = 0;
     if (FileInformationClass == FileDirectoryInformation)
@@ -1331,6 +1642,10 @@ _FX NTSTATUS File_GetMergedInformation(
 
     if (info_entry_length > Length)
         return STATUS_INFO_LENGTH_MISMATCH;
+
+    THREAD_DATA *TlsData = Dll_GetTlsData(NULL);
+
+    Dll_PushTlsNameBuffer(TlsData);
 
     prev_entry = FileInformation;
     next_entry = FileInformation;
@@ -1397,7 +1712,7 @@ _FX NTSTATUS File_GetMergedInformation(
 
 				int cmp = RtlCompareUnicodeString(&best->name_uni, &cur->name_uni, TRUE); // CaseInSensitive
 
-				if (cmp == 0) // equal - same file in booth, use newer (best)
+				if (cmp == 0) // equal - same file in both, use newer (best)
 					cur->have_entry = FALSE;
 				else if (cmp > 0)
 					best = cur;
@@ -1408,15 +1723,6 @@ _FX NTSTATUS File_GetMergedInformation(
             ptr_info = best->info;
 			best->have_entry = FALSE;
         }
-
-		// if the entry found was in the copy directory, then the file
-		// may be marked deleted (see Filesys_Mark_File_Deleted for
-		// details).  if it is marked so, we pretend this entry does
-		// not exist by fetching the following one
-
-		if (ptr_info && (!merge->true_ptr || ptr_info != merge->true_ptr->info) &&
-			IS_DELETE_MARK(&ptr_info->CreationTime))
-			continue;
 
         // if both directories are exhausted, reset the
         // NextEntryOffset field of FILE_*_INFORMATION to
@@ -1430,6 +1736,57 @@ _FX NTSTATUS File_GetMergedInformation(
             *(ULONG *)prev_entry = 0;   // reset NextEntryOffset
             break;
         }
+
+        //if (ptr_info->FileId.QuadPart == -1) {
+        //    WCHAR msg[1024];
+        //    Sbie_snwprintf(msg, 1024, L"File_MergeDummy simulate %s", ptr_info->FileName);
+        //    SbieApi_MonitorPutMsg(MONITOR_OTHER | MONITOR_TRACE, msg);
+        //}
+
+        if (File_Delete_v2) {
+
+            if ((merge->true_ptr && ptr_info == merge->true_ptr->info) // is in true path
+                || ptr_info != merge->files[0].info) { // is in template
+
+                WCHAR* TruePath2 = Dll_GetTlsNameBuffer(TlsData, TRUE_NAME_BUFFER, ((TruePathLen + 1) * sizeof(WCHAR) + ptr_info->FileNameLength + sizeof(WCHAR)));
+                WCHAR* ptr = TruePath2;
+                wmemcpy(ptr, TruePath, TruePathLen);
+                ptr += TruePathLen;
+                if (ptr[-1] != L'\\') *ptr++ = L'\\';
+                wmemcpy(ptr, ptr_info->FileName, ptr_info->FileNameLength / sizeof(WCHAR));
+                ptr += ptr_info->FileNameLength / sizeof(WCHAR);
+                *ptr = L'\0';
+
+                WCHAR* CopyPath2 = Dll_GetTlsNameBuffer(TlsData, COPY_NAME_BUFFER, ((CopyPathLen + 1) * sizeof(WCHAR) + ptr_info->FileNameLength + sizeof(WCHAR)));
+                ptr = CopyPath2;
+                wmemcpy(ptr, CopyPath, CopyPathLen);
+                ptr += CopyPathLen;
+                if (ptr[-1] != L'\\') *ptr++ = L'\\';
+                wmemcpy(ptr, ptr_info->FileName, ptr_info->FileNameLength / sizeof(WCHAR));
+                ptr += ptr_info->FileNameLength / sizeof(WCHAR);
+                *ptr = L'\0';
+
+                //
+                // check if the file is listed as deleted
+                //
+
+                if (File_IsDeletedEx(TruePath2, CopyPath2, best->snapshot))
+                    continue;
+
+            } //else // is in copy path - nothing to do
+        }
+        else {
+
+		    // if the entry found was in the copy directory, then the file
+		    // may be marked deleted (see Filesys_Mark_File_Deleted for
+		    // details).  if it is marked so, we pretend this entry does
+		    // not exist by fetching the following one
+
+            if ((!merge->true_ptr || ptr_info != merge->true_ptr->info) &&
+                IS_DELETE_MARK(&ptr_info->CreationTime))
+                continue;
+        }
+
 
         //
         // make sure caller has enough room in output buffer for the
@@ -1456,9 +1813,8 @@ _FX NTSTATUS File_GetMergedInformation(
             *(ULONG *)prev_entry = 0;   // reset NextEntryOffset
 
             if (next_entry == FileInformation)
-                return STATUS_BUFFER_OVERFLOW;
-            else
-                break;
+                status = STATUS_BUFFER_OVERFLOW;
+            break;
         }
 
         //
@@ -1475,6 +1831,15 @@ _FX NTSTATUS File_GetMergedInformation(
 
         name_ptr = File_CopyFixedInformation(
             ptr_info, next_entry, FileInformationClass);
+
+        // This structure must be aligned on a LONGLONG (8-byte) 
+        // boundary. If a buffer contains two or more of these 
+        // structures, the NextEntryOffset value in each entry, 
+        // except the last, falls on an 8-byte boundary.
+        
+        ULONG tmp = (*(ULONG*)next_entry & 0x07);
+        if (tmp != 0) // fix alignment when needed
+            *(ULONG*)next_entry += 0x8 - tmp;
 
         // copy as much of the filename as there is room available
         // in the caller's buffer.  note that for the second and
@@ -1523,6 +1888,8 @@ _FX NTSTATUS File_GetMergedInformation(
     IoStatusBlock->Status = status;
     IoStatusBlock->Information =        // number of bytes written
         (UCHAR *)next_entry - (UCHAR *)FileInformation;
+
+    Dll_PopTlsNameBuffer(TlsData);
 
     return status;
 }
@@ -1915,9 +2282,9 @@ _FX NTSTATUS File_NtCloseImpl(HANDLE FileHandle)
     THREAD_DATA *TlsData = Dll_GetTlsData(&LastError);
 
     NTSTATUS status;
-    ULONG type;
-    FILE_MERGE *merge;
-    MSG_HEADER *req;
+    BOOLEAN DeleteOnClose = FALSE;
+    UNICODE_STRING uni;
+    WCHAR *DeletePath = NULL;
 
     P_NtClose pSysNtClose = __sys_NtClose;
 
@@ -1950,35 +2317,96 @@ _FX NTSTATUS File_NtCloseImpl(HANDLE FileHandle)
     }
 
     //
-    // determine the type of handle we are closing.
-    // if we are closing a key handle, call Key_NtClose
+    // check the handle map and execute the close handlers if there is are any
+    // and prepare the DeleteOnClose if its set
     //
 
-    type = Obj_GetObjectType(FileHandle);
+    Handle_ExecuteCloseHandler(FileHandle, &DeleteOnClose);
 
-    if (type == OBJ_TYPE_KEY) {
+    //
+    // prepare delete disposition if set
+    //
 
-        Key_NtClose(FileHandle);
+    if (DeleteOnClose) {
+
+        Dll_PushTlsNameBuffer(TlsData);
+
+        __try {
+
+            WCHAR *TruePath, *CopyPath;
+            ULONG FileFlags;
+
+            RtlInitUnicodeString(&uni, L"");
+            status = File_GetName(
+                FileHandle, &uni, &TruePath, &CopyPath, &FileFlags);
+
+            ULONG len = wcslen(TruePath);
+            DeletePath = Dll_AllocTemp((len + 8) * sizeof(WCHAR));
+            wmemcpy(DeletePath, TruePath, len + 1);
+
+            if (Dll_ChromeSandbox) {
+
+                //
+                // if this is a Chrome sandbox process, we have
+                // to pass a DOS path to NtDeleteFile rather
+                // than a file handle
+                //
+
+                if (SbieDll_TranslateNtToDosPath(DeletePath)) {
+                    len = wcslen(DeletePath);
+                    wmemmove(DeletePath + 4, DeletePath, len + 1);
+                    wmemcpy(DeletePath, File_BQQB, 4);
+                }
+            }
+
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = GetExceptionCode();
+        }
+
+        Dll_PopTlsNameBuffer(TlsData);
     }
 
     //
-    // if not closing a file handle, stop here
+    // close the handle
     //
 
-    if (type != OBJ_TYPE_FILE) {
+    status = pSysNtClose ? pSysNtClose(FileHandle) : NtClose(FileHandle);
 
-        TlsData->file_NtClose_lock = FALSE;
+    //
+    // finish
+    //
 
-        SetLastError(LastError);
+    TlsData->file_NtClose_lock = FALSE;
 
-        return pSysNtClose ? pSysNtClose(FileHandle) : NtClose(FileHandle);
+    //
+    // execute pending delete disposition
+    //
+
+    if (DeletePath) {
+            
+        OBJECT_ATTRIBUTES objattrs;
+        RtlInitUnicodeString(&uni, DeletePath);
+        InitializeObjectAttributes(
+            &objattrs, &uni, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            
+        File_NtDeleteFileImpl(&objattrs);
+    
+        Dll_Free(DeletePath);
     }
 
-    //
-    // close for a real handle
-    //
+    SetLastError(LastError);
+    return status;
+}
 
-    req = NULL;
+
+//---------------------------------------------------------------------------
+// File_NtCloseDir
+//---------------------------------------------------------------------------
+
+
+_FX VOID File_NtCloseDir(HANDLE FileHandle, void* CloseParams)
+{
+    FILE_MERGE *merge;
 
     EnterCriticalSection(&File_DirHandles_CritSec);
 
@@ -1993,26 +2421,6 @@ _FX NTSTATUS File_NtCloseImpl(HANDLE FileHandle)
     }
 
     LeaveCriticalSection(&File_DirHandles_CritSec);
-
-    //
-    // close and recover file
-    //
-
-    File_NotifyRecover(FileHandle, &req);
-
-    status = pSysNtClose ? pSysNtClose(FileHandle) : NtClose(FileHandle);
-
-    if (req) {
-        MSG_HEADER *rpl = SbieDll_CallServer(req);
-        Dll_Free(req);
-        if (rpl)
-            Dll_Free(rpl);
-    }
-
-    TlsData->file_NtClose_lock = FALSE;
-
-    SetLastError(LastError);
-    return status;
 }
 
 
@@ -2308,509 +2716,6 @@ _FX NTSTATUS File_MarkChildrenDeleted(const WCHAR *ParentTruePath)
     Dll_Free(info);
     NtClose(handle);
     return status;
-}
-
-
-//---------------------------------------------------------------------------
-//
-// Immediate Recovery for Files
-//
-//---------------------------------------------------------------------------
-
-
-//---------------------------------------------------------------------------
-// Structures and Types
-//---------------------------------------------------------------------------
-
-
-typedef struct _FILE_RECOVER_FOLDER {
-
-    LIST_ELEM list_elem;
-    ULONG ticks;            // for File_RecPaths
-    ULONG path_len;
-    WCHAR path[1];
-
-} FILE_RECOVER_FOLDER;
-
-
-//---------------------------------------------------------------------------
-// File_InitRecoverFolders
-//---------------------------------------------------------------------------
-
-
-_FX void File_InitRecoverFolders(void)
-{
-    //
-    // init list of recoverable file handles
-    //
-
-    List_Init(&File_RecoverFolders);
-    List_Init(&File_RecoverIgnores);
-
-    InitializeCriticalSectionAndSpinCount(&File_RecHandles_CritSec, 1000);
-
-    List_Init(&File_RecPaths);
-
-    File_RecHandles = Dll_Alloc(sizeof(HANDLE) * 128);
-    memzero(File_RecHandles, sizeof(HANDLE) * 128);
-    File_RecHandles[127] = (HANDLE)-1;
-
-    //
-    // init list of recover folders
-    //
-
-    if (SbieApi_QueryConfBool(NULL, L"AutoRecover", FALSE)) {
-
-        ULONG buf_len = 4096 * sizeof(WCHAR);
-        WCHAR *buf = Dll_AllocTemp(buf_len);
-
-        File_InitRecoverList(
-            L"RecoverFolder", &File_RecoverFolders, TRUE, buf, buf_len);
-
-        File_InitRecoverList(
-            L"AutoRecoverIgnore", &File_RecoverIgnores, FALSE, buf, buf_len);
-
-        Dll_Free(buf);
-    }
-}
-
-
-//---------------------------------------------------------------------------
-// File_InitRecoverList
-//---------------------------------------------------------------------------
-
-
-_FX void File_InitRecoverList(
-    const WCHAR *setting, LIST *list, BOOLEAN MustBeValidPath,
-    WCHAR *buf, ULONG buf_len)
-{
-    UNICODE_STRING uni;
-    WCHAR *TruePath, *CopyPath, *ReparsedPath;
-    FILE_RECOVER_FOLDER *fold;
-
-    ULONG index = 0;
-    while (1) {
-
-        NTSTATUS status = SbieApi_QueryConf(
-            NULL, setting, index, buf, buf_len - 16 * sizeof(WCHAR));
-        if (! NT_SUCCESS(status))
-            break;
-        ++index;
-
-        RtlInitUnicodeString(&uni, buf);
-        status = File_GetName(NULL, &uni, &TruePath, &CopyPath, NULL);
-
-        ReparsedPath = NULL;
-
-        if (NT_SUCCESS(status) && MustBeValidPath) {
-
-            ReparsedPath = File_TranslateTempLinks(TruePath, FALSE);
-            if (ReparsedPath)
-                TruePath = ReparsedPath;
-
-        } else if ((! NT_SUCCESS(status)) && (! MustBeValidPath)) {
-
-            TruePath = buf;
-            status = STATUS_SUCCESS;
-        }
-
-        if (NT_SUCCESS(status)) {
-
-            ULONG len = wcslen(TruePath);
-            if (len && TruePath[len - 1] == L'\\') {
-                TruePath[len - 1] = L'\0';
-                --len;
-            }
-            len = sizeof(FILE_RECOVER_FOLDER)
-                + (len + 1) * sizeof(WCHAR);
-            fold = Dll_Alloc(len);
-
-            fold->ticks = 0;    // not used
-
-            wcscpy(fold->path, TruePath);
-            fold->path_len = wcslen(fold->path);
-
-            List_Insert_After(list, NULL, fold);
-        }
-
-        if (ReparsedPath)
-            Dll_Free(ReparsedPath);
-    }
-}
-
-
-//---------------------------------------------------------------------------
-// File_IsRecoverable
-//---------------------------------------------------------------------------
-
-
-_FX BOOLEAN File_IsRecoverable(
-    const WCHAR *TruePath)
-{
-    const WCHAR *save_TruePath;
-    FILE_RECOVER_FOLDER *fold;
-    const WCHAR *ptr;
-    ULONG TruePath_len;
-    ULONG PrefixLen;
-    BOOLEAN ok;
-
-    //
-    // if we have a path that looks like
-    // \Device\LanmanRedirector\;Q:000000000000b09f\server\share\f1.txt
-    // \Device\Mup\;LanmanRedirector\;Q:000000000000b09f\server\share\f1.txt
-    // then translate to
-    // \Device\Mup\server\share\f1.txt
-    // and test again.  We do this because the SbieDrv records paths
-    // in the \Device\Mup format.  See SbieDrv::File_TranslateShares.
-    //
-
-    save_TruePath = TruePath;
-
-    if (_wcsnicmp(TruePath, File_Redirector, File_RedirectorLen) == 0)
-        PrefixLen = File_RedirectorLen;
-    else if (_wcsnicmp(TruePath, File_DfsClientRedir, File_DfsClientRedirLen) == 0)
-        PrefixLen = File_DfsClientRedirLen;
-    else if (_wcsnicmp(TruePath, File_HgfsRedir, File_HgfsRedirLen) == 0)
-        PrefixLen = File_HgfsRedirLen;
-    else if (_wcsnicmp(TruePath, File_MupRedir, File_MupRedirLen) == 0)
-        PrefixLen = File_MupRedirLen;
-    else
-        PrefixLen = 0;
-
-    if (PrefixLen && TruePath[PrefixLen] == L';') {
-
-        WCHAR *ptr = wcschr(TruePath + PrefixLen, L'\\');
-        if (ptr && ptr[0] && ptr[1]) {
-
-            ULONG len1   = wcslen(ptr + 1);
-            ULONG len2   = (File_MupLen + len1 + 8) * sizeof(WCHAR);
-            WCHAR *path2 = Dll_Alloc(len2);
-            wmemcpy(path2, File_Mup, File_MupLen);
-            wmemcpy(path2 + File_MupLen, ptr + 1, len1 + 1);
-
-            TruePath = (const WCHAR *)path2;
-        }
-    }
-
-    //
-    // look for the TruePath in the list of RecoverFolder settings
-    //
-
-    ok = FALSE;
-
-    fold = List_Head(&File_RecoverFolders);
-    while (fold) {
-
-        if (_wcsnicmp(fold->path, TruePath, fold->path_len) == 0) {
-            ptr = TruePath + fold->path_len;
-            if (*ptr == L'\\' || *ptr == L'\0') {
-                ok = TRUE;
-                break;
-            }
-        }
-
-        fold = List_Next(fold);
-    }
-
-    if (! ok)
-        goto finish;
-
-    //
-    // ignore files that begin with ~$ (Microsoft Office temp files)
-    // or that don't have a file type extension (probably temp files)
-    //
-
-    if (File_MsoDllLoaded) {
-
-        ptr = wcsrchr(TruePath, L'\\');
-        if (ptr) {
-            if (ptr[1] == L'~' && ptr[2] == L'$')
-                ok = FALSE;
-            else {
-                ptr = wcschr(ptr, L'.');
-                if (! ptr)
-                    ok = FALSE;
-            }
-            if (! ok)
-                goto finish;
-        }
-    }
-
-    //
-    // look for TruePath in the list of AutoRecoverIgnore settings
-    //
-
-    TruePath_len = wcslen(TruePath);
-
-    fold = List_Head(&File_RecoverIgnores);
-    while (fold) {
-
-        if (_wcsnicmp(fold->path, TruePath, fold->path_len) == 0) {
-            ptr = TruePath + fold->path_len;
-            if (*ptr == L'\\' || *ptr == L'\0') {
-                ok = FALSE;
-                break;
-            }
-        }
-
-        if (TruePath_len >= fold->path_len) {
-            ptr = TruePath + TruePath_len - fold->path_len;
-            if (_wcsicmp(fold->path, ptr) == 0) {
-                ok = FALSE;
-                break;
-            }
-        }
-
-        fold = List_Next(fold);
-    }
-
-    //
-    // finish
-    //
-
-finish:
-
-    if (TruePath != save_TruePath)
-        Dll_Free((WCHAR *)TruePath);
-    return ok;
-}
-
-
-//---------------------------------------------------------------------------
-// File_RecordRecover
-//---------------------------------------------------------------------------
-
-
-_FX BOOLEAN File_RecordRecover(HANDLE FileHandle, const WCHAR *TruePath)
-{
-    ULONG i;
-
-    if (! File_RecHandles)
-        return FALSE;
-
-    if (! File_IsRecoverable(TruePath))
-        return FALSE;
-
-    EnterCriticalSection(&File_RecHandles_CritSec);
-
-    if (FileHandle) {
-        for (i = 0; File_RecHandles[i] != (HANDLE)-1; ++i)
-            if (File_RecHandles[i] == FileHandle) {
-                FileHandle = NULL;
-                break;
-            }
-    }
-
-    if (FileHandle) {
-        for (i = 0; File_RecHandles[i] != (HANDLE)-1; ++i)
-            if (! File_RecHandles[i]) {
-                File_RecHandles[i] = FileHandle;
-                FileHandle = NULL;
-                break;
-            }
-    }
-
-    LeaveCriticalSection(&File_RecHandles_CritSec);
-
-    return TRUE;
-}
-
-
-//---------------------------------------------------------------------------
-// File_DuplicateRecover
-//---------------------------------------------------------------------------
-
-
-_FX void File_DuplicateRecover(
-    HANDLE OldFileHandle, HANDLE NewFileHandle)
-{
-    ULONG i;
-    BOOLEAN dup;
-
-    if (! File_RecHandles)
-        return;
-
-    //
-    // called from NtDuplicateObject to duplicate the "recoverability"
-    // of the old handle to the new handle.  needed in particular for
-    // SHFileOperation to recover correctly on Windows Vista
-    //
-
-    dup = FALSE;
-
-    EnterCriticalSection(&File_RecHandles_CritSec);
-
-    for (i = 0; File_RecHandles[i] != (HANDLE)-1; ++i)
-        if (File_RecHandles[i] == OldFileHandle) {
-            dup = TRUE;
-            break;
-        }
-
-    if (dup && NewFileHandle) {
-        for (i = 0; File_RecHandles[i] != (HANDLE)-1; ++i)
-            if (File_RecHandles[i] == NewFileHandle) {
-                NewFileHandle = NULL;
-                break;
-            }
-    }
-
-    if (dup && NewFileHandle) {
-        for (i = 0; File_RecHandles[i] != (HANDLE)-1; ++i)
-            if (! File_RecHandles[i]) {
-                File_RecHandles[i] = NewFileHandle;
-                NewFileHandle = NULL;
-                break;
-            }
-    }
-
-    LeaveCriticalSection(&File_RecHandles_CritSec);
-}
-
-
-//---------------------------------------------------------------------------
-// File_NotifyRecover
-//---------------------------------------------------------------------------
-
-
-_FX void File_NotifyRecover(
-    HANDLE FileHandle, MSG_HEADER **out_req)
-{
-    THREAD_DATA *TlsData = Dll_GetTlsData(NULL);
-
-    NTSTATUS status;
-    union {
-        FILE_NETWORK_OPEN_INFORMATION open;
-        ULONG space[16];
-    } info;
-    ULONG length;
-    ULONG i;
-    ULONG FileFlags;
-    UNICODE_STRING uni;
-    WCHAR *TruePath, *CopyPath;
-    IO_STATUS_BLOCK IoStatusBlock;
-    BOOLEAN IsRecoverable;
-
-    //
-    // check input handle against list of recorded handles
-    //
-
-    if (! File_RecHandles)
-        return;
-
-    IsRecoverable = FALSE;
-    EnterCriticalSection(&File_RecHandles_CritSec);
-
-    for (i = 0; File_RecHandles[i] != (HANDLE)-1; ++i) {
-        if (File_RecHandles[i] == FileHandle)
-        {
-            File_RecHandles[i] = NULL;
-            IsRecoverable = TRUE;
-            break;
-        }
-    }
-
-    LeaveCriticalSection(&File_RecHandles_CritSec);
-
-    //
-    // in a Chrome sandbox process, handles are opened by the broker,
-    // so skip checking against the list of recorded file handles
-    //
-
-    if ((! IsRecoverable) && Dll_ChromeSandbox) {
-
-        FILE_ACCESS_INFORMATION info;
-
-        status = __sys_NtQueryInformationFile(
-            FileHandle, &IoStatusBlock, &info,
-            sizeof(FILE_ACCESS_INFORMATION), FileAccessInformation);
-
-        if (NT_SUCCESS(status) && (info.AccessFlags & FILE_WRITE_DATA))
-            IsRecoverable = TRUE;
-        else
-            IsRecoverable = FALSE;
-    }
-
-    if (! IsRecoverable)
-        return;
-
-    //
-    // send request to SbieCtrl (if recoverable file)
-    //
-
-    Dll_PushTlsNameBuffer(TlsData);
-
-    do {
-
-        RtlInitUnicodeString(&uni, L"");
-        status = File_GetName(
-            FileHandle, &uni, &TruePath, &CopyPath, &FileFlags);
-        if (! NT_SUCCESS(status))
-            break;
-
-        if (! (FileFlags & FGN_IS_BOXED_PATH))
-            break;
-
-        //
-        // Immediate Recovery
-        //
-
-        IsRecoverable = File_IsRecoverable(TruePath);
-        if (! IsRecoverable)
-            break;
-
-        status = __sys_NtQueryInformationFile(
-            FileHandle, &IoStatusBlock, &info,
-            sizeof(FILE_NETWORK_OPEN_INFORMATION),
-            FileNetworkOpenInformation);
-
-        if (! NT_SUCCESS(status))
-            break;
-        if (info.open.EndOfFile.QuadPart == 0)
-            break;
-
-        //
-        // queue immediate recovery elements for later processing
-        //
-
-        if (IsRecoverable) {
-
-            FILE_RECOVER_FOLDER *rec;
-            ULONG TruePath_len;
-
-            EnterCriticalSection(&File_RecHandles_CritSec);
-
-            TruePath_len = wcslen(TruePath);
-
-            rec = List_Head(&File_RecPaths);
-            while (rec) {
-                if (rec->path_len == TruePath_len)
-                    if (_wcsicmp(rec->path, TruePath) == 0)
-                        break;
-                rec = List_Next(rec);
-            }
-
-            if (! rec) {
-
-                length = sizeof(FILE_RECOVER_FOLDER)
-                       + (TruePath_len + 1) * sizeof(WCHAR);
-                rec = Dll_Alloc(length);
-
-                rec->ticks = GetTickCount();
-
-                wcscpy(rec->path, TruePath);
-                rec->path_len = TruePath_len;
-
-                List_Insert_After(&File_RecPaths, NULL, rec);
-            }
-
-            LeaveCriticalSection(&File_RecHandles_CritSec);
-            if (rec)
-                File_DoAutoRecover(TRUE);
-        }
-
-    } while (0);
-
-    Dll_PopTlsNameBuffer(TlsData);
 }
 
 
@@ -3178,14 +3083,13 @@ _FX NTSTATUS File_NtQueryVolumeInformationFile(
     // then open the real drive X to get the correct result
     //
 
-    path = Dll_AllocTemp(8192);
-
     handle = FileHandle;
 
-    status = SbieDll_GetHandlePath(FileHandle, path, &IsBoxedPath);
+    status = SbieDll_GetHandlePath(FileHandle, NULL, &IsBoxedPath);
     if (IsBoxedPath && (
             NT_SUCCESS(status) || (status == STATUS_BAD_INITIAL_PC))) {
-
+        
+        path = Dll_AllocTemp(8192);
         status = SbieDll_GetHandlePath(FileHandle, path, NULL);
         if (NT_SUCCESS(status)) {
 
@@ -3245,9 +3149,10 @@ _FX NTSTATUS File_NtQueryVolumeInformationFile(
                 LeaveCriticalSection(File_DrivesAndLinks_CritSec);
             }
         }
+
+        Dll_Free(path);
     }
 
-    Dll_Free(path);
 
     status = __sys_NtQueryVolumeInformationFile(
         handle, IoStatusBlock, FsInformation, Length, FsInformationClass);
@@ -3260,52 +3165,105 @@ _FX NTSTATUS File_NtQueryVolumeInformationFile(
 
 
 //---------------------------------------------------------------------------
+// File_CanonizePath
+//---------------------------------------------------------------------------
+
+
+WCHAR* File_CanonizePath(const wchar_t* absolute_path, ULONG abs_path_len, const wchar_t* relative_path, ULONG rel_path_len) 
+{
+    ULONG i, j;
+    
+    while(absolute_path[abs_path_len-1] == L'\\')
+        abs_path_len--;
+
+    WCHAR* result = (WCHAR*)Dll_Alloc((abs_path_len + rel_path_len + 1) * sizeof(wchar_t));
+    if (!result) return NULL;
+    wcsncpy(result, absolute_path, abs_path_len);
+    result[abs_path_len] = 0;
+
+    for (i = 0; i < rel_path_len; ) {
+
+        if (relative_path[i] == L'.' && relative_path[i + 1] == L'.' && (relative_path[i + 2] == L'\\' || relative_path[i + 2] == L'\0')) {
+
+            for (j = abs_path_len - 1; j >= 0 && result[j] != L'\\'; --j)
+                result[j] = L'\0';
+            if (j >= 0)
+                result[j] = L'\0';
+
+            abs_path_len = j;
+
+            i += 3;
+
+        } else if (relative_path[i] == L'.' && (relative_path[i + 1] == L'\\' || relative_path[i + 1] == L'\0')) {
+
+            i += 2;
+
+        } else {
+
+            for (j = i; j < rel_path_len && relative_path[j] != L'\\' && relative_path[j] != L'\0'; ++j)
+                ;
+
+            if (abs_path_len > 0 && result[abs_path_len - 1] != L'\\') {
+                result[abs_path_len] = L'\\';
+                abs_path_len++;
+            }
+            
+            wcsncpy(result + abs_path_len, &relative_path[i], j - i);
+            result[abs_path_len + j - i] = L'\0';
+
+            abs_path_len += j - i;
+
+            i = j + (relative_path[j] == L'\\' ? 1 : 0);
+        }
+    }
+
+    return result;
+}
+
+
+//---------------------------------------------------------------------------
 // File_SetReparsePoint
 //---------------------------------------------------------------------------
 
 
 _FX NTSTATUS File_SetReparsePoint(
-    HANDLE FileHandle, UCHAR *Data, ULONG DataLen)
+    HANDLE FileHandle, PREPARSE_DATA_BUFFER Data, ULONG DataLen)
 {
-    THREAD_DATA *TlsData;
+    THREAD_DATA *TlsData = Dll_GetTlsData(NULL);
+
     NTSTATUS status;
     UNICODE_STRING objname;
     OBJECT_ATTRIBUTES objattrs;
     WCHAR *TruePath, *CopyPath;
-    WCHAR *SourcePath, *TargetPath;
-    USHORT NameOffset, NameLength;
+    //WCHAR *SourcePath = NULL, *TargetPath = NULL;
+    WCHAR* AbsolutePath = NULL;
     ULONG FileFlags, mp_flags;
+    PREPARSE_DATA_BUFFER NewData = NULL;
+    ULONG NewDataLen;
+    IO_STATUS_BLOCK MyIoStatusBlock;
+    BOOLEAN MigrateTarget = FALSE;
 
     if (! Data)
         return STATUS_BAD_INITIAL_PC;
-
-    if (*(ULONG *)Data == IO_REPARSE_TAG_SYMLINK)
-        return STATUS_INVALID_DEVICE_REQUEST;
-
-    if (*(ULONG *)Data != IO_REPARSE_TAG_MOUNT_POINT)
-        return STATUS_BAD_INITIAL_PC;
-
-    NameOffset = *(USHORT *)(Data + 8);
-    NameLength = *(USHORT *)(Data + 10);
-
-    SourcePath = NULL;
-    TargetPath = NULL;
 
     //
     // get paths to source and target directories
     //
 
-    TlsData = Dll_GetTlsData(NULL);
-
     Dll_PushTlsNameBuffer(TlsData);
 
     __try {
+        USHORT SubstituteNameLength;
+        WCHAR* SubstituteNameBuffer;
+        USHORT PrintNameLength;
+        WCHAR* PrintNameBuffer;
 
         //
         // get copy path of reparse source
         //
 
         RtlInitUnicodeString(&objname, L"");
+
         InitializeObjectAttributes(
             &objattrs, &objname, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
@@ -3330,35 +3288,141 @@ _FX NTSTATUS File_SetReparsePoint(
             __leave;
         }
 
-		if (File_Snapshot != NULL)
-			File_FindSnapshotPath(&CopyPath);
+        //
+        // get the absolute reparse target path
+        //
 
-        SourcePath = Dll_Alloc((wcslen(CopyPath) + 4) * sizeof(WCHAR));
-        wcscpy(SourcePath, CopyPath);
+        if (Data->ReparseTag == IO_REPARSE_TAG_SYMLINK)
+        {
+            SubstituteNameLength = Data->SymbolicLinkReparseBuffer.SubstituteNameLength;
+            SubstituteNameBuffer = &Data->SymbolicLinkReparseBuffer.PathBuffer[Data->SymbolicLinkReparseBuffer.SubstituteNameOffset/sizeof(WCHAR)];
+            PrintNameLength = Data->SymbolicLinkReparseBuffer.PrintNameLength;
+            PrintNameBuffer = &Data->SymbolicLinkReparseBuffer.PathBuffer[Data->SymbolicLinkReparseBuffer.PrintNameOffset/sizeof(WCHAR)];
+            if (Data->SymbolicLinkReparseBuffer.Flags & SYMLINK_FLAG_RELATIVE) {
+
+                WCHAR* LinkName = wcsrchr(TruePath, L'\\');
+                AbsolutePath = File_CanonizePath(TruePath, (ULONG)(LinkName - TruePath), SubstituteNameBuffer, SubstituteNameLength / sizeof(wchar_t));
+            }
+
+            NewDataLen = (UFIELD_OFFSET(REPARSE_DATA_BUFFER, SymbolicLinkReparseBuffer.PathBuffer) - UFIELD_OFFSET(REPARSE_DATA_BUFFER, GenericReparseBuffer));
+        }
+        else if (Data->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT)
+        {
+            SubstituteNameLength = Data->MountPointReparseBuffer.SubstituteNameLength;
+            SubstituteNameBuffer = &Data->MountPointReparseBuffer.PathBuffer[Data->MountPointReparseBuffer.SubstituteNameOffset/sizeof(WCHAR)];
+            PrintNameLength = Data->MountPointReparseBuffer.PrintNameLength;
+            PrintNameBuffer = &Data->MountPointReparseBuffer.PathBuffer[Data->MountPointReparseBuffer.PrintNameOffset/sizeof(WCHAR)]; 
+
+            NewDataLen = (UFIELD_OFFSET(REPARSE_DATA_BUFFER, MountPointReparseBuffer.PathBuffer) - UFIELD_OFFSET(REPARSE_DATA_BUFFER, GenericReparseBuffer));
+        }
+        else {
+            status = STATUS_BAD_INITIAL_PC;
+            __leave;
+        }
+
+		//if (File_Snapshot != NULL){
+        // WCHAR* TmplName = File_FindSnapshotPath(CopyPath);
+        // if (TmplName) CopyPath = TmplName;
+		//}
+        
+        //SourcePath = Dll_Alloc((wcslen(CopyPath) + 4) * sizeof(WCHAR));
+        //wcscpy(SourcePath, CopyPath);
 
         //
         // get copy path of reparse target
         //
 
-        objname.Length = NameLength;
+        if (AbsolutePath) {
+            objname.Length = wcslen(AbsolutePath) * sizeof(wchar_t);
+            objname.Buffer = AbsolutePath;
+        } else {
+            objname.Length = SubstituteNameLength;
+            objname.Buffer = SubstituteNameBuffer;
+        }
         objname.MaximumLength = objname.Length;
-        objname.Buffer = (WCHAR *)(Data + 0x10 + NameOffset);;
 
         status = File_GetName(NULL, &objname, &TruePath, &CopyPath, NULL);
         if (! NT_SUCCESS(status))
             __leave;
 
-        TargetPath = Dll_Alloc((wcslen(CopyPath) + 4) * sizeof(WCHAR));
-        wcscpy(TargetPath, CopyPath);
+        if (AbsolutePath) {
 
-    //
-    // finish
-    //
+            //
+            // We can allow for a relative path in the box but must ensure the hatget gets migrated
+            //
+                
+            MigrateTarget = TRUE;
+            status = STATUS_BAD_INITIAL_PC;
+            __leave;
+        }
+
+        //TargetPath = Dll_Alloc((wcslen(CopyPath) + 4) * sizeof(WCHAR));
+        //wcscpy(TargetPath, CopyPath);
+
+        WCHAR* NewSubstituteNameBuffer = CopyPath;
+        WCHAR* OldPrintNameBuffer = PrintNameBuffer; // we don't need to change the display name
+        
+        if (Data->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
+
+            SbieDll_TranslateNtToDosPath(NewSubstituteNameBuffer);
+            memmove(NewSubstituteNameBuffer + 4, NewSubstituteNameBuffer, (wcslen(NewSubstituteNameBuffer) + 1) * sizeof(wchar_t));
+            wcsncpy(NewSubstituteNameBuffer, L"\\??\\", 4);
+        }
+
+        SubstituteNameLength = wcslen(NewSubstituteNameBuffer) * sizeof(WCHAR);
+
+        NewDataLen += SubstituteNameLength + sizeof(WCHAR) + PrintNameLength + sizeof(WCHAR) + 8;
+        NewData = Dll_Alloc(NewDataLen);
+        memzero(NewData, sizeof(REPARSE_DATA_BUFFER));
+
+        NewData->ReparseTag = Data->ReparseTag;
+        NewData->Reserved = 0; //Data->Reserved;
+        NewData->ReparseDataLength = (USHORT)NewDataLen - 8;
+
+        if (NewData->ReparseTag == IO_REPARSE_TAG_SYMLINK)
+        {
+            NewData->SymbolicLinkReparseBuffer.SubstituteNameOffset = 0;
+            NewData->SymbolicLinkReparseBuffer.SubstituteNameLength = SubstituteNameLength;
+            SubstituteNameBuffer = &NewData->SymbolicLinkReparseBuffer.PathBuffer[NewData->SymbolicLinkReparseBuffer.SubstituteNameOffset/sizeof(WCHAR)];
+            NewData->SymbolicLinkReparseBuffer.PrintNameLength = PrintNameLength;
+            NewData->SymbolicLinkReparseBuffer.PrintNameOffset = SubstituteNameLength + sizeof(WCHAR);
+            PrintNameBuffer = &NewData->SymbolicLinkReparseBuffer.PathBuffer[NewData->SymbolicLinkReparseBuffer.PrintNameOffset/sizeof(WCHAR)];
+            
+        }
+        else if (NewData->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT)
+        {
+            NewData->MountPointReparseBuffer.SubstituteNameOffset = 0;
+            NewData->MountPointReparseBuffer.SubstituteNameLength = SubstituteNameLength;
+            SubstituteNameBuffer = &NewData->MountPointReparseBuffer.PathBuffer[NewData->MountPointReparseBuffer.SubstituteNameOffset/sizeof(WCHAR)];
+            NewData->MountPointReparseBuffer.PrintNameLength = PrintNameLength;
+            NewData->MountPointReparseBuffer.PrintNameOffset = SubstituteNameLength + sizeof(WCHAR);
+            PrintNameBuffer = &NewData->MountPointReparseBuffer.PathBuffer[NewData->MountPointReparseBuffer.PrintNameOffset/sizeof(WCHAR)]; 
+        }
+
+        memcpy(SubstituteNameBuffer, NewSubstituteNameBuffer, SubstituteNameLength + sizeof(WCHAR));
+        memcpy(PrintNameBuffer, OldPrintNameBuffer, PrintNameLength + sizeof(WCHAR));
 
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
     }
 
+    //
+    // since Curt's code in the driver handles reparsing and the driver is no longer blocking this operation,
+    // we can do it directly without the need to ask our service
+    //
+
+    if (NT_SUCCESS(status)) {
+
+        status = __sys_NtFsControlFile(
+            FileHandle, NULL, NULL, NULL,
+            &MyIoStatusBlock, FSCTL_SET_REPARSE_POINT,
+            NewData, NewDataLen,
+            NULL, 0);
+
+        MigrateTarget = NT_SUCCESS(status);
+    }
+
+    /*
     //
     // send request to SbieSvc
     //
@@ -3402,263 +3466,30 @@ _FX NTSTATUS File_SetReparsePoint(
     if (SourcePath)
         Dll_Free(SourcePath);
     if (TargetPath)
-        Dll_Free(TargetPath);
+        Dll_Free(TargetPath);*/
+
+    if (MigrateTarget) {
+
+        //
+        // We must migrate the file or directory into the sandbox as the path reparsing by NtCreateFile
+        // is done by the kernel and we do not "manually" reparse the path before invoking it,
+        // hence there must be the expected file at the path we are linking to.
+        //
+
+        HANDLE SourceHandle;
+        if (NT_SUCCESS(File_OpenForRenameFile(&SourceHandle, TruePath)))
+            NtClose(SourceHandle);
+    }
+
+    if (AbsolutePath)
+        Dll_Free(AbsolutePath);
+
+    if (NewData)
+        Dll_Free(NewData);
 
     Dll_PopTlsNameBuffer(TlsData);
 
     return status;
-}
-
-
-//---------------------------------------------------------------------------
-// File_DoAutoRecover
-//---------------------------------------------------------------------------
-
-
-_FX void File_DoAutoRecover(BOOLEAN force)
-{
-    static ULONG last_ticks = 0;
-
-    ULONG LastError;
-    THREAD_DATA *TlsData = Dll_GetTlsData(&LastError);
-
-    ULONG ticks = GetTickCount();
-    if (force || (ticks - last_ticks > 400)) {
-
-        last_ticks = ticks;
-
-        if (TryEnterCriticalSection(&File_RecHandles_CritSec)) {
-
-            if (List_Head(&File_RecPaths)) {
-
-                Dll_PushTlsNameBuffer(TlsData);
-
-                File_DoAutoRecover_2(force, ticks);
-
-                Dll_PopTlsNameBuffer(TlsData);
-            }
-
-            LeaveCriticalSection(&File_RecHandles_CritSec);
-        }
-    }
-
-    SetLastError(LastError);
-}
-
-
-//---------------------------------------------------------------------------
-// File_DoAutoRecover_2
-//---------------------------------------------------------------------------
-
-
-_FX void File_DoAutoRecover_2(BOOLEAN force, ULONG ticks)
-{
-    NTSTATUS status;
-    SYSTEM_HANDLE_INFORMATION *info = NULL;
-    FILE_GET_ALL_HANDLES_RPL *rpl = NULL;
-    ULONG info_len = 64, len, i;
-    WCHAR *pathbuf;
-    ULONG UseCount = 0;
-    FILE_RECOVER_FOLDER *rec;
-    UCHAR FileObjectTypeNumber = 0;
-
-    //
-    // get list of open handles in the system
-    //
-
-    for (i = 0; i < 5; ++i) {
-
-        info = Dll_AllocTemp(info_len);
-
-        status = NtQuerySystemInformation(
-            SystemHandleInformation, info, info_len, &len);
-
-        if (NT_SUCCESS(status))
-            break;
-
-        Dll_Free(info);
-        info_len = len + 64;
-
-        if (status == STATUS_BUFFER_OVERFLOW ||
-            status == STATUS_INFO_LENGTH_MISMATCH ||
-            status == STATUS_BUFFER_TOO_SMALL) {
-
-            continue;
-        }
-
-        break;
-    }
-
-    if (status == STATUS_ACCESS_DENIED) {
-
-        //
-        // on Windows 8.1, NtQuerySystemInformation fails, probably because
-        // we are running without any privileges, so go through SbieSvc
-        //
-
-        MSG_HEADER req;
-        req.length = sizeof(req);
-        req.msgid = MSGID_FILE_GET_ALL_HANDLES;
-        rpl = (FILE_GET_ALL_HANDLES_RPL *)SbieDll_CallServer(&req);
-
-        if (rpl) {
-            info = NULL;
-            status = STATUS_SUCCESS;
-        }
-    }
-
-    if (! NT_SUCCESS(status))
-        return;
-
-    pathbuf = Dll_AllocTemp(1024);
-
-    //
-    // scan list of queued recovery files
-    //
-
-    rec = List_Head(&File_RecPaths);
-    while (rec) {
-
-        FILE_RECOVER_FOLDER *rec_next = List_Next(rec);
-        BOOLEAN send2199 = FALSE;
-
-        if (force)
-            send2199 = TRUE;
-        else {
-            if (ticks - rec->ticks >= 1000) {
-                ULONG UseCount = File_DoAutoRecover_3(
-                    rec->path, pathbuf, info, rpl, &FileObjectTypeNumber);
-                if (UseCount == 0)
-                    send2199 = TRUE;
-            }
-        }
-
-        if (send2199) {
-            WCHAR *colon = wcschr(rec->path, L':');
-			if (!colon) {
-				const WCHAR* strings[] = { Dll_BoxName, rec->path, NULL };
-				SbieApi_LogMsgExt(2199, strings);
-			}
-            List_Remove(&File_RecPaths, rec);
-        }
-
-        rec = rec_next;
-    }
-
-    //
-    // finish
-    //
-
-    Dll_Free(pathbuf);
-    if (info)
-        Dll_Free(info);
-    if (rpl)
-        Dll_Free(rpl);
-}
-
-
-//---------------------------------------------------------------------------
-// File_DoAutoRecover_3
-//---------------------------------------------------------------------------
-
-
-_FX ULONG File_DoAutoRecover_3(
-    const WCHAR *PathToFind, WCHAR *PathBuf1024,
-    SYSTEM_HANDLE_INFORMATION *info, FILE_GET_ALL_HANDLES_RPL *rpl,
-    UCHAR *FileObjectTypeNumber)
-{
-    HANDLE FileHandle;
-    ULONG UseCount, i;
-
-    //
-    // scan handles for current process
-    //
-
-    UseCount = 0;
-
-    if (info) {
-
-        for (i = 0; i < info->Count; ++i) {
-
-            HANDLE_INFO *hi = &info->HandleInfo[i];
-
-            if (hi->ProcessId != Dll_ProcessId)
-                continue;
-
-            FileHandle = (HANDLE)(ULONG_PTR)hi->Handle;
-
-            UseCount += File_DoAutoRecover_4(
-                    PathToFind, PathBuf1024,
-                    FileHandle, hi->ObjectTypeNumber, FileObjectTypeNumber);
-        }
-
-    } else if (rpl) {
-
-        for (i = 0; i < rpl->num_handles; ++i) {
-
-            UCHAR objtype = (UCHAR)(rpl->handles[i] >> 24);
-
-            FileHandle = (HANDLE)(ULONG_PTR)(rpl->handles[i] & 0x00FFFFFFU);
-
-            UseCount += File_DoAutoRecover_4(
-                    PathToFind, PathBuf1024,
-                    FileHandle, objtype, FileObjectTypeNumber);
-        }
-    }
-
-    return UseCount;
-}
-
-
-//---------------------------------------------------------------------------
-// File_DoAutoRecover_4
-//---------------------------------------------------------------------------
-
-
-_FX ULONG File_DoAutoRecover_4(
-    const WCHAR *PathToFind, WCHAR *PathBuf1024,
-    HANDLE FileHandle, UCHAR ObjectTypeNumber, UCHAR *FileObjectTypeNumber)
-{
-    UNICODE_STRING uni;
-    WCHAR *TruePath, *CopyPath;
-    NTSTATUS status;
-
-    //
-    // make sure the handle is to a file
-    //
-
-    if (*FileObjectTypeNumber) {
-
-        if (ObjectTypeNumber != *FileObjectTypeNumber)
-            return 0;
-
-    } else {
-
-        if (Obj_GetObjectType(FileHandle) == OBJ_TYPE_FILE) {
-
-            *FileObjectTypeNumber = ObjectTypeNumber;
-
-        } else
-            return 0;
-    }
-
-    //
-    // get file name
-    //
-
-    status = SbieApi_GetFileName(FileHandle, 1000, PathBuf1024);
-    if (! NT_SUCCESS(status))
-        return 0;
-
-    RtlInitUnicodeString(&uni, PathBuf1024);
-    status = File_GetName(NULL, &uni, &TruePath, &CopyPath, NULL);
-    if (! NT_SUCCESS(status))
-        return 0;
-
-    if (_wcsicmp(PathToFind, TruePath) == 0)
-        return 1;
-
-    return 0;
 }
 
 
@@ -3689,128 +3520,53 @@ _FX NTSTATUS File_MyQueryDirectoryFile(
 
 
 //---------------------------------------------------------------------------
-// File_MsoDll
+// File_CreateBaseFolders
 //---------------------------------------------------------------------------
 
+//#include <Knownfolders.h>
 
-_FX BOOLEAN File_MsoDll(HMODULE module)
+_FX void File_CreateBaseFolders()
 {
+    NTSTATUS status;
+    WCHAR conf_buf[2048];
+
     //
-    // hack for File_IsRecoverable
+    // in privacy mode we need to pre create some folders or else programs may fail
     //
 
-    File_MsoDllLoaded = TRUE;
-    return TRUE;
-}
+    //File_CreateBoxedPath(File_SysVolume);
+    // 
+    //if (SbieApi_QueryConfBool(NULL, L"SeparateUserFolders", TRUE)) {
+    //    File_CreateBoxedPath(File_AllUsers);
+    //    File_CreateBoxedPath(File_CurrentUser);
+    //}
 
+    for (ULONG index = 0; ; ++index) {
 
-//---------------------------------------------------------------------------
-// File_Scramble_Char
-//---------------------------------------------------------------------------
+        status = SbieApi_QueryConf(
+            L"TemplateDefaultFolders", L"DefaultFolder", index | CONF_GET_NO_GLOBAL, conf_buf, sizeof(conf_buf) - 16 * sizeof(WCHAR));
+        if (!NT_SUCCESS(status))
+            break;
 
+        File_CreateBoxedPath(conf_buf);
+    }
 
-_FX WCHAR File_Scramble_Char(WCHAR wValue, int Key, BOOLEAN scram)
-{
-	//
-	// This function allows to scramble file name charakters properly, 
-	// i.e. no invalid cahacters can result fron this operation.
-	// It does not scramble invalid charakters like: " * / : < > ? \ |
-	// And it does not scramble ~
-	// The entropy of the scrambler is 25,5bit (i.e. 52 million values)
-	//
+    for (ULONG index = 0; ; ++index) {
 
-	char reserved_ch[] = { '\"', '*', '/', ':', '<', '>', '?', '\\', '|' };
-	const int reserved_count = 9;
-	const int max_ch = 0x7E - reserved_count - 0x20;
+        status = SbieApi_QueryConf(
+            NULL, L"DefaultFolder", index | CONF_GET_NO_EXPAND, conf_buf, sizeof(conf_buf) - 16 * sizeof(WCHAR));
+        if (!NT_SUCCESS(status))
+            break;
 
-	int uValue = (wValue & 0x7F);
-	if (uValue < 0x20 || uValue >= 0x7E) // < space || >= ~
-		return wValue;
-	for (int i = 0; i < reserved_count; i++)
-		if (uValue == reserved_ch[i]) return wValue;
+        WCHAR expanded[MAX_PATH];
+        DWORD len = ExpandEnvironmentStringsW(conf_buf, expanded, MAX_PATH);
+        if (len == 0 || len > MAX_PATH || wcschr(expanded, L'%'))
+            continue;
 
-	Key &= 0x7f;
-	while (Key >= max_ch)
-		Key -= max_ch;
-	if (!scram)
-		Key = -Key;
-
-	for (int i = 1; i <= reserved_count; i++)
-		if (uValue > reserved_ch[reserved_count - i])	uValue -= 1;
-	uValue -= 0x20;
-
-	uValue += Key;
-
-	if (uValue >= max_ch)
-		uValue -= max_ch;
-	else if (uValue < 0)
-		uValue += max_ch;
-
-	uValue += 0x20;
-	for (int i = 0; i < reserved_count; i++)
-		if (uValue >= reserved_ch[i])	uValue += 1;
-
-	return uValue;
-}
-
-
-//---------------------------------------------------------------------------
-// File_ScrambleShortName
-//---------------------------------------------------------------------------
-
-
-_FX void File_ScrambleShortName(WCHAR* ShortName, CCHAR* ShortNameBytes, ULONG ScramKey)
-{
-	CCHAR ShortNameLength = *ShortNameBytes / sizeof(WCHAR);
-
-	CCHAR dot_pos;
-	WCHAR *dot = wcsrchr(ShortName, L'.');
-	if (dot == NULL) {
-		dot_pos = ShortNameLength;
-		if (ShortNameLength >= 12)
-			return; // this should never not happen!
-		ShortName[ShortNameLength++] = L'.';
-	}
-	else
-		dot_pos = (CCHAR)(dot - ShortName);
-
-	while (ShortNameLength - dot_pos < 4)
-	{
-		if (ShortNameLength >= 12)
-			return; // this should never not happen!
-		ShortName[ShortNameLength++] = L' ';
-	}
-
-	*ShortNameBytes = ShortNameLength * sizeof(WCHAR);
-
-	if (dot_pos > 0)
-		ShortName[dot_pos - 1] = File_Scramble_Char(ShortName[dot_pos - 1], ((char*)&ScramKey)[0], TRUE);
-	for (int i = 1; i <= 3; i++)
-		ShortName[dot_pos + i] = File_Scramble_Char(ShortName[dot_pos + i], ((char*)&ScramKey)[i], TRUE);
-}
-
-
-//---------------------------------------------------------------------------
-// File_UnScrambleShortName
-//---------------------------------------------------------------------------
-
-
-_FX void File_UnScrambleShortName(WCHAR* ShortName, ULONG ScramKey)
-{
-	CCHAR ShortNameLength = (CCHAR)wcslen(ShortName);
-
-	WCHAR *dot = wcsrchr(ShortName, L'.');
-	if (dot == NULL)
-		return; // not a scrambled short name.
-	CCHAR dot_pos = (CCHAR)(dot - ShortName);
-
-	if (dot_pos > 0)
-		ShortName[dot_pos - 1] = File_Scramble_Char(ShortName[dot_pos - 1], ((char*)&ScramKey)[0], FALSE);
-	for (int i = 1; i <= 3; i++)
-		ShortName[dot_pos + i] = File_Scramble_Char(ShortName[dot_pos + i], ((char*)&ScramKey)[i], FALSE);
-
-	while (ShortName[ShortNameLength - 1] == L' ')
-		ShortName[ShortNameLength-- - 1] = 0;
-	if (ShortName[ShortNameLength - 1] == L'.')
-		ShortName[ShortNameLength-- - 1] = 0;
+        WCHAR* pathNT = File_TranslateDosToNtPath(expanded);
+        if (pathNT) {
+            File_CreateBoxedPath(pathNT);
+            Dll_Free(pathNT);
+        }
+    }
 }

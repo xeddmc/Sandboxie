@@ -35,7 +35,7 @@
 
 struct BoxBorderParms {
 
-    WCHAR boxname[48];
+    WCHAR boxname[BOXNAME_COUNT];
     COLORREF color;
     BOOL title;
     int width;
@@ -176,7 +176,7 @@ void CBorderGuard::Refresh()
     HWND hwnd;
     ULONG style;
     ULONG pid = NULL;
-    WCHAR boxname[48];
+    WCHAR boxname[BOXNAME_COUNT];
     boxname[0] = L'\0';
 
     hwnd = GetForegroundWindow();
@@ -246,7 +246,7 @@ void CBorderGuard::Refresh()
                 //
                 // window rect is same as last recorded window rect
                 // but if we track title area for border then also
-                // check the cursor is stil in the title area
+                // check the cursor is still in the title area
                 //
 
                 refresh = FALSE;
@@ -449,25 +449,31 @@ void CBorderGuard::RefreshBorder(
 
     desktop = &monitor.rcWork;
 
+
     int ax = rect->left;
-    if (ax < desktop->left)
+    if (rect->left < desktop->left && (desktop->left - rect->left) < (boxparm->width + 4))
         ax = desktop->left;
 
     int ay = rect->top;
-    if (ay < desktop->top)
+    if (rect->top < desktop->top && (desktop->top - rect->top) < (boxparm->width + 4))
         ay = desktop->top;
 
     int aw = -ax;
-    if (rect->right <= desktop->right)
-        aw += rect->right;
-    else
+    if (rect->right > desktop->right && (desktop->right - rect->right) < (boxparm->width + 4))
         aw += desktop->right;
+    else
+        aw += rect->right;
 
     int ah = -ay;
-    if (rect->bottom <= desktop->bottom)
-        ah += rect->bottom;
-    else
+    if (rect->bottom > desktop->bottom && (desktop->bottom - rect->bottom) < (boxparm->width + 4))
         ah += desktop->bottom;
+    else
+        ah += rect->bottom;
+        
+
+
+	if (rect->bottom == desktop->bottom) 
+		ah -= 1;
 
     //int bb = 6;
     //if (rect->left   <= desktop->left &&
@@ -562,6 +568,7 @@ void CBorderGuard::RefreshBorder(
 
     HRGN hrgn = CreatePolygonRgn(points, num_points, ALTERNATE);
     SetWindowRgn(m_border_hwnd, hrgn, TRUE);
+    DeleteObject(hrgn);
     SetWindowPos(m_border_hwnd, NULL, ax, ay, aw, ah,
                  SWP_SHOWWINDOW | SWP_NOACTIVATE);
 

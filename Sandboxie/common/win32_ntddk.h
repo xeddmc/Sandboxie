@@ -190,6 +190,60 @@ typedef CONST OBJECT_ATTRIBUTES *PCOBJECT_ATTRIBUTES;
     (p)->SecurityQualityOfService = NULL;               \
     }
 
+NTSYSAPI BOOLEAN WINAPI RtlValidSecurityDescriptor(
+  PSECURITY_DESCRIPTOR SecurityDescriptor
+);
+
+NTSYSAPI NTSTATUS WINAPI RtlGetControlSecurityDescriptor(
+  PSECURITY_DESCRIPTOR pSecurityDescriptor,
+  PSECURITY_DESCRIPTOR_CONTROL pControl,
+  LPDWORD lpdwRevision
+);
+
+NTSYSAPI NTSTATUS WINAPI RtlMakeSelfRelativeSD(
+  PSECURITY_DESCRIPTOR pAbsoluteSecurityDescriptor,
+  PSECURITY_DESCRIPTOR pSelfRelativeSecurityDescriptor,
+  LPDWORD lpdwBufferLength
+);
+
+NTSYSAPI ULONG WINAPI RtlLengthSecurityDescriptor(
+  PSECURITY_DESCRIPTOR SecurityDescriptor
+);
+
+NTSYSAPI NTSTATUS WINAPI RtlAbsoluteToSelfRelativeSD(
+  PSECURITY_DESCRIPTOR AbsoluteSecurityDescriptor,
+  PSECURITY_DESCRIPTOR SelfRelativeSecurityDescriptor,
+  PULONG               BufferLength
+);
+
+NTSYSAPI NTSTATUS WINAPI RtlSelfRelativeToAbsoluteSD(
+  PSECURITY_DESCRIPTOR SelfRelativeSecurityDescriptor,
+  PSECURITY_DESCRIPTOR AbsoluteSecurityDescriptor,
+  PULONG               AbsoluteSecurityDescriptorSize,
+  PACL                 Dacl,
+  PULONG               DaclSize,
+  PACL                 Sacl,
+  PULONG               SaclSize,
+  PSID                 Owner,
+  PULONG               OwnerSize,
+  PSID                 PrimaryGroup,
+  PULONG               PrimaryGroupSize
+);
+
+NTSYSAPI NTSTATUS WINAPI RtlGetAce(
+  PACL  Acl,
+  ULONG AceIndex,
+  PVOID *Ace
+);
+
+NTSYSAPI NTSTATUS WINAPI RtlAddAce(
+  PACL  Acl,
+  ULONG AceRevision,
+  ULONG StartingAceIndex,
+  PVOID AceList,
+  ULONG AceListLength
+);
+
 //---------------------------------------------------------------------------
 
 #define PAGE_SIZE 4096
@@ -227,8 +281,6 @@ typedef struct __PUBLIC_OBJECT_TYPE_INFORMATION {
     UNICODE_STRING TypeName;
 
     ULONG Reserved [22];    // reserved for internal use
-
-    BYTE  ExtraPadding[48]; // NtQueryObject often requires more space than MSDN says
 
 } PUBLIC_OBJECT_TYPE_INFORMATION, *PPUBLIC_OBJECT_TYPE_INFORMATION;
 
@@ -305,6 +357,14 @@ NtCreateDirectoryObject(
     IN ACCESS_MASK          DesiredAccess,
     IN POBJECT_ATTRIBUTES   ObjectAttributes
 );
+
+__declspec(dllimport) NTSTATUS __stdcall
+NtCreateDirectoryObjectEx(
+    OUT PHANDLE DirectoryHandle,
+    IN ACCESS_MASK DesiredAccess,
+    IN POBJECT_ATTRIBUTES ObjectAttributes,
+    IN HANDLE ShadowDirectoryHandle,
+    IN ULONG Flags);
 
 __declspec(dllimport) NTSTATUS __stdcall
 NtOpenDirectoryObject(
@@ -452,8 +512,8 @@ typedef enum _FILE_INFORMATION_CLASS {
     FileNumaNodeInformation,                 // 53
     FileStandardLinkInformation,             // 54
     FileRemoteProtocolInformation,           // 55
-    FileRenameInformationBypassAccessCheck,  // 56
-    FileLinkInformationBypassAccessCheck,    // 57
+    FileRenameInformationBypassAccessCheck,  // 56 - kernel mode only
+    FileLinkInformationBypassAccessCheck,    // 57 - kernel mode only
     FileVolumeNameInformation,               // 58
     FileIdInformation,                       // 59
     FileIdExtdDirectoryInformation,          // 60
@@ -461,8 +521,18 @@ typedef enum _FILE_INFORMATION_CLASS {
     FileHardLinkFullIdInformation,
     FileIdExtdBothDirectoryInformation,
     FileDispositionInformationEx,
-    FileRenameInformationEx,                 // 65
-    FileRenameInformationExBypassAccessCheck,
+    FileRenameInformationEx,                        // 65
+    FileRenameInformationExBypassAccessCheck,       // 66 - kernel mode only
+    FileDesiredStorageClassInformation,             // 67
+    FileStatInformation,                            // 68
+    FileMemoryPartitionInformation,                 // 69
+    FileStatLxInformation,                          // 70
+    FileCaseSensitiveInformation,                   // 71
+    FileLinkInformationEx,                          // 72
+    FileLinkInformationExBypassAccessCheck,         // 73 - kernel mode only
+    FileStorageReserveIdInformation,                // 74
+    FileCaseSensitiveInformationForceAccessCheck,   // 75
+
     FileMaximumInformation
 } FILE_INFORMATION_CLASS, *PFILE_INFORMATION_CLASS;
 
@@ -554,13 +624,34 @@ typedef struct _FILE_SHORT_NAME_INFORMATION {
 
 // FileDispositionInformation
 typedef struct _FILE_DISPOSITION_INFORMATION {
-    BOOLEAN DeleteFile;
+    BOOLEAN DeleteFileOnClose;
 } FILE_DISPOSITION_INFORMATION, *PFILE_DISPOSITION_INFORMATION;
+
+// // FileDispositionInformationEx
+#if (_WIN32_WINNT >= _WIN32_WINNT_WIN10_RS1)
+#define FILE_DISPOSITION_DO_NOT_DELETE              0x00000000
+#define FILE_DISPOSITION_DELETE                     0x00000001
+#define FILE_DISPOSITION_POSIX_SEMANTICS            0x00000002
+#define FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK  0x00000004
+#define FILE_DISPOSITION_ON_CLOSE                   0x00000008
+#if (_WIN32_WINNT >= _WIN32_WINNT_WIN10_RS5)
+#define FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE  0x00000010
+#endif
+
+typedef struct _FILE_DISPOSITION_INFORMATION_EX {
+    ULONG Flags;
+} FILE_DISPOSITION_INFORMATION_EX, *PFILE_DISPOSITION_INFORMATION_EX;
+#endif
 
 // FilePositionInformation
 typedef struct _FILE_POSITION_INFORMATION {
     LARGE_INTEGER CurrentByteOffset;
 } FILE_POSITION_INFORMATION, *PFILE_POSITION_INFORMATION;
+
+// FileEndOfFileInformation
+typedef struct _FILE_END_OF_FILE_INFORMATION {
+  LARGE_INTEGER EndOfFile;
+} FILE_END_OF_FILE_INFORMATION, *PFILE_END_OF_FILE_INFORMATION;
 
 // FileStreamInformation
 typedef struct _FILE_STREAM_INFORMATION {
@@ -671,6 +762,21 @@ typedef struct _FILE_ALL_INFORMATION {
     FILE_NAME_INFORMATION NameInformation;
 } FILE_ALL_INFORMATION, *PFILE_ALL_INFORMATION;
 
+// FileLinkInformation
+typedef struct _FILE_LINK_INFORMATION {
+#if (_WIN32_WINNT >= _WIN32_WINNT_WIN10_RS5)
+    union {
+        BOOLEAN ReplaceIfExists;  // FileLinkInformation
+        ULONG Flags;              // FileLinkInformationEx
+    } DUMMYUNIONNAME;
+#else
+    BOOLEAN ReplaceIfExists;
+#endif
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} FILE_LINK_INFORMATION, *PFILE_LINK_INFORMATION;
+
 __declspec(dllimport) NTSTATUS __stdcall
 NtCreateFile(
     OUT PHANDLE                     FileHandle,
@@ -719,6 +825,15 @@ NtQueryInformationFile(
     IN ULONG                        Length,
     IN FILE_INFORMATION_CLASS       FileInformationClass
 );
+
+/*__declspec(dllimport) NTSTATUS __stdcall
+NtQueryInformationByName(
+    _In_ POBJECT_ATTRIBUTES ObjectAttributes,
+    _Out_ PIO_STATUS_BLOCK IoStatusBlock,
+    _Out_writes_bytes_(Length) PVOID FileInformation,
+    _In_ ULONG Length,
+    _In_ FILE_INFORMATION_CLASS FileInformationClass
+);*/
 
 __declspec(dllimport) NTSTATUS __stdcall
 NtQueryAttributesFile(
@@ -857,6 +972,14 @@ typedef enum _FSINFOCLASS {
     FileFsDriverPathInformation, // 9
     FileFsMaximumInformation
 } FS_INFORMATION_CLASS, *PFS_INFORMATION_CLASS;
+
+typedef struct _FILE_FS_VOLUME_INFORMATION {
+  LARGE_INTEGER VolumeCreationTime;
+  ULONG         VolumeSerialNumber;
+  ULONG         VolumeLabelLength;
+  BOOLEAN       SupportsObjects;
+  WCHAR         VolumeLabel[1];
+} FILE_FS_VOLUME_INFORMATION, *PFILE_FS_VOLUME_INFORMATION;
 
 __declspec(dllimport) NTSTATUS __stdcall
 NtQueryVolumeInformationFile(
@@ -1076,6 +1199,8 @@ typedef enum _KEY_INFORMATION_CLASS {
     KeyFlagsInformation,
     KeyVirtualizationInformation,   // Windows Vista
     KeyHandleTagsInformation,       // Windows 7
+    KeyTrustInformation,
+    KeyLayerInformation,
     MaxKeyInfoClass
 } KEY_INFORMATION_CLASS;
 
@@ -1643,7 +1768,7 @@ typedef struct _ALPC_MESSAGE_VIEW {
     ULONG               SendFlags;
     ULONG               ReceiveFlags;
     union {
-        ULONG           Unknowns[12];
+        ULONG           Unknowns[16]; // was 12
         struct {
             ULONG       ReplyLength;
             ULONG       Unknown1;
@@ -1970,6 +2095,11 @@ __declspec(dllimport) NTSTATUS __stdcall NtLoadKey(
     POBJECT_ATTRIBUTES TargetObjectAttributes,
     POBJECT_ATTRIBUTES SourceObjectAttributes);
 
+__declspec(dllimport) NTSTATUS __stdcall NtLoadKey2(
+    POBJECT_ATTRIBUTES TargetObjectAttributes,
+    POBJECT_ATTRIBUTES SourceObjectAttributes,
+    ULONG Flags);
+
 __declspec(dllimport) NTSTATUS __stdcall NtSaveKey(
     HANDLE KeyHandle,
     HANDLE FileHandle);
@@ -2093,6 +2223,17 @@ __declspec(dllimport) NTSTATUS __stdcall NtMapViewOfSection(
     IN  ULONG AllocationType,
     IN  ULONG Protect);
 
+__declspec(dllimport) NTSTATUS __stdcall NtNotifyChangeDirectoryFile(
+    IN  HANDLE FileHandle,
+    IN  HANDLE Event OPTIONAL,
+    IN  PIO_APC_ROUTINE ApcRoutine OPTIONAL,
+    IN  PVOID ApcContext OPTIONAL,
+    OUT PIO_STATUS_BLOCK IoStatusBlock,
+    OUT PVOID Buffer,
+    IN  ULONG BufferSize,
+    IN  ULONG CompletionFilter,
+    IN  BOOLEAN WatchTree);
+
 __declspec(dllimport) NTSTATUS __stdcall NtUnmapViewOfSection(
     IN  HANDLE ProcessHandle,
     IN  PVOID BaseAddress);
@@ -2174,6 +2315,22 @@ __declspec(dllimport) NTSTATUS __stdcall NtFilterToken(
     IN PTOKEN_GROUPS RestrictedSids OPTIONAL,
     OUT PHANDLE NewTokenHandle);
 
+__declspec(dllimport) NTSTATUS __stdcall NtFilterTokenEx(
+    _In_ HANDLE ExistingTokenHandle,
+    _In_ ULONG Flags,
+    _In_opt_ PTOKEN_GROUPS SidsToDisable,
+    _In_opt_ PTOKEN_PRIVILEGES PrivilegesToDelete,
+    _In_opt_ PTOKEN_GROUPS RestrictedSids,
+    _In_ ULONG DisableUserClaimsCount,
+    _In_opt_ PUNICODE_STRING UserClaimsToDisable,
+    _In_ ULONG DisableDeviceClaimsCount,
+    _In_opt_ PUNICODE_STRING DeviceClaimsToDisable,
+    _In_opt_ PTOKEN_GROUPS DeviceGroupsToDisable,
+    _In_opt_ PVOID RestrictedUserAttributes,
+    _In_opt_ PVOID RestrictedDeviceAttributes,
+    _In_opt_ PTOKEN_GROUPS RestrictedDeviceGroups,
+    _Out_ PHANDLE NewTokenHandle);
+
 __declspec(dllimport) NTSTATUS __stdcall NtAdjustPrivilegesToken(
     IN HANDLE TokenHandle,
     IN BOOLEAN DisableAllPrivileges,
@@ -2188,6 +2345,12 @@ __declspec(dllimport) NTSTATUS __stdcall NtPrivilegeCheck(
     OUT PBOOLEAN Result);
 
 typedef NTSTATUS (*P_RtlQueryElevationFlags)(ULONG *Flags);
+
+typedef NTSTATUS (*P_RtlCheckTokenMembershipEx)(
+    HANDLE tokenHandle,
+    PSID sidToCheck,
+    DWORD flags,
+    PBOOL isMember);
 
 __declspec(dllimport) NTSTATUS RtlQueryElevationFlags(ULONG *Flags);
 
@@ -2220,6 +2383,20 @@ __declspec(dllimport) NTSTATUS RtlCreateSecurityDescriptor(
     ULONG Revision
 );
 
+__declspec(dllimport) NTSTATUS RtlGetOwnerSecurityDescriptor(
+    PSECURITY_DESCRIPTOR SecurityDescriptor,
+    PSID* Owner, PBOOLEAN OwnerDefaulted
+);
+
+__declspec(dllimport) NTSTATUS RtlGetGroupSecurityDescriptor(
+    PSECURITY_DESCRIPTOR SecurityDescriptor,
+    PSID* Group, PBOOLEAN GroupDefaulted
+);
+
+__declspec(dllimport) BOOLEAN NTAPI RtlEqualSid(PSID Sid1, PSID Sid2);
+__declspec(dllimport) ULONG NTAPI RtlLengthSid(PSID Sid);
+__declspec(dllimport) PVOID NTAPI RtlFreeSid(PSID Sid);
+
 //---------------------------------------------------------------------------
 
 typedef struct _RTL_DRIVE_LETTER_CURDIR {
@@ -2232,26 +2409,31 @@ typedef struct _RTL_DRIVE_LETTER_CURDIR {
 typedef struct _RTL_USER_PROCESS_PARAMETERS {
     ULONG MaximumLength;
     ULONG Length;
+
     ULONG Flags;
     ULONG DebugFlags;
+
     PVOID ConsoleHandle;
     ULONG ConsoleFlags;
     HANDLE StdInputHandle;
     HANDLE StdOutputHandle;
     HANDLE StdErrorHandle;
+
     UNICODE_STRING CurrentDirectoryPath;
     HANDLE CurrentDirectoryHandle;
     UNICODE_STRING DllPath;
     UNICODE_STRING ImagePathName;
     UNICODE_STRING CommandLine;
     PVOID Environment;
+
     ULONG StartingPositionLeft;
     ULONG StartingPositionTop;
     ULONG Width;
     ULONG Height;
     ULONG CharWidth;
     ULONG CharHeight;
-    ULONG ConsoleTextAttributes;
+    ULONG FillAttribute; // ConsoleTextAttributes; ???
+
     ULONG WindowFlags;
     ULONG ShowWindowFlags;
     UNICODE_STRING WindowTitle;
@@ -2259,6 +2441,17 @@ typedef struct _RTL_USER_PROCESS_PARAMETERS {
     UNICODE_STRING ShellInfo;
     UNICODE_STRING RuntimeData;
     RTL_DRIVE_LETTER_CURDIR DLCurrentDirectory[0x20];
+
+    ULONG_PTR EnvironmentSize;
+    ULONG_PTR EnvironmentVersion;
+    PVOID PackageDependencyData;
+    ULONG ProcessGroupId;
+    ULONG LoaderThreads;
+
+    UNICODE_STRING RedirectionDllName; // REDSTONE4
+    UNICODE_STRING HeapPartitionName; // 19H1
+    ULONG_PTR DefaultThreadpoolCpuSetMasks;
+    ULONG DefaultThreadpoolCpuSetMaskCount;
 } RTL_USER_PROCESS_PARAMETERS, *PRTL_USER_PROCESS_PARAMETERS;
 
 __declspec(dllimport) NTSTATUS RtlCreateProcessParameters(
@@ -2273,10 +2466,126 @@ __declspec(dllimport) NTSTATUS RtlCreateProcessParameters(
     UNICODE_STRING *ShellInfo,
     UNICODE_STRING *RuntimeData);
 
+
+// windows-internals-book:"Chapter 5"
+typedef enum _PS_CREATE_STATE
+{
+    PsCreateInitialState,
+    PsCreateFailOnFileOpen,
+    PsCreateFailOnSectionCreate,
+    PsCreateFailExeFormat,
+    PsCreateFailMachineMismatch,
+    PsCreateFailExeName, // Debugger specified
+    PsCreateSuccess,
+    PsCreateMaximumStates
+} PS_CREATE_STATE;
+
+
+typedef struct _PS_CREATE_INFO
+{
+    SIZE_T Size;
+    PS_CREATE_STATE State;
+    union
+    {
+        // PsCreateInitialState
+        struct
+        {
+            union
+            {
+                ULONG InitFlags;
+                struct
+                {
+                    UCHAR WriteOutputOnExit : 1;
+                    UCHAR DetectManifest : 1;
+                    UCHAR IFEOSkipDebugger : 1;
+                    UCHAR IFEODoNotPropagateKeyState : 1;
+                    UCHAR SpareBits1 : 4;
+                    UCHAR SpareBits2 : 8;
+                    USHORT ProhibitedImageCharacteristics : 16;
+                };
+            };
+            ACCESS_MASK AdditionalFileAccess;
+        } InitState;
+
+        // PsCreateFailOnSectionCreate
+        struct
+        {
+            HANDLE FileHandle;
+        } FailSection;
+
+        // PsCreateFailExeFormat
+        struct
+        {
+            USHORT DllCharacteristics;
+        } ExeFormat;
+
+        // PsCreateFailExeName
+        struct
+        {
+            HANDLE IFEOKey;
+        } ExeName;
+
+        // PsCreateSuccess
+        struct
+        {
+            union
+            {
+                ULONG OutputFlags;
+                struct
+                {
+                    UCHAR ProtectedProcess : 1;
+                    UCHAR AddressSpaceOverride : 1;
+                    UCHAR DevOverrideEnabled : 1; // from Image File Execution Options
+                    UCHAR ManifestDetected : 1;
+                    UCHAR ProtectedProcessLight : 1;
+                    UCHAR SpareBits1 : 3;
+                    UCHAR SpareBits2 : 8;
+                    USHORT SpareBits3 : 16;
+                };
+            };
+            HANDLE FileHandle;
+            HANDLE SectionHandle;
+            ULONGLONG UserProcessParametersNative;
+            ULONG UserProcessParametersWow64;
+            ULONG CurrentParameterFlags;
+            ULONGLONG PebAddressNative;
+            ULONG PebAddressWow64;
+            ULONGLONG ManifestAddress;
+            ULONG ManifestSize;
+        } SuccessState;
+    };
+} PS_CREATE_INFO, *PPS_CREATE_INFO;
+
+
+
+typedef struct _PS_ATTRIBUTE
+{
+    ULONG_PTR Attribute;
+    SIZE_T Size;
+    union
+    {
+        ULONG_PTR Value;
+        PVOID ValuePtr;
+    };
+    PSIZE_T ReturnLength;
+} PS_ATTRIBUTE, *PPS_ATTRIBUTE;
+
+typedef struct _PS_ATTRIBUTE_LIST
+{
+    SIZE_T TotalLength;
+    PS_ATTRIBUTE Attributes[1];
+} PS_ATTRIBUTE_LIST, *PPS_ATTRIBUTE_LIST;
+
+
 __declspec(dllimport) NTSTATUS __stdcall NtCreateJobObject(
     OUT PHANDLE JobHandle,
     IN  ACCESS_MASK DesiredAccess,
     IN  POBJECT_ATTRIBUTES ObjectAttributes OPTIONAL);
+
+__declspec(dllimport) NTSTATUS __stdcall NtOpenJobObject(
+    OUT PHANDLE JobHandle,
+    IN  ACCESS_MASK DesiredAccess,
+    IN  POBJECT_ATTRIBUTES ObjectAttributes);
 
 __declspec(dllimport) NTSTATUS __stdcall NtAssignProcessToJobObject(
     HANDLE hJob, HANDLE hProcess);
@@ -2376,6 +2685,21 @@ RtlNtStatusToDosError(NTSTATUS Status);
 
 __declspec(dllimport) void __stdcall RtlRaiseStatus(NTSTATUS Status);
 
+NTSTATUS NTAPI RtlSetThreadErrorMode(IN ULONG NewMode, OUT PULONG OldMode);
+
+__declspec(dllimport) PULONG __stdcall
+RtlSubAuthoritySid(
+    _In_ PSID Sid,
+    _In_ ULONG SubAuthority
+    );
+
+__declspec(dllimport) NTSTATUS __stdcall
+RtlInitializeSid(
+    _Out_ PSID Sid,
+    _In_ PSID_IDENTIFIER_AUTHORITY IdentifierAuthority,
+    _In_ UCHAR SubAuthorityCount
+    );
+
 //---------------------------------------------------------------------------
 
 //__declspec(dllimport) USHORT RtlCaptureStackBackTrace(
@@ -2395,9 +2719,11 @@ __declspec(dllimport) NTSTATUS __stdcall NtRaiseHardError(
 
 //---------------------------------------------------------------------------
 
-#ifdef _WIN64
+#ifdef _M_ARM64
+#define NtCurrentPeb() (*((ULONG_PTR*)(__getReg(18) + 0x60)))
+#elif _WIN64
 #define NtCurrentPeb() ((ULONG_PTR)__readgsqword(0x60))
-#else ! _WIN64
+#else // _M_X86
 #define NtCurrentPeb() ((ULONG_PTR)__readfsdword(0x30))
 #endif _WIN64
 

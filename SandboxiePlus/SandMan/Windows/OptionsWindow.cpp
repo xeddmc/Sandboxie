@@ -1,57 +1,178 @@
 #include "stdafx.h"
 #include "OptionsWindow.h"
 #include "SandMan.h"
+#include "SettingsWindow.h"
 #include "../MiscHelpers/Common/Settings.h"
 #include "../MiscHelpers/Common/Common.h"
 #include "../MiscHelpers/Common/ComboInputDialog.h"
+#include "../MiscHelpers/Common/SettingsWidgets.h"
 #include "Helpers/WinAdmin.h"
-#include <QProxyStyle>
+#include "../Wizards/TemplateWizard.h"
+#include "Helpers/TabOrder.h"
+#include "../MiscHelpers/Common/CodeEdit.h"
+#include "Helpers/IniHighlighter.h"
 
-class CustomTabStyle : public QProxyStyle {
+
+class NoEditDelegate : public QStyledItemDelegate {
 public:
-	CustomTabStyle(QStyle* style = 0) : QProxyStyle(style) {}
+	NoEditDelegate(QObject* parent = 0) : QStyledItemDelegate(parent) {}
 
-	QSize sizeFromContents(ContentsType type, const QStyleOption* option,
-		const QSize& size, const QWidget* widget) const {
-		QSize s = QProxyStyle::sizeFromContents(type, option, size, widget);
-		if (type == QStyle::CT_TabBarTab) {
-			s.transpose();
-			if(theGUI->m_DarkTheme)
-				s.setHeight(s.height() * 13 / 10);
-			else
-				s.setHeight(s.height() * 15 / 10);
-			s.setWidth(s.width() * 11 / 10); // for the the icon
-		}
-		return s;
-	}
-
-	void drawControl(ControlElement element, const QStyleOption* option, QPainter* painter, const QWidget* widget) const {
-		if (element == CE_TabBarTabLabel) {
-			if (const QStyleOptionTab* tab = qstyleoption_cast<const QStyleOptionTab*>(option)) {
-				QStyleOptionTab opt(*tab);
-				opt.shape = QTabBar::RoundedNorth;
-				//opt.iconSize = QSize(32, 32);
-				opt.iconSize = QSize(24, 24);
-				QProxyStyle::drawControl(element, &opt, painter, widget);
-				return;
-			}
-		}
-		QProxyStyle::drawControl(element, option, painter, widget);
+	virtual QWidget* createEditor(QWidget* parent, const QStyleOptionViewItem& option, const QModelIndex& index) const {
+		return NULL;
 	}
 };
 
+class QTreeWidgetHacker : public QTreeWidget
+{
+public:
+	friend class ProgramsDelegate;
+	//QModelIndex indexFromItem(const QTreeWidgetItem *item, int column = 0) const;
+	//QTreeWidgetItem *itemFromIndex(const QModelIndex &index) const;
+};
+
+
+//////////////////////////////////////////////////////////////////////////
+// ProgramsDelegate
+
+class ProgramsDelegate : public QStyledItemDelegate {
+public:
+	ProgramsDelegate(COptionsWindow* pOptions, QTreeWidget* pTree, int Column, QObject* parent = 0) : QStyledItemDelegate(parent) {
+		m_pOptions = pOptions; 
+		m_pTree = pTree; 
+		m_Column = (m_Group = (Column == -2)) ? -1 : Column;
+	}
+
+	virtual QWidget* createEditor(QWidget* parent, const QStyleOptionViewItem& option, const QModelIndex& index) const {
+		QTreeWidgetItem* pItem = ((QTreeWidgetHacker*)m_pTree)->itemFromIndex(index);
+		if (!pItem->data(index.column(), Qt::UserRole).isValid())
+			return NULL;
+
+		if(m_Group && !pItem->parent()) // for groups use simple edit
+			return QStyledItemDelegate::createEditor(parent, option, index);
+
+		if (m_Column == -1 || pItem->data(m_Column, Qt::UserRole).toInt() == COptionsWindow::eProcess) {
+			QComboBox* pBox = new QComboBox(parent);
+			pBox->setEditable(true);
+			foreach(const QString Group, m_pOptions->GetCurrentGroups()) {
+				QString GroupName = Group.mid(1, Group.length() - 2);
+				pBox->addItem(tr("Group: %1").arg(GroupName), Group);
+			}
+			foreach(const QString & Name, m_pOptions->GetPrograms())
+				pBox->addItem(Name, Name);
+
+			connect(pBox->lineEdit(), &QLineEdit::textEdited, [pBox](const QString& text){
+				/*if (pBox->currentIndex() != -1) {
+					int pos = pBox->lineEdit()->cursorPosition();
+					pBox->setCurrentIndex(-1);
+					pBox->setCurrentText(text);
+					pBox->lineEdit()->setCursorPosition(pos);
+				}*/
+				pBox->setProperty("value", text);
+			});
+			connect(pBox->lineEdit(), &QLineEdit::returnPressed, [pBox](){
+				/*if (pBox->currentIndex() != -1) {
+					int pos = pBox->lineEdit()->cursorPosition();
+					pBox->setCurrentIndex(-1);
+					pBox->setCurrentText(text);
+					pBox->lineEdit()->setCursorPosition(pos);
+				}*/
+				pBox->setProperty("value", pBox->lineEdit()->text());
+			});
+
+			connect(pBox, qOverload<int>(&QComboBox::currentIndexChanged), [pBox](int index){
+				if (index != -1) {
+					QString Program = pBox->itemData(index).toString();
+					pBox->setProperty("value", Program);
+					pBox->lineEdit()->setReadOnly(Program.left(1) == "<");
+				}
+			});
+
+			return pBox;
+		}
+		else if (pItem->data(0, Qt::UserRole).toInt() == COptionsWindow::ePath)
+			return QStyledItemDelegate::createEditor(parent, option, index);
+		else
+			return NULL;
+	}
+
+	virtual void setEditorData(QWidget* editor, const QModelIndex& index) const {
+		QComboBox* pBox = qobject_cast<QComboBox*>(editor);
+		if (pBox) {
+			QTreeWidgetItem* pItem = ((QTreeWidgetHacker*)m_pTree)->itemFromIndex(index);
+			QString Program = pItem->data(index.column(), Qt::UserRole).toString();
+
+			pBox->setProperty("value", Program);
+			pBox->lineEdit()->setReadOnly(Program.left(1) == "<");
+
+			int Index = pBox->findData(Program);
+			pBox->setCurrentIndex(Index);
+			if (Index == -1)
+				pBox->setCurrentText(Program);
+		}
+		else
+			QStyledItemDelegate::setEditorData(editor, index);
+	}
+
+	virtual void setModelData(QWidget* editor, QAbstractItemModel* model, const QModelIndex& index) const {
+		QTreeWidgetItem* pItem = ((QTreeWidgetHacker*)m_pTree)->itemFromIndex(index);
+
+		QComboBox* pBox = qobject_cast<QComboBox*>(editor);
+		if (pBox) {
+			
+			QString Value = pBox->property("value").toString();
+			bool prev = m_pTree->blockSignals(true);
+			pItem->setText(index.column(), pBox->currentText());
+			m_pTree->blockSignals(prev);
+			//QString Text = pBox->currentText();
+			//QVariant Data = pBox->currentData();
+			pItem->setData(index.column(), Qt::UserRole, Value);
+		}
+
+		QLineEdit* pEdit = qobject_cast<QLineEdit*>(editor);
+		if (pEdit) {
+			bool prev = m_pTree->blockSignals(true);
+			pItem->setText(index.column(), pEdit->text());
+			m_pTree->blockSignals(prev);
+			QString Value = pEdit->text();
+			if (m_Group) Value = "<" + Value + ">";
+			pItem->setData(index.column(), Qt::UserRole, Value);
+		}
+	}
+
+	QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const
+	{
+		QSize size = QStyledItemDelegate::sizeHint(option, index);
+		if(size.height() < 20) size.setHeight(20); // ensure enough room for the combo box
+		return size;
+	}
+
+protected:
+	COptionsWindow* m_pOptions;
+	QTreeWidget* m_pTree;
+	int m_Column;
+	bool m_Group;
+};
+
+
+//////////////////////////////////////////////////////////////////////////
+// COptionsWindow
 
 COptionsWindow::COptionsWindow(const QSharedPointer<CSbieIni>& pBox, const QString& Name, QWidget *parent)
-	: QDialog(parent)
+	: CConfigDialog(parent)
 {
 	m_pBox = pBox;
 
 	m_Template = pBox->GetName().left(9).compare("Template_", Qt::CaseInsensitive) == 0;
 	bool ReadOnly = /*pBox->GetAPI()->IsConfigLocked() ||*/ (m_Template && pBox->GetName().mid(9, 6).compare("Local_", Qt::CaseInsensitive) != 0);
 	
+	m_HoldChange = false;
+
+	m_ImageSize = 2ull*1024*1024*1024;
+
 	QSharedPointer<CSandBoxPlus> pBoxPlus = m_pBox.objectCast<CSandBoxPlus>();
 	if (!pBoxPlus.isNull())
 		m_Programs = pBoxPlus->GetRecentPrograms();
+	m_Programs.insert("program.exe");
 
 	Qt::WindowFlags flags = windowFlags();
 	flags |= Qt::CustomizeWindowHint;
@@ -62,146 +183,355 @@ COptionsWindow::COptionsWindow(const QSharedPointer<CSbieIni>& pBox, const QStri
 	//flags &= ~Qt::WindowCloseButtonHint;
 	setWindowFlags(flags);
 
-	bool bAlwaysOnTop = theConf->GetBool("Options/AlwaysOnTop", false);
-	this->setWindowFlag(Qt::WindowStaysOnTopHint, bAlwaysOnTop);
+	this->setWindowFlag(Qt::WindowStaysOnTopHint, theGUI->IsAlwaysOnTop());
 
 	ui.setupUi(this);
-	this->setWindowTitle(tr("Sandboxie Plus - '%1' Options").arg(Name));
+	this->setWindowTitle(tr("Sandboxie Plus - '%1' Options").arg(QString(Name).replace("_", " ")));
 
 	ui.tabs->setTabPosition(QTabWidget::West);
-	ui.tabs->tabBar()->setStyle(new CustomTabStyle(ui.tabs->tabBar()->style()));
 
-	QStringList DebugOptions = theConf->ListKeys("DebugOptions");
-	if(DebugOptions.isEmpty())
-		ui.tabsAdvanced->removeTab(ui.tabsAdvanced->count() - 1);
-	else
+	ui.tabs->setCurrentIndex(0);
+	ui.tabs->setTabIcon(0, CSandMan::GetIcon("Config"));
+	ui.tabs->setTabIcon(1, CSandMan::GetIcon("Security"));
+	ui.tabs->setTabIcon(2, CSandMan::GetIcon("Group"));
+	ui.tabs->setTabIcon(3, CSandMan::GetIcon("Control"));
+	ui.tabs->setTabIcon(4, CSandMan::GetIcon("Stop"));
+	ui.tabs->setTabIcon(5, CSandMan::GetIcon("Start"));
+	ui.tabs->setTabIcon(6, CSandMan::GetIcon("Ampel"));
+	ui.tabs->setTabIcon(7, CSandMan::GetIcon("Network"));
+	ui.tabs->setTabIcon(8, CSandMan::GetIcon("Recover"));
+	ui.tabs->setTabIcon(9, CSandMan::GetIcon("Settings"));
+	ui.tabs->setTabIcon(10, CSandMan::GetIcon("Advanced"));
+	ui.tabs->setTabIcon(11, CSandMan::GetIcon("Compatibility"));
+	ui.tabs->setTabIcon(12, CSandMan::GetIcon("Editor"));
+
+	ui.tabsGeneral->setCurrentIndex(0);
+	ui.tabsGeneral->setTabIcon(0, CSandMan::GetIcon("Box"));
+	ui.tabsGeneral->setTabIcon(1, CSandMan::GetIcon("Folder"));
+	ui.tabsGeneral->setTabIcon(2, CSandMan::GetIcon("Move"));
+	ui.tabsGeneral->setTabIcon(3, CSandMan::GetIcon("NoAccess"));
+	ui.tabsGeneral->setTabIcon(4, CSandMan::GetIcon("EFence"));
+	ui.tabsGeneral->setTabIcon(5, CSandMan::GetIcon("Run"));
+
+	ui.tabsSecurity->setCurrentIndex(0);
+	ui.tabsSecurity->setTabIcon(0, CSandMan::GetIcon("Shield7"));
+	ui.tabsSecurity->setTabIcon(1, CSandMan::GetIcon("Fence"));
+	ui.tabsSecurity->setTabIcon(2, CSandMan::GetIcon("Shield15"));
+	ui.tabsSecurity->setTabIcon(3, CSandMan::GetIcon("Job"));
+	ui.tabsSecurity->setTabIcon(4, CSandMan::GetIcon("Shield12"));
+
+	ui.tabsForce->setCurrentIndex(0);
+	ui.tabsForce->setTabIcon(0, CSandMan::GetIcon("Force"));
+	ui.tabsForce->setTabIcon(1, CSandMan::GetIcon("Breakout"));
+
+	ui.tabsStop->setCurrentIndex(0);
+	ui.tabsStop->setTabIcon(0, CSandMan::GetIcon("Fail"));
+	ui.tabsStop->setTabIcon(1, CSandMan::GetIcon("Pass"));
+	ui.tabsStop->setTabIcon(2, CSandMan::GetIcon("Policy"));
+		
+	ui.tabsInternet->setCurrentIndex(0);
+	ui.tabsInternet->setTabIcon(0, CSandMan::GetIcon("EthSocket2"));
+	ui.tabsInternet->setTabIcon(1, CSandMan::GetIcon("Wall"));
+	ui.tabsInternet->setTabIcon(2, CSandMan::GetIcon("DNS"));
+	ui.tabsInternet->setTabIcon(3, CSandMan::GetIcon("Proxy"));
+	ui.tabsInternet->setTabIcon(4, CSandMan::GetIcon("Network3"));
+
+	ui.tabsAccess->setCurrentIndex(0);
+	ui.tabsAccess->setTabIcon(0, CSandMan::GetIcon("Folder"));
+	ui.tabsAccess->setTabIcon(1, CSandMan::GetIcon("RegEdit"));
+	ui.tabsAccess->setTabIcon(2, CSandMan::GetIcon("Port"));
+	ui.tabsAccess->setTabIcon(3, CSandMan::GetIcon("Window"));
+	ui.tabsAccess->setTabIcon(4, CSandMan::GetIcon("Objects"));
+	//ui.tabsAccess->setTabIcon(0, CSandMan::GetIcon("Rules"));
+	ui.tabsAccess->setTabIcon(5, CSandMan::GetIcon("Policy"));
+
+	ui.tabsRecovery->setCurrentIndex(0);
+	ui.tabsRecovery->setTabIcon(0, CSandMan::GetIcon("QuickRecovery"));
+	ui.tabsRecovery->setTabIcon(1, CSandMan::GetIcon("ImmidiateRecovery"));
+
+	ui.tabsOther->setCurrentIndex(0);
+	ui.tabsOther->setTabIcon(0, CSandMan::GetIcon("Presets"));
+	ui.tabsOther->setTabIcon(1, CSandMan::GetIcon("Dll"));
+
+	ui.tabsAdvanced->setCurrentIndex(0);
+	ui.tabsAdvanced->setTabIcon(0, CSandMan::GetIcon("Presets"));
+	ui.tabsAdvanced->setTabIcon(1, CSandMan::GetIcon("Trigger"));
+	ui.tabsAdvanced->setTabIcon(2, CSandMan::GetIcon("Shield2"));
+	ui.tabsAdvanced->setTabIcon(3, CSandMan::GetIcon("Anon"));
+	ui.tabsAdvanced->setTabIcon(4, CSandMan::GetIcon("Users"));
+	ui.tabsAdvanced->setTabIcon(5, CSandMan::GetIcon("SetLogging"));
+	ui.tabsAdvanced->setTabIcon(6, CSandMan::GetIcon("Bug"));
+
+	ui.tabsTemplates->setCurrentIndex(0);
+	ui.tabsTemplates->setTabIcon(0, CSandMan::GetIcon("Template"));
+	ui.tabsTemplates->setTabIcon(1, CSandMan::GetIcon("Explore"));
+	ui.tabsTemplates->setTabIcon(2, CSandMan::GetIcon("Accessibility"));
+
+
+	int iViewMode = theConf->GetInt("Options/ViewMode", 1);
+	int iOptionLayout = theConf->GetInt("Options/NewConfigLayout", 2);
+	if (iOptionLayout == 2)
+		iOptionLayout = iViewMode != 2 ? 1 : 0;
+
+	if ((QGuiApplication::queryKeyboardModifiers() & Qt::AltModifier) != 0)
+		iOptionLayout = !iOptionLayout;
+
+	QWidget* pDummy = new QWidget(this);
+	pDummy->setVisible(false);
+
+	// merge recovery tabs
+	QWidget* pWidget3 = new QWidget();
+	pWidget3->setLayout(ui.gridLayout_10);
+	ui.gridLayout_24->addWidget(pWidget3, 1, 0);
+	QWidget* pWidget4 = new QWidget();
+	pWidget4->setLayout(ui.gridLayout_56);
+	ui.gridLayout_24->addWidget(pWidget4, 2, 0);
+	delete ui.tabsRecovery;
+	ui.gridLayout_24->setContentsMargins(0, 0, 0, 0);
+
+	// collect file options on a new files tab
+
+	QWidget* pWidget = new QWidget();
+	QGridLayout* pLayout = new QGridLayout(pWidget);
+
+	QTabWidget* pTabWidget = new QTabWidget();
+	pLayout->addWidget(pTabWidget, 0, 0);
+	ui.tabs->insertTab(1, pWidget, tr("File Options"));
+	ui.tabs->setTabIcon(1, CSandMan::GetIcon("Folder"));
+
+	pTabWidget->addTab(ui.tabsGeneral->widget(1), ui.tabsGeneral->tabText(1));
+	pTabWidget->setTabIcon(0, CSandMan::GetIcon("Files"));
+	pTabWidget->addTab(ui.tabsGeneral->widget(1), ui.tabsGeneral->tabText(1));
+	pTabWidget->setTabIcon(1, CSandMan::GetIcon("Move"));
+	pTabWidget->addTab(ui.tabs->widget(9), ui.tabs->tabText(9));
+	pTabWidget->setTabIcon(2, CSandMan::GetIcon("Recover"));
+	//
+
+	// re structure the UI a bit
+	if (iOptionLayout == 1)
 	{
-		int RowCount = 0;
-		foreach(const QString& DebugOption, DebugOptions)
-		{
-			QStringList ValueDescr = theConf->GetString("DebugOptions/" + DebugOption).split("|");
+		// merge stop tabs
+		QWidget* pWidget1 = new QWidget();
+		pWidget1->setLayout(ui.gridLayout_57);
+		ui.gridLayout_17->addWidget(pWidget1, 1, 0);
+		QWidget* pWidget2 = new QWidget();
+		pWidget2->setLayout(ui.gridLayout_61);
+		ui.gridLayout_17->addWidget(pWidget2, 2, 0);
+		QWidget* pWidget3 = new QWidget();
+		pWidget3->setLayout(ui.gridLayout_82);
+		ui.gridLayout_82->setContentsMargins(3, 3, 3, 3);
+		ui.verticalSpacer_40->changeSize(0, 0);
+		ui.lblStopOpt->setVisible(false);
+		ui.lblStopOpt->setProperty("hidden", true);
+		ui.gridLayout_17->addWidget(pWidget3, 3, 0);
+		delete ui.tabsStop;
+		ui.gridLayout_17->setContentsMargins(0, 0, 0, 0);
 
-			QString Description = ValueDescr.size() >= 3 ? ValueDescr[2] : ValueDescr[0];
-			int Column = 0; // use - to add up to 10 indents
-			for (; Description[0] == "-" && Column < 10; Column++) Description.remove(0, 1);
+		// move stop and restrictions to program tab
+		ui.tabsForce->addTab(ui.tabs->widget(5), ui.tabs->tabText(5));
+		ui.tabsForce->setTabIcon(2, CSandMan::GetIcon("Stop"));
+		ui.tabsForce->addTab(ui.tabs->widget(5), ui.tabs->tabText(5));
+		ui.tabsForce->setTabIcon(3, CSandMan::GetIcon("Start"));
+		ui.gridLayout_19->setContentsMargins(3, 6, 3, 3);
 
-			SDbgOpt DbgOption = { ValueDescr[0], ValueDescr.size() >= 2 ? ValueDescr[1] : "y" , false};
-
-			QString Info = DbgOption.Name + "=" + DbgOption.Value;
-			QCheckBox* pCheck = new QCheckBox(tr("%1 (%2)").arg(Description).arg(Info));
-			//pCheck->setToolTip(Info);
-			ui.dbgLayout->addWidget(pCheck, RowCount++, Column, 1, 10-Column);
-
-			connect(pCheck, SIGNAL(clicked(bool)), this, SLOT(OnDebugChanged()));
-			m_DebugOptions.insert(pCheck, DbgOption);
-		}
-
-		for(int i=0; i < 10; i++)
-			ui.dbgLayout->addItem(new QSpacerItem(20, 40, QSizePolicy::Minimum, QSizePolicy::Expanding), RowCount, i);
-		ui.dbgLayout->addItem(new QSpacerItem(40, 20, QSizePolicy::Expanding, QSizePolicy::Minimum), RowCount, 10);
+		// move grouping to program tab
+		ui.tabsForce->insertTab(0, ui.tabGroups, tr("Grouping"));
+		ui.tabsForce->setTabIcon(0, CSandMan::GetIcon("Group"));
+		ui.tabsForce->setCurrentIndex(0);
+		ui.gridLayout_18->setContentsMargins(3, 6, 3, 3);
 	}
+
+	if (iViewMode != 1 && (QGuiApplication::queryKeyboardModifiers() & Qt::ControlModifier) == 0)
+	{
+		if (iOptionLayout == 1) {
+			//ui.tabs->removeTab(7); // ini edit
+			ui.tabAdvanced->setParent(pDummy); //ui.tabs->removeTab(5); // advanced
+			//ui.tabsForce->removeTab(2); // breakout
+		}
+		else {
+			//ui.tabs->removeTab(11); // ini edit
+			ui.tabAdvanced->setParent(pDummy); //ui.tabs->removeTab(9); // advanced
+			//ui.tabsForce->removeTab(1); // breakout
+		}
+		ui.tabPrivileges->setParent(pDummy); //ui.tabsSecurity->removeTab(3); // advanced security
+		ui.tabIsolation->setParent(pDummy); //ui.tabsSecurity->removeTab(1); // security isolation
+		//ui.tabsAccess->removeTab(5); // policy
+		ui.treeOptions = NULL;
+	}
+
+	foreach(QTreeWidget* pTree, this->findChildren<QTreeWidget*>()) {
+		if (pTree == ui.treeFolders) continue;
+		pTree->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Ignored);
+		pTree->setMinimumHeight(50);
+	}
+
+	int size = 16.0;
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+	size *= (QApplication::desktop()->logicalDpiX() / 96.0); // todo Qt6
+#endif
+	AddIconToLabel(ui.lblAppearance, CSandMan::GetIcon("Design").pixmap(size,size));
+	AddIconToLabel(ui.lblBoxType, CSandMan::GetIcon("Maintenance").pixmap(size,size));
+	AddIconToLabel(ui.lblNotes, CSandMan::GetIcon("EditIni").pixmap(size,size));
+	AddIconToLabel(ui.lblStructure, CSandMan::GetIcon("Structure").pixmap(size,size));
+	AddIconToLabel(ui.lblMigration, CSandMan::GetIcon("Move").pixmap(size,size));
+	AddIconToLabel(ui.lblDelete, CSandMan::GetIcon("Erase").pixmap(size,size));
+	AddIconToLabel(ui.lblRawDisk, CSandMan::GetIcon("Disk").pixmap(size,size));
+	AddIconToLabel(ui.lblJob, CSandMan::GetIcon("Job3").pixmap(size,size));
+	AddIconToLabel(ui.lblLimit, CSandMan::GetIcon("Job2").pixmap(size,size));
+	AddIconToLabel(ui.lblSecurity, CSandMan::GetIcon("Shield5").pixmap(size,size));
+	AddIconToLabel(ui.lblElevation, CSandMan::GetIcon("Shield9").pixmap(size,size));
+	AddIconToLabel(ui.lblACLs, CSandMan::GetIcon("Ampel").pixmap(size,size));
+	AddIconToLabel(ui.lblBoxProtection, CSandMan::GetIcon("BoxConfig").pixmap(size,size));
+	AddIconToLabel(ui.lblNetwork, CSandMan::GetIcon("Network").pixmap(size,size));
+	AddIconToLabel(ui.lblBind, CSandMan::GetIcon("EthSocket2").pixmap(size,size));
+	AddIconToLabel(ui.lblPrinting, CSandMan::GetIcon("Printer").pixmap(size,size));
+	AddIconToLabel(ui.lblOther, CSandMan::GetIcon("NoAccess").pixmap(size,size));
+
+	AddIconToLabel(ui.lblStopOpt, CSandMan::GetIcon("Stop").pixmap(size,size));
+
+	AddIconToLabel(ui.lblPorts, CSandMan::GetIcon("Port").pixmap(size,size));
+
+	AddIconToLabel(ui.lblMode, CSandMan::GetIcon("Anon").pixmap(size,size));
+	AddIconToLabel(ui.lblPolicy, CSandMan::GetIcon("Policy").pixmap(size,size));
+
+	AddIconToLabel(ui.lblCompatibility, CSandMan::GetIcon("Compatibility").pixmap(size,size));
+	//AddIconToLabel(ui.lblComRpc, CSandMan::GetIcon("Objects").pixmap(size,size));
+
+	AddIconToLabel(ui.lblPrivilege, CSandMan::GetIcon("Token").pixmap(size,size));
+	AddIconToLabel(ui.lblToken, CSandMan::GetIcon("Sandbox").pixmap(size,size));
+	AddIconToLabel(ui.lblIsolation, CSandMan::GetIcon("Fence").pixmap(size,size));
+	AddIconToLabel(ui.lblDesktop, CSandMan::GetIcon("Monitor").pixmap(size,size));
+	AddIconToLabel(ui.lblAccess, CSandMan::GetIcon("NoAccess").pixmap(size,size));
+	AddIconToLabel(ui.lblProtection, CSandMan::GetIcon("EFence").pixmap(size,size));
+
+	AddIconToLabel(ui.lblPrivacyProtection, CSandMan::GetIcon("Anon").pixmap(size,size));
+	AddIconToLabel(ui.lblProcessHiding, CSandMan::GetIcon("Cmd").pixmap(size,size));
+
+	AddIconToLabel(ui.lblMonitor, CSandMan::GetIcon("Monitor").pixmap(size,size));
+	AddIconToLabel(ui.lblTracing, CSandMan::GetIcon("SetLogging").pixmap(size,size));
+
+
+	if (theConf->GetBool("Options/AltRowColors", false)) {
+		foreach(QTreeWidget* pTree, this->findChildren<QTreeWidget*>()) 
+			pTree->setAlternatingRowColors(true);
+	}
+
+	m_pCodeEdit = new CCodeEdit(new CIniHighlighter(theGUI->m_DarkTheme));
+	m_pCodeEdit->installEventFilter(this);
+	ui.txtIniSection->parentWidget()->layout()->replaceWidget(ui.txtIniSection, m_pCodeEdit);
+	delete ui.txtIniSection;
+	ui.txtIniSection = NULL;
+	connect(m_pCodeEdit, SIGNAL(textChanged()), this, SLOT(OnIniChanged()));
+
+	CreateDebug();
 
 	if (m_Template)
 	{
-		ui.tabGeneral->setEnabled(false);
-		ui.tabStart->setEnabled(false);
-		ui.tabInternet->setEnabled(false);
-		ui.tabAdvanced->setEnabled(false);
-		ui.tabTemplates->setEnabled(false);
+		//ui.tabGeneral->setEnabled(false);
+		//ui.tabStart->setEnabled(false);
+		//ui.tabInternet->setEnabled(false);
+		//ui.tabAdvanced->setEnabled(false);
+		//ui.tabOther->setEnabled(false);
+		//ui.tabTemplates->setEnabled(false);
+		//
+		//for (int i = 0; i < ui.tabs->count(); i++) 
+		//	ui.tabs->setTabEnabled(i, ui.tabs->widget(i)->isEnabled());
 
-		for (int i = 0; i < ui.tabs->count(); i++) 
-			ui.tabs->setTabEnabled(i, ui.tabs->widget(i)->isEnabled());
+		//ui.tabs->setCurrentIndex(ui.tabs->indexOf(ui.tabAccess));
 
-		ui.tabs->setCurrentIndex(ui.tabs->indexOf(ui.tabAccess));
-
+		ui.chkShowGroupTmpl->setEnabled(false);
 		ui.chkShowForceTmpl->setEnabled(false);
+		ui.chkShowBreakoutTmpl->setEnabled(false);
 		ui.chkShowStopTmpl->setEnabled(false);
-		ui.chkShowAccessTmpl->setEnabled(false);
+		ui.chkShowLeaderTmpl->setEnabled(false);
+		ui.chkShowStartTmpl->setEnabled(false);
+		ui.chkShowFilesTmpl->setEnabled(false);
+		ui.chkShowKeysTmpl->setEnabled(false);
+		ui.chkShowIPCTmpl->setEnabled(false);
+		ui.chkShowWndTmpl->setEnabled(false);
+		ui.chkShowCOMTmpl->setEnabled(false);
+		ui.chkShowNetFwTmpl->setEnabled(false);
+		ui.chkShowRecoveryTmpl->setEnabled(false);
+		ui.chkShowRecIgnoreTmpl->setEnabled(false);
+		ui.chkShowTriggersTmpl->setEnabled(false);
+		ui.chkShowHiddenProcTmpl->setEnabled(false);
+		ui.chkShowHostProcTmpl->setEnabled(false);
+		ui.chkShowOptionsTmpl->setEnabled(false);
 
 		//ui.chkWithTemplates->setEnabled(false);
 	}
 
-	ui.tabs->setTabIcon(0, CSandMan::GetIcon("Box"));
-	ui.tabs->setTabIcon(1, CSandMan::GetIcon("Group"));
-	ui.tabs->setTabIcon(2, CSandMan::GetIcon("Force"));
-	ui.tabs->setTabIcon(3, CSandMan::GetIcon("Stop"));
-	ui.tabs->setTabIcon(4, CSandMan::GetIcon("Start"));
-	ui.tabs->setTabIcon(5, CSandMan::GetIcon("Internet"));
-	ui.tabs->setTabIcon(6, CSandMan::GetIcon("Wall"));
-	ui.tabs->setTabIcon(7, CSandMan::GetIcon("Recover"));
-	ui.tabs->setTabIcon(8, CSandMan::GetIcon("Advanced"));
-	ui.tabs->setTabIcon(9, CSandMan::GetIcon("Template"));
-	ui.tabs->setTabIcon(10, CSandMan::GetIcon("EditIni"));
-
-	ui.tabs->setCurrentIndex(0);
+	ui.tabs->setCurrentIndex(m_Template ? ui.tabs->count()-1 : 0);
+	if(m_Template)
+		OnTab();
 
 	//connect(ui.chkWithTemplates, SIGNAL(clicked(bool)), this, SLOT(OnWithTemplates()));
 
 	m_ConfigDirty = true;
 
-	// General
-	ui.cmbBoxIndicator->addItem(tr("Don't alter the window title"), "-");
-	ui.cmbBoxIndicator->addItem(tr("Display [#] indicator only"), "n");
-	ui.cmbBoxIndicator->addItem(tr("Display box name in title"), "y");
+	CreateGeneral();
 
-	ui.cmbBoxBorder->addItem(tr("Border disabled"), "off");
-	ui.cmbBoxBorder->addItem(tr("Show only when title is in focus"), "ttl");
-	ui.cmbBoxBorder->addItem(tr("Always show"), "on");
-
-	connect(ui.cmbBoxIndicator, SIGNAL(currentIndexChanged(int)), this, SLOT(OnGeneralChanged()));
-	connect(ui.cmbBoxBorder, SIGNAL(currentIndexChanged(int)), this, SLOT(OnGeneralChanged()));
-	connect(ui.btnBorderColor, SIGNAL(clicked(bool)), this, SLOT(OnPickColor()));
-	connect(ui.spinBorderWidth, SIGNAL(valueChanged(int)), this, SLOT(OnGeneralChanged()));
-
-	connect(ui.chkBlockNetShare, SIGNAL(clicked(bool)), this, SLOT(OnGeneralChanged()));
-	connect(ui.chkBlockNetParam, SIGNAL(clicked(bool)), this, SLOT(OnGeneralChanged()));
-	connect(ui.chkDropRights, SIGNAL(clicked(bool)), this, SLOT(OnGeneralChanged()));
-	connect(ui.chkBlockSpooler, SIGNAL(clicked(bool)), this, SLOT(OnGeneralChanged()));
-	connect(ui.chkOpenSpooler, SIGNAL(clicked(bool)), this, SLOT(OnGeneralChanged()));
-	connect(ui.chkPrintToFile, SIGNAL(clicked(bool)), this, SLOT(OnGeneralChanged()));
-
-	connect(ui.txtCopyLimit, SIGNAL(textChanged(const QString&)), this, SLOT(OnGeneralChanged()));
-	connect(ui.chkCopyLimit, SIGNAL(clicked(bool)), this, SLOT(OnGeneralChanged()));
-	connect(ui.chkNoCopyWarn, SIGNAL(clicked(bool)), this, SLOT(OnGeneralChanged()));
-
-	connect(ui.chkProtectBox, SIGNAL(clicked(bool)), this, SLOT(OnGeneralChanged()));
-	connect(ui.chkAutoEmpty, SIGNAL(clicked(bool)), this, SLOT(OnGeneralChanged()));
-
-	connect(ui.btnAddCmd, SIGNAL(clicked(bool)), this, SLOT(OnAddCommand()));
-	QMenu* pRunBtnMenu = new QMenu(ui.btnAddFile);
-	pRunBtnMenu->addAction(tr("Browse for Program"), this, SLOT(OnBrowsePath()));
-	ui.btnAddCmd->setPopupMode(QToolButton::MenuButtonPopup);
-	ui.btnAddCmd->setMenu(pRunBtnMenu);
-	connect(ui.btnDelCmd, SIGNAL(clicked(bool)), this, SLOT(OnDelCommand()));
-
-	connect(ui.btnAddAutoExe, SIGNAL(clicked(bool)), this, SLOT(OnAddAutoCmd()));
-	QMenu* pAutoBtnMenu = new QMenu(ui.btnAddFile);
-	pAutoBtnMenu->addAction(tr("Browse for Program"), this, SLOT(OnAddAutoExe()));
-	ui.btnAddAutoExe->setPopupMode(QToolButton::MenuButtonPopup);
-	ui.btnAddAutoExe->setMenu(pAutoBtnMenu);
-	connect(ui.btnAddAutoExe, SIGNAL(clicked(bool)), this, SLOT(OnAddAutoExe()));
-	connect(ui.btnAddAutoSvc, SIGNAL(clicked(bool)), this, SLOT(OnDelAutoSvc()));
-	connect(ui.btnDelAuto, SIGNAL(clicked(bool)), this, SLOT(OnDelAuto()));
-	//
-
-	// Groupes
+	// Groups
 	connect(ui.btnAddGroup, SIGNAL(clicked(bool)), this, SLOT(OnAddGroup()));
 	connect(ui.btnAddProg, SIGNAL(clicked(bool)), this, SLOT(OnAddProg()));
 	connect(ui.btnDelProg, SIGNAL(clicked(bool)), this, SLOT(OnDelProg()));
+	connect(ui.chkShowGroupTmpl, SIGNAL(clicked(bool)), this, SLOT(OnShowGroupTmpl()));
+	ui.treeGroups->setItemDelegateForColumn(0, new ProgramsDelegate(this, ui.treeGroups, -2, this));
+	connect(ui.treeGroups, SIGNAL(itemChanged(QTreeWidgetItem *, int)), this, SLOT(OnGroupsChanged(QTreeWidgetItem *, int)));
 	//
 
 	// Force
 	connect(ui.btnForceProg, SIGNAL(clicked(bool)), this, SLOT(OnForceProg()));
+	QMenu* pFileBtnMenu = new QMenu(ui.btnForceProg);
+	pFileBtnMenu->addAction(tr("Browse for File"), this, SLOT(OnForceBrowseProg()));
+	ui.btnForceProg->setPopupMode(QToolButton::MenuButtonPopup);
+	ui.btnForceProg->setMenu(pFileBtnMenu);
+
+	connect(ui.btnForceChild, SIGNAL(clicked(bool)), this, SLOT(OnForceChild()));
+	pFileBtnMenu = new QMenu(ui.btnForceChild);
+	pFileBtnMenu->addAction(tr("Browse for File"), this, SLOT(OnForceBrowseChild()));
+	ui.btnForceChild->setPopupMode(QToolButton::MenuButtonPopup);
+	ui.btnForceChild->setMenu(pFileBtnMenu);
+
 	connect(ui.btnForceDir, SIGNAL(clicked(bool)), this, SLOT(OnForceDir()));
 	connect(ui.btnDelForce, SIGNAL(clicked(bool)), this, SLOT(OnDelForce()));
 	connect(ui.chkShowForceTmpl, SIGNAL(clicked(bool)), this, SLOT(OnShowForceTmpl()));
+	//ui.treeForced->setEditTriggers(QAbstractItemView::DoubleClicked);
+	ui.treeForced->setItemDelegateForColumn(0, new NoEditDelegate(this));
+	ui.treeForced->setItemDelegateForColumn(1, new ProgramsDelegate(this, ui.treeForced, -1, this));
+	connect(ui.treeForced, SIGNAL(itemChanged(QTreeWidgetItem *, int)), this, SLOT(OnForcedChanged(QTreeWidgetItem *, int)));
+	connect(ui.chkDisableForced, SIGNAL(clicked(bool)), this, SLOT(OnForcedChanged()));
+
+	connect(ui.btnBreakoutProg, SIGNAL(clicked(bool)), this, SLOT(OnBreakoutProg()));
+	QMenu* pFileBtnMenu2 = new QMenu(ui.btnBreakoutProg);
+	pFileBtnMenu2->addAction(tr("Browse for File"), this, SLOT(OnBreakoutBrowse()));
+	ui.btnBreakoutProg->setPopupMode(QToolButton::MenuButtonPopup);
+	ui.btnBreakoutProg->setMenu(pFileBtnMenu2);
+	connect(ui.btnBreakoutDir, SIGNAL(clicked(bool)), this, SLOT(OnBreakoutDir()));
+	connect(ui.btnBreakoutDoc, SIGNAL(clicked(bool)), this, SLOT(OnBreakoutDoc()));
+	connect(ui.btnDelBreakout, SIGNAL(clicked(bool)), this, SLOT(OnDelBreakout()));
+	connect(ui.chkShowBreakoutTmpl, SIGNAL(clicked(bool)), this, SLOT(OnShowBreakoutTmpl()));
+	//ui.treeBreakout->setEditTriggers(QAbstractItemView::DoubleClicked);
+	ui.treeBreakout->setItemDelegateForColumn(0, new NoEditDelegate(this));
+	ui.treeBreakout->setItemDelegateForColumn(1, new ProgramsDelegate(this, ui.treeBreakout, -1, this));
+	connect(ui.treeBreakout, SIGNAL(itemChanged(QTreeWidgetItem *, int)), this, SLOT(OnBreakoutChanged(QTreeWidgetItem *, int)));
 	//
 
 	// Stop
 	connect(ui.btnAddLingering, SIGNAL(clicked(bool)), this, SLOT(OnAddLingering()));
-	connect(ui.btnAddLeader, SIGNAL(clicked(bool)), this, SLOT(OnAddLeader()));
 	connect(ui.btnDelStopProg, SIGNAL(clicked(bool)), this, SLOT(OnDelStopProg()));
 	connect(ui.chkShowStopTmpl, SIGNAL(clicked(bool)), this, SLOT(OnShowStopTmpl()));
+	ui.treeStop->setItemDelegateForColumn(0, new ProgramsDelegate(this, ui.treeStop, -1, this));
+	connect(ui.treeStop, SIGNAL(itemChanged(QTreeWidgetItem *, int)), this, SLOT(OnStopChanged()));
+
+	connect(ui.btnAddLeader, SIGNAL(clicked(bool)), this, SLOT(OnAddLeader()));
+	connect(ui.btnDelLeader, SIGNAL(clicked(bool)), this, SLOT(OnDelLeader()));
+	connect(ui.chkShowLeaderTmpl, SIGNAL(clicked(bool)), this, SLOT(OnShowLeaderTmpl()));
+	ui.treeLeader->setItemDelegateForColumn(0, new ProgramsDelegate(this, ui.treeLeader, -1, this));
+	connect(ui.treeLeader, SIGNAL(itemChanged(QTreeWidgetItem *, int)), this, SLOT(OnStopChanged()));
+
+	connect(ui.chkNoStopWnd, SIGNAL(clicked(bool)), this, SLOT(OnStopChanged()));
+	connect(ui.chkLingerLeniency, SIGNAL(clicked(bool)), this, SLOT(OnStopChanged()));
 	//
 
 	// Start
@@ -210,38 +540,17 @@ COptionsWindow::COptionsWindow(const QSharedPointer<CSbieIni>& pBox, const QStri
 	connect(ui.radStartSelected, SIGNAL(clicked(bool)), this, SLOT(OnRestrictStart()));
 	connect(ui.btnAddStartProg, SIGNAL(clicked(bool)), this, SLOT(OnAddStartProg()));
 	connect(ui.btnDelStartProg, SIGNAL(clicked(bool)), this, SLOT(OnDelStartProg()));
+	//connect(ui.chkShowStartTmpl, SIGNAL(clicked(bool)), this, SLOT(OnShowStartTmpl()));
+	ui.chkShowStartTmpl->setVisible(false); // todo
 	connect(ui.chkStartBlockMsg, SIGNAL(clicked(bool)), this, SLOT(OnStartChanged()));
+	ui.treeStart->setItemDelegateForColumn(0, new ProgramsDelegate(this, ui.treeStart, -1, this));
+	connect(ui.treeStart, SIGNAL(itemChanged(QTreeWidgetItem *, int)), this, SLOT(OnStartChanged(QTreeWidgetItem *, int)));
+	connect(ui.chkAlertBeforeStart, SIGNAL(clicked(bool)), this, SLOT(OnStartChanged()));
 	//
 
-	// INet
-	connect(ui.chkBlockINet, SIGNAL(clicked(bool)), this, SLOT(OnBlockINet()));
-	connect(ui.btnAddINetProg, SIGNAL(clicked(bool)), this, SLOT(OnAddINetProg()));
-	connect(ui.btnDelINetProg, SIGNAL(clicked(bool)), this, SLOT(OnDelINetProg()));
-	connect(ui.chkINetBlockPrompt, SIGNAL(clicked(bool)), this, SLOT(OnINetBlockChanged()));
-	connect(ui.chkINetBlockMsg, SIGNAL(clicked(bool)), this, SLOT(OnINetBlockChanged()));
-	//
+	CreateNetwork();
 
-	// Access
-	connect(ui.btnAddFile, SIGNAL(clicked(bool)), this, SLOT(OnAddFile()));
-	QMenu* pFileBtnMenu = new QMenu(ui.btnAddFile);
-	pFileBtnMenu->addAction(tr("Browse for File"), this, SLOT(OnBrowseFile()));
-	pFileBtnMenu->addAction(tr("Browse for Folder"), this, SLOT(OnBrowseFolder()));
-	ui.btnAddFile->setPopupMode(QToolButton::MenuButtonPopup);
-	ui.btnAddFile->setMenu(pFileBtnMenu);
-	connect(ui.btnAddKey, SIGNAL(clicked(bool)), this, SLOT(OnAddKey()));
-	connect(ui.btnAddIPC, SIGNAL(clicked(bool)), this, SLOT(OnAddIPC()));
-	connect(ui.btnAddWnd, SIGNAL(clicked(bool)), this, SLOT(OnAddWnd()));
-	connect(ui.btnAddCOM, SIGNAL(clicked(bool)), this, SLOT(OnAddCOM()));
-	// todo: add priority by order 
-	ui.btnMoveUp->setVisible(false);
-	ui.btnMoveDown->setVisible(false);
-	connect(ui.chkShowAccessTmpl, SIGNAL(clicked(bool)), this, SLOT(OnShowAccessTmpl()));
-	connect(ui.btnDelAccess, SIGNAL(clicked(bool)), this, SLOT(OnDelAccess()));
-
-	connect(ui.treeAccess, SIGNAL(itemClicked(QTreeWidgetItem*, int)), this, SLOT(OnAccessItemClicked(QTreeWidgetItem*, int)));
-	connect(ui.treeAccess, SIGNAL(itemDoubleClicked(QTreeWidgetItem*, int)), this, SLOT(OnAccessItemDoubleClicked(QTreeWidgetItem*, int)));
-	connect(ui.treeAccess, SIGNAL(itemSelectionChanged()), this, SLOT(OnAccessSelectionChanged()));
-	//
+	CreateAccess();
 
 	// Recovery
 	connect(ui.chkAutoRecovery, SIGNAL(clicked(bool)), this, SLOT(OnRecoveryChanged()));
@@ -249,116 +558,163 @@ COptionsWindow::COptionsWindow(const QSharedPointer<CSbieIni>& pBox, const QStri
 	connect(ui.btnDelRecovery, SIGNAL(clicked(bool)), this, SLOT(OnDelRecEntry()));
 	connect(ui.btnAddRecIgnore, SIGNAL(clicked(bool)), this, SLOT(OnAddRecIgnore()));
 	connect(ui.btnAddRecIgnoreExt, SIGNAL(clicked(bool)), this, SLOT(OnAddRecIgnoreExt()));
+	connect(ui.btnDelRecIgnore, SIGNAL(clicked(bool)), this, SLOT(OnDelRecIgnoreEntry()));
 	connect(ui.chkShowRecoveryTmpl, SIGNAL(clicked(bool)), this, SLOT(OnShowRecoveryTmpl()));
+	connect(ui.chkShowRecIgnoreTmpl, SIGNAL(clicked(bool)), this, SLOT(OnShowRecIgnoreTmpl()));
 	//
 
-	// Advanced
-	connect(ui.chkPreferExternalManifest, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-
-	connect(ui.chkNoWindowRename, SIGNAL(clicked(bool)), this, SLOT(OnNoWindowRename()));
-
-	connect(ui.chkProtectSCM, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkRestrictServices, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkProtectSystem, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-
-	connect(ui.chkOpenCredentials, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkOpenProtectedStorage, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkOpenSmartCard, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkOpenBluetooth, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	//connect(ui.chkOpenLsaEndpoint, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-		
-	connect(ui.chkAddToJob, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-
-	connect(ui.chkFileTrace, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkPipeTrace, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkKeyTrace, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkIpcTrace, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkGuiTrace, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkComTrace, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkDbgTrace, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.chkErrTrace, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-
-	connect(ui.btnAddAutoExec, SIGNAL(clicked(bool)), this, SLOT(OnAddAutoExec()));
-	connect(ui.btnDelAutoExec, SIGNAL(clicked(bool)), this, SLOT(OnDelAutoExec()));
-
-	connect(ui.chkHideOtherBoxes, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	connect(ui.btnAddProcess, SIGNAL(clicked(bool)), this, SLOT(OnAddProcess()));
-	connect(ui.btnDelProcess, SIGNAL(clicked(bool)), this, SLOT(OnDelProcess()));
-
-	connect(ui.btnAddUser, SIGNAL(clicked(bool)), this, SLOT(OnAddUser()));
-	connect(ui.btnDelUser, SIGNAL(clicked(bool)), this, SLOT(OnDelUser()));
-	connect(ui.chkMonitorAdminOnly, SIGNAL(clicked(bool)), this, SLOT(OnAdvancedChanged()));
-	
-	//
+	CreateAdvanced();
 
 	// Templates
 	connect(ui.cmbCategories, SIGNAL(currentIndexChanged(int)), this, SLOT(OnFilterTemplates()));
 	connect(ui.txtTemplates, SIGNAL(textChanged(const QString&)), this, SLOT(OnFilterTemplates()));
-	connect(ui.treeTemplates, SIGNAL(itemClicked(QTreeWidgetItem*, int)), this, SLOT(OnTemplateClicked(QTreeWidgetItem*, int)));
+	//connect(ui.treeTemplates, SIGNAL(itemClicked(QTreeWidgetItem*, int)), this, SLOT(OnTemplateClicked(QTreeWidgetItem*, int)));
+	connect(ui.treeTemplates, SIGNAL(itemChanged(QTreeWidgetItem*, int)), this, SLOT(OnTemplateClicked(QTreeWidgetItem*, int)));
 	connect(ui.treeTemplates, SIGNAL(itemDoubleClicked(QTreeWidgetItem*, int)), this, SLOT(OnTemplateDoubleClicked(QTreeWidgetItem*, int)));
+	connect(ui.btnAddTemplate, SIGNAL(clicked(bool)), this, SLOT(OnAddTemplates()));
+	QMenu* pTmplBtnMenu = new QMenu(ui.btnAddTemplate);
+	for(int i = 1; i < CTemplateWizard::TmplMax; i++)
+		pTmplBtnMenu->addAction(tr("Add %1 Template").arg(CTemplateWizard::GetTemplateLabel((CTemplateWizard::ETemplateType)i)), this, SLOT(OnTemplateWizard()))->setData(i);
+	ui.btnAddTemplate->setPopupMode(QToolButton::MenuButtonPopup);
+	ui.btnAddTemplate->setMenu(pTmplBtnMenu);
+	connect(ui.btnOpenTemplate, SIGNAL(clicked(bool)), this, SLOT(OnOpenTemplate()));
+	connect(ui.btnDelTemplate, SIGNAL(clicked(bool)), this, SLOT(OnDelTemplates()));
+	connect(ui.chkScreenReaders, SIGNAL(clicked(bool)), this, SLOT(OnScreenReaders()));
 	//
 
 	connect(ui.tabs, SIGNAL(currentChanged(int)), this, SLOT(OnTab()));
 
 	// edit
+	ApplyIniEditFont();
+
 	connect(ui.btnEditIni, SIGNAL(clicked(bool)), this, SLOT(OnEditIni()));
 	connect(ui.btnSaveIni, SIGNAL(clicked(bool)), this, SLOT(OnSaveIni()));
 	connect(ui.btnCancelEdit, SIGNAL(clicked(bool)), this, SLOT(OnCancelEdit()));
-	//
+	//connect(ui.txtIniSection, SIGNAL(textChanged()), this, SLOT(OnIniChanged()));
 
 	connect(ui.buttonBox->button(QDialogButtonBox::Ok), SIGNAL(clicked(bool)), this, SLOT(ok()));
 	connect(ui.buttonBox->button(QDialogButtonBox::Apply), SIGNAL(clicked(bool)), this, SLOT(apply()));
 	connect(ui.buttonBox, SIGNAL(rejected()), this, SLOT(close()));
 
-	if (ReadOnly) {
+	if (ReadOnly)
+	{
 		ui.btnEditIni->setEnabled(false);
 		ui.buttonBox->button(QDialogButtonBox::Ok)->setEnabled(false);
-		ui.buttonBox->button(QDialogButtonBox::Apply)->setEnabled(false);
 	}
 
-	OnTab(); // -> LoadConfig();
+	if (theAPI->IsRunningAsAdmin())
+	{
+		ui.chkDropRights->setEnabled(false);
+		ui.chkFakeElevation->setEnabled(false);
+	}
+	else
+		ui.lblAdmin->setVisible(false);
 
-	ui.treeAccess->viewport()->installEventFilter(this);
+	LoadConfig();
+
+	m_pCurrentTab = ui.tabGeneral;
+	UpdateCurrentTab();
+
+	ui.buttonBox->button(QDialogButtonBox::Apply)->setEnabled(false);
+	
+	ui.treeCopy->viewport()->installEventFilter(this);
+	ui.treeINet->viewport()->installEventFilter(this);
+	ui.treeNetFw->viewport()->installEventFilter(this);
+	ui.treeFiles->viewport()->installEventFilter(this);
+	ui.treeKeys->viewport()->installEventFilter(this);
+	ui.treeIPC->viewport()->installEventFilter(this);
+	ui.treeWnd->viewport()->installEventFilter(this);
+	ui.treeCOM->viewport()->installEventFilter(this);
+	//ui.treeAccess->viewport()->installEventFilter(this);
+	if(ui.treeOptions) ui.treeOptions->viewport()->installEventFilter(this);
+	this->installEventFilter(this); // prevent enter from closing the dialog
 
 	restoreGeometry(theConf->GetBlob("OptionsWindow/Window_Geometry"));
 
-	QByteArray
-	Columns = theConf->GetBlob("OptionsWindow/Run_Columns");
-	if (!Columns.isEmpty()) ui.treeRun->header()->restoreState(Columns);
-	Columns = theConf->GetBlob("OptionsWindow/AutoRun_Columns");
-	if (!Columns.isEmpty()) ui.treeAutoStart->header()->restoreState(Columns);
-	Columns = theConf->GetBlob("OptionsWindow/Groups_Columns");
-	if (!Columns.isEmpty()) ui.treeGroups->header()->restoreState(Columns);
-	Columns = theConf->GetBlob("OptionsWindow/Forced_Columns");
-	if (!Columns.isEmpty()) ui.treeForced->header()->restoreState(Columns);
-	Columns = theConf->GetBlob("OptionsWindow/Stop_Columns");
-	if (!Columns.isEmpty()) ui.treeStop->header()->restoreState(Columns);
-	Columns = theConf->GetBlob("OptionsWindow/Start_Columns");
-	if (!Columns.isEmpty()) ui.treeStart->header()->restoreState(Columns);
-	Columns = theConf->GetBlob("OptionsWindow/INet_Columns");
-	if (!Columns.isEmpty()) ui.treeINet->header()->restoreState(Columns);
-	Columns = theConf->GetBlob("OptionsWindow/Access_Columns");
-	if (!Columns.isEmpty()) ui.treeAccess->header()->restoreState(Columns);
-	Columns = theConf->GetBlob("OptionsWindow/Recovery_Columns");
-	if (!Columns.isEmpty()) ui.treeRecovery->header()->restoreState(Columns);
-	Columns = theConf->GetBlob("OptionsWindow/Templates_Columns");
-	if (!Columns.isEmpty()) ui.treeTemplates->header()->restoreState(Columns);
+	foreach(QTreeWidget * pTree, this->findChildren<QTreeWidget*>()) {
+		QByteArray Columns = theConf->GetBlob("OptionsWindow/" + pTree->objectName() + "_Columns");
+		if (!Columns.isEmpty()) 
+			pTree->header()->restoreState(Columns);
+	}
+
+	if (theAPI->GetGlobalSettings()->GetBool("EditAdminOnly", false) && !IsAdminUser())
+	{
+		for (int I = 0; I < ui.tabs->count(); I++) {
+			QGridLayout* pGrid = qobject_cast<QGridLayout*>(ui.tabs->widget(I)->layout());
+			QTabWidget* pSubTabs = pGrid ? qobject_cast<QTabWidget*>(pGrid->itemAt(0)->widget()) : NULL;
+			if (!pSubTabs) {
+				ui.tabs->widget(I)->setEnabled(false);
+			}
+			else {
+				for (int J = 0; J < pSubTabs->count(); J++) {
+					pSubTabs->widget(J)->setEnabled(false);
+				}
+			}
+		}
+	}
+
+	int iOptionTree = theConf->GetInt("Options/OptionTree", 2);
+	if (iOptionTree == 2)
+		iOptionTree = iViewMode == 2 ? 1 : 0;
+
+	if (iOptionTree) {
+		m_HoldChange = true;
+		OnSetTree();
+		m_HoldChange = false;
+	}
+	else {
+		//this->setMinimumHeight(390);
+
+		QWidget* pSearch = AddConfigSearch(ui.tabs);
+		ui.horizontalLayout->insertWidget(0, pSearch);
+		QTimer::singleShot(0, [this]() {
+			m_pSearch->setMaximumWidth(m_pTabs->tabBar()->width());
+		});
+
+		QAction* pSetTree = new QAction();
+		connect(pSetTree, SIGNAL(triggered()), this, SLOT(OnSetTree()));
+		pSetTree->setShortcut(QKeySequence("Ctrl+Alt+T"));
+		pSetTree->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+		this->addAction(pSetTree);
+	}
+	m_pSearch->setPlaceholderText(tr("Search for options"));
+	
+	SetTabOrder(this);
+}
+
+void COptionsWindow::ApplyIniEditFont()
+{
+	QFont font; // defaults to application font
+	auto fontName = theConf->GetString("UIConfig/IniFont", "").trimmed();
+	if (!fontName.isEmpty()) {
+		font.fromString(fontName); // ignore fromString() fail
+		//ui.txtIniSection->setFont(font);
+		m_pCodeEdit->SetFont(font);
+	}
+}
+
+void COptionsWindow::OnSetTree()
+{
+	if (!ui.tabs) return;
+	QWidget* pAltView = ConvertToTree(ui.tabs);
+	ui.verticalLayout->replaceWidget(ui.tabs, pAltView);
+	ui.tabs->deleteLater();
+	ui.tabs = NULL;
+}
+
+void COptionsWindow::OnOptChanged() 
+{
+	if (m_HoldChange)
+		return;
+	ui.buttonBox->button(QDialogButtonBox::Apply)->setEnabled(true);
 }
 
 COptionsWindow::~COptionsWindow()
 {
 	theConf->SetBlob("OptionsWindow/Window_Geometry",saveGeometry());
 
-	theConf->SetBlob("OptionsWindow/Run_Columns", ui.treeRun->header()->saveState());
-	theConf->SetBlob("OptionsWindow/AutoRun_Columns", ui.treeAutoStart->header()->saveState());
-	theConf->SetBlob("OptionsWindow/Groups_Columns", ui.treeGroups->header()->saveState());
-	theConf->SetBlob("OptionsWindow/Forced_Columns", ui.treeForced->header()->saveState());
-	theConf->SetBlob("OptionsWindow/Stop_Columns", ui.treeStop->header()->saveState());
-	theConf->SetBlob("OptionsWindow/Start_Columns", ui.treeStart->header()->saveState());
-	theConf->SetBlob("OptionsWindow/INet_Columns", ui.treeINet->header()->saveState());
-	theConf->SetBlob("OptionsWindow/Access_Columns", ui.treeAccess->header()->saveState());
-	theConf->SetBlob("OptionsWindow/Recovery_Columns", ui.treeRecovery->header()->saveState());
-	theConf->SetBlob("OptionsWindow/Templates_Columns", ui.treeTemplates->header()->saveState());
+	foreach(QTreeWidget * pTree, this->findChildren<QTreeWidget*>()) 
+		theConf->SetBlob("OptionsWindow/" + pTree->objectName() + "_Columns", pTree->header()->saveState());
 }
 
 void COptionsWindow::closeEvent(QCloseEvent *e)
@@ -370,24 +726,74 @@ void COptionsWindow::closeEvent(QCloseEvent *e)
 bool COptionsWindow::eventFilter(QObject *source, QEvent *event)
 {
 	if (event->type() == QEvent::KeyPress && ((QKeyEvent*)event)->key() == Qt::Key_Escape 
-		&& ((QKeyEvent*)event)->modifiers() == Qt::NoModifier)
+		&& ((QKeyEvent*)event)->modifiers() == Qt::NoModifier
+		&& source == m_pCodeEdit)
 	{
+		return true; // cancel event
+	}
+
+	if (event->type() == QEvent::KeyPress && ((QKeyEvent*)event)->key() == Qt::Key_Escape 
+		&& ((QKeyEvent*)event)->modifiers() == Qt::NoModifier
+		&& (source == ui.treeCopy->viewport()
+			|| source == ui.treeINet->viewport() || source == ui.treeNetFw->viewport() 
+			// || source == ui.treeAccess->viewport()
+			|| source == ui.treeFiles->viewport() || source == ui.treeKeys->viewport() || source == ui.treeIPC->viewport() || source == ui.treeWnd->viewport() || source == ui.treeCOM->viewport() 
+			|| (ui.treeOptions && source == ui.treeOptions->viewport())))
+	{
+		CloseCopyEdit(false);
+		CloseINetEdit(false);
+		CloseNetFwEdit(false);
 		CloseAccessEdit(false);
+		CloseOptionEdit(false);
+        CloseNetProxyEdit(false);
 		return true; // cancel event
 	}
 
 	if (event->type() == QEvent::KeyPress && (((QKeyEvent*)event)->key() == Qt::Key_Enter || ((QKeyEvent*)event)->key() == Qt::Key_Return) 
-		&& ((QKeyEvent*)event)->modifiers() == Qt::NoModifier)
+		&& (((QKeyEvent*)event)->modifiers() == Qt::NoModifier || ((QKeyEvent*)event)->modifiers() == Qt::KeypadModifier))
 	{
+		CloseCopyEdit(true);
+		CloseINetEdit(true);
+		CloseNetFwEdit(true);
 		CloseAccessEdit(true);
+		CloseOptionEdit(true);
+        CloseNetProxyEdit(true);
 		return true; // cancel event
 	}
 	
-	if (source == ui.treeAccess->viewport() && event->type() == QEvent::MouseButtonPress)
+	if (source == ui.treeCopy->viewport() && event->type() == QEvent::MouseButtonPress)
+	{
+		CloseCopyEdit();
+	}
+
+	if (source == ui.treeINet->viewport() && event->type() == QEvent::MouseButtonPress)
+	{
+		CloseINetEdit();
+	}
+
+	if (source == ui.treeNetFw->viewport() && event->type() == QEvent::MouseButtonPress)
+	{
+		CloseNetFwEdit();
+	}
+
+    if (source == ui.treeProxy->viewport() && event->type() == QEvent::MouseButtonPress)
+	{
+		CloseNetProxyEdit();
+	}
+
+	if (//source == ui.treeAccess->viewport() 
+		(source == ui.treeFiles->viewport() || source == ui.treeKeys->viewport() || source == ui.treeIPC->viewport() || source == ui.treeWnd->viewport() || source == ui.treeCOM->viewport())
+		&& event->type() == QEvent::MouseButtonPress)
 	{
 		CloseAccessEdit();
 	}
-	
+
+
+	if ((ui.treeOptions && source == ui.treeOptions->viewport()) && event->type() == QEvent::MouseButtonPress)
+	{
+		CloseOptionEdit();
+	}
+
 	return QDialog::eventFilter(source, event);
 }
 
@@ -400,62 +806,64 @@ bool COptionsWindow::eventFilter(QObject *source, QEvent *event)
 
 void COptionsWindow::ReadAdvancedCheck(const QString& Name, QCheckBox* pCheck, const QString& Value)
 {
-	QString Data = m_pBox->GetText(Name, "");
+	QString Data = m_pBox->GetText(Name);
 	if (Data == Value)			pCheck->setCheckState(Qt::Checked);
 	else if (Data.isEmpty())	pCheck->setCheckState(Qt::Unchecked);
 	else						pCheck->setCheckState(Qt::PartiallyChecked);
+}
+
+int COptionsWindow__GetBoolConfig(const QString& Value)
+{
+	QString temp = Value.left(1).toLower();
+	if (temp == "y")
+		return 1;
+	else if (temp == "n")
+		return 0;
+	return -1;
+}
+
+void COptionsWindow::ReadGlobalCheck(QCheckBox* pCheck, const QString& Setting, bool bDefault)
+{
+	int iLocal = COptionsWindow__GetBoolConfig(m_pBox->GetText(Setting));
+	int iTemplate = COptionsWindow__GetBoolConfig(m_pBox->GetText(Setting, QString(), false, true, true));
+	int iGlobal = COptionsWindow__GetBoolConfig(m_pBox->GetText(Setting, QString(), true));
+
+	bool bTemplate = m_pBox->GetBool(Setting, bDefault, true, true);
+	if (iLocal != -1) 
+		pCheck->setChecked(iLocal == 1);
+	else
+		pCheck->setChecked(iTemplate != -1 ? iTemplate == 1 : iGlobal != -1 ? iGlobal == 1 : bDefault);
+	QStringList Info;
+	Info.append(tr("Box: %1").arg(iLocal == 1 ? "y" : "n"));
+	if (iTemplate != -1)	Info.append(tr("Template: %1").arg(iTemplate == 1 ? "y" : "n"));
+	if (iGlobal != -1)		Info.append(tr("Global: %1").arg(iGlobal == 1 ? "y" : "n"));
+	Info.append(tr("Default: %1").arg(bDefault ? "y" : "n"));
+	pCheck->setToolTip(Info.join("\r\n"));
+}
+
+void COptionsWindow::WriteGlobalCheck(QCheckBox* pCheck, const QString& Setting, bool bDefault)
+{
+	bool bLocal = pCheck->isChecked();
+	bool bPreset = m_pBox->GetBool(Setting, bDefault, true, true);
+	SB_STATUS Status;
+	if(bPreset == bLocal)
+		Status = m_pBox->DelValue(Setting);
+	else 
+		Status = m_pBox->SetText(Setting, bLocal ? "y" : "n");
+
+	if (!Status)
+		throw Status;
 }
 
 void COptionsWindow::LoadConfig()
 {
 	m_ConfigDirty = false;
 
-	{
-		QString BoxNameTitle = m_pBox->GetText("BoxNameTitle", "n");
-		ui.cmbBoxIndicator->setCurrentIndex(ui.cmbBoxIndicator->findData(BoxNameTitle.toLower()));
+	m_HoldChange = true;
 
-		QStringList BorderCfg = m_pBox->GetText("BorderColor").split(",");
-		ui.cmbBoxBorder->setCurrentIndex(ui.cmbBoxBorder->findData(BorderCfg.size() >= 2 ? BorderCfg[1].toLower() : "on"));
-		m_BorderColor = QColor("#" + BorderCfg[0].mid(5, 2) + BorderCfg[0].mid(3, 2) + BorderCfg[0].mid(1, 2));
-		ui.btnBorderColor->setStyleSheet("background-color: " + m_BorderColor.name());
-		int BorderWidth = BorderCfg.count() >= 3 ? BorderCfg[2].toInt() : 0;
-		if (!BorderWidth) BorderWidth = 6;
-		ui.spinBorderWidth->setValue(BorderWidth);
+	LoadTemplates();
 
-		ui.chkBlockNetShare->setChecked(m_pBox->GetBool("BlockNetworkFiles", true));
-		ui.chkBlockNetParam->setChecked(m_pBox->GetBool("BlockNetParam", true));
-		ui.chkDropRights->setChecked(m_pBox->GetBool("DropAdminRights", false));
-		ui.chkBlockSpooler->setChecked(m_pBox->GetBool("ClosePrintSpooler", false));
-		ui.chkOpenSpooler->setChecked(m_pBox->GetBool("OpenPrintSpooler", false));
-		ui.chkOpenSpooler->setEnabled(!ui.chkBlockSpooler->isChecked());
-		ui.chkPrintToFile->setChecked(m_pBox->GetBool("AllowSpoolerPrintToFile", false));
-		ui.chkPrintToFile->setEnabled(!ui.chkBlockSpooler->isChecked());
-
-		ui.treeAutoStart->clear();
-		foreach(const QString & Value, m_pBox->GetTextList("StartProgram", m_Template))
-			AddAutoRunItem(Value, 0);
-		foreach(const QString & Value, m_pBox->GetTextList("StartService", m_Template))
-			AddAutoRunItem(Value, 1);
-
-		ui.treeRun->clear();
-		foreach(const QString& Value, m_pBox->GetTextList("RunCommand", m_Template))
-		{
-			StrPair NameCmd = Split2(Value, "|");
-			QTreeWidgetItem* pItem = new QTreeWidgetItem();
-			AddRunItem(NameCmd.first, NameCmd.second);
-		}
-
-
-		int iLimit = m_pBox->GetNum("CopyLimitKb", 80 * 1024);
-		ui.chkCopyLimit->setChecked(iLimit != -1);
-		ui.txtCopyLimit->setText(QString::number(iLimit > 0 ? iLimit : 80 * 1024));
-		ui.chkNoCopyWarn->setChecked(!m_pBox->GetBool("CopyLimitSilent", false));
-	
-		ui.chkProtectBox->setChecked(m_pBox->GetBool("NeverDelete", false));
-		ui.chkAutoEmpty->setChecked(m_pBox->GetBool("AutoDelete", false));
-
-		m_GeneralChanged = false;
-	}
+	LoadGeneral();
 
 	LoadGroups();
 
@@ -463,90 +871,36 @@ void COptionsWindow::LoadConfig()
 
 	LoadStop();
 
-	{
-		ui.chkStartBlockMsg->setEnabled(!ui.radStartAll->isChecked());
-		ui.chkStartBlockMsg->setChecked(m_pBox->GetBool("NotifyStartRunAccessDenied", true));
-	
-		m_StartChanged = false;
-	}
+	LoadStart();
 
-	{
-		ui.chkINetBlockPrompt->setEnabled(ui.chkBlockINet->isChecked());
-		ui.chkINetBlockPrompt->setChecked(m_pBox->GetBool("PromptForInternetAccess", false));
-		ui.chkINetBlockMsg->setEnabled(ui.chkBlockINet->isChecked());
-		ui.chkINetBlockMsg->setChecked(m_pBox->GetBool("NotifyInternetAccessDenied", true));
-	
-		m_INetBlockChanged = false;
-	}
+	LoadINetAccess();
+	LoadNetFwRules();
+	LoadDnsFilter();
+	LoadNetProxy();
+	LoadNetwork();
 
 	LoadAccessList();
 
 	LoadRecoveryList();
 
-	{
-		ui.chkPreferExternalManifest->setChecked(m_pBox->GetBool("PreferExternalManifest", false));
+	LoadAdvanced();
+	LoadDebug();
+	
+	UpdateBoxType();
 
-		ui.chkProtectSCM->setChecked(!m_pBox->GetBool("UnrestrictedSCM", false));
-		ui.chkRestrictServices->setChecked(!m_pBox->GetBool("RunServicesAsSystem", false));
-		ui.chkProtectSystem->setChecked(!m_pBox->GetBool("ExposeBoxedSystem", false));
-
-		ui.chkOpenProtectedStorage->setChecked(m_pBox->GetBool("OpenProtectedStorage", false));
-		ui.chkOpenCredentials->setEnabled(!ui.chkOpenProtectedStorage->isChecked());
-		ui.chkOpenCredentials->setChecked(!ui.chkOpenCredentials->isEnabled() || m_pBox->GetBool("OpenCredentials", false));
-		ui.chkOpenSmartCard->setChecked(m_pBox->GetBool("OpenSmartCard", true));
-		ui.chkOpenBluetooth->setChecked(m_pBox->GetBool("OpenBluetooth", false));
-		//ui.chkOpenLsaEndpoint->setChecked(m_pBox->GetBool("OpenLsaEndpoint", false));
-
-
-		ui.chkAddToJob->setChecked(!m_pBox->GetBool("NoAddProcessToJob", false));
-
-
-		QStringList AutoExec = m_pBox->GetTextList("AutoExec", m_Template);
-		ui.lstAutoExec->clear();
-		ui.lstAutoExec->addItems(AutoExec);
-
-
-		ReadAdvancedCheck("FileTrace", ui.chkFileTrace, "*");
-		ReadAdvancedCheck("PipeTrace", ui.chkPipeTrace, "*");
-		ReadAdvancedCheck("KeyTrace", ui.chkKeyTrace, "*");
-		ReadAdvancedCheck("IpcTrace", ui.chkIpcTrace, "*");
-		ReadAdvancedCheck("GuiTrace", ui.chkGuiTrace, "*");
-		ReadAdvancedCheck("ClsidTrace", ui.chkComTrace, "*");
-		ui.chkDbgTrace->setChecked(m_pBox->GetBool("DebugTrace", false));
-		ui.chkErrTrace->setChecked(m_pBox->GetBool("ErrorTrace", false));
-
-		ui.chkHideOtherBoxes->setChecked(m_pBox->GetBool("HideOtherBoxes", false));
-		QStringList Processes = m_pBox->GetTextList("HideHostProcess", m_Template);
-		ui.lstProcesses->clear();
-		ui.lstProcesses->addItems(Processes);
-
-
-		QStringList Users = m_pBox->GetText("Enabled").split(",");
-		ui.lstUsers->clear();
-		if (Users.count() > 1)
-			ui.lstUsers->addItems(Users.mid(1));
-		ui.chkMonitorAdminOnly->setChecked(m_pBox->GetBool("MonitorAdminOnly", false));
-
-		m_AdvancedChanged = false;
-	}
-
-	foreach(QCheckBox* pCheck, m_DebugOptions.keys()) 
-	{
-		SDbgOpt& DbgOption = m_DebugOptions[pCheck];
-		DbgOption.Changed = false;
-		ReadAdvancedCheck(DbgOption.Name, pCheck, DbgOption.Value);
-	}
-
-	{
-		LoadTemplates();
-		m_TemplatesChanged = false;
-	}
+	m_HoldChange = false;
 }
 
 void COptionsWindow::WriteAdvancedCheck(QCheckBox* pCheck, const QString& Name, const QString& Value)
 {
-	if (pCheck->checkState() == Qt::Checked)		m_pBox->SetText(Name, Value);
-	else if (pCheck->checkState() == Qt::Unchecked) m_pBox->DelValue(Name);
+	SB_STATUS Status;
+	if (pCheck->checkState() == Qt::Checked)		
+		Status = m_pBox->SetText(Name, Value);
+	else if (pCheck->checkState() == Qt::Unchecked) 
+		Status = m_pBox->DelValue(Name);
+	
+	if (!Status)
+		throw Status;
 }
 
 void COptionsWindow::WriteAdvancedCheck(QCheckBox* pCheck, const QString& Name, const QString& OnValue, const QString& OffValue)
@@ -554,201 +908,210 @@ void COptionsWindow::WriteAdvancedCheck(QCheckBox* pCheck, const QString& Name, 
 	//if (pCheck->checkState() == Qt::PartiallyChecked)
 	//	return;
 
+	if (!pCheck->isEnabled())
+		return;
+
+	QString StrValue;
 	if (pCheck->checkState() == Qt::Checked)
 	{
-		if(!OnValue.isEmpty())
-			m_pBox->SetText(Name, OnValue);
-		else
-			m_pBox->DelValue(Name);
+		if (!OnValue.isEmpty())
+			StrValue = OnValue;
 	}
 	else if (pCheck->checkState() == Qt::Unchecked)
 	{
 		if (!OffValue.isEmpty())
-			m_pBox->SetText(Name, OffValue);
-		else
-			m_pBox->DelValue(Name);
+			StrValue = OffValue;
 	}
+
+	QStringList Values = m_pBox->GetTextList(Name, false);
+	foreach(const QString & CurValue, Values) {
+		if (CurValue.contains(","))
+			continue;
+		if (!StrValue.isEmpty() && CurValue == StrValue)
+			StrValue.clear();
+		else
+			m_pBox->DelValue(Name, CurValue);
+	}
+
+	if (!StrValue.isEmpty()) {
+		SB_STATUS Status = m_pBox->AppendText(Name, StrValue);
+		if (!Status)
+			throw Status;
+	}
+}
+
+void COptionsWindow::WriteText(const QString& Name, const QString& Value)
+{
+	SB_STATUS Status = m_pBox->SetText(Name, Value);
+	if (!Status)
+		throw Status;
+}
+
+void COptionsWindow::WriteTextList(const QString& Setting, const QStringList& List)
+{
+	SB_STATUS Status = m_pBox->UpdateTextList(Setting, List, m_Template);
+	if (!Status)
+		throw Status;
+}
+
+void COptionsWindow::WriteTextSafe(const QString& Name, const QString& Value)
+{
+	QStringList List = m_pBox->GetTextList(Name, false);
+
+	// clear all non per process (name=program.exe,value) entries 
+	for (int i = 0; i < List.count(); i++) {
+		if (!List[i].contains(","))
+			List.removeAt(i--);
+	}
+
+	// Prepend the global entry
+	if (!Value.isEmpty()) List.append(Value);
+
+	WriteTextList(Name, List);
+}
+
+QString COptionsWindow::ReadTextSafe(const QString& Name, const QString& Default)
+{
+	QStringList List = m_pBox->GetTextList(Name, false);
+
+	for (int i = 0; i < List.count(); i++) {
+		if (!List[i].contains(","))
+			return List[i];
+	}
+
+	return Default;
 }
 
 void COptionsWindow::SaveConfig()
 {
-	if (m_GeneralChanged)
+	bool UpdatePaths = false;
+
+	m_pBox->SetRefreshOnChange(false);
+
+	try
 	{
-		m_pBox->SetText("BoxNameTitle", ui.cmbBoxIndicator->currentData().toString());
+		if (m_GeneralChanged)
+			SaveGeneral();
+		if (m_CopyRulesChanged)
+			SaveCopyRules();
 
-		QStringList BorderCfg;
-		BorderCfg.append(QString("#%1%2%3").arg(m_BorderColor.blue(), 2, 16, QChar('0')).arg(m_BorderColor.green(), 2, 16, QChar('0')).arg(m_BorderColor.red(), 2, 16, QChar('0')));
-		BorderCfg.append(ui.cmbBoxBorder->currentData().toString());
-		BorderCfg.append(QString::number(ui.spinBorderWidth->value()));
-		m_pBox->SetText("BorderColor", BorderCfg.join(","));
+		if (m_GroupsChanged)
+			SaveGroups();
 
-		m_pBox->SetBool("BlockNetworkFiles", ui.chkBlockNetShare->isChecked());
-		m_pBox->SetBool("BlockNetParam", ui.chkBlockNetParam->isChecked());
-		m_pBox->SetBool("DropAdminRights", ui.chkDropRights->isChecked());
-		m_pBox->SetBool("ClosePrintSpooler", ui.chkBlockSpooler->isChecked());
-		m_pBox->SetBool("OpenPrintSpooler", ui.chkOpenSpooler->isChecked());
-		m_pBox->SetBool("AllowSpoolerPrintToFile", ui.chkPrintToFile->isChecked());
+		if (m_ForcedChanged)
+			SaveForced();
 
+		if (m_StopChanged)
+			SaveStop();
 
-		QStringList StartProgram;
-		QStringList StartService;
-		for (int i = 0; i < ui.treeAutoStart->topLevelItemCount(); i++) {
-			QTreeWidgetItem* pItem = ui.treeAutoStart->topLevelItem(i);
-			if (pItem->data(0, Qt::UserRole).toInt())
-				StartService.append(pItem->text(1));
-			else
-				StartProgram.append(pItem->text(1));
+		if (m_StartChanged)
+			SaveStart();
+
+		if (m_INetBlockChanged)
+			SaveINetAccess();
+		if (m_NetFwRulesChanged)
+			SaveNetFwRules();
+		if (m_DnsFilterChanged)
+			SaveDnsFilter();
+		if (m_NetProxyChanged)
+			SaveNetProxy();
+		if (m_NetworkChanged)
+			SaveNetwork();
+
+		if (m_AccessChanged) {
+			SaveAccessList();
+			UpdatePaths = true;
 		}
-		m_pBox->UpdateTextList("StartProgram", StartProgram, m_Template);
-		m_pBox->UpdateTextList("StartService", StartService, m_Template);
 
-		QStringList RunCommands;
-		for (int i = 0; i < ui.treeRun->topLevelItemCount(); i++) {
-			QTreeWidgetItem* pItem = ui.treeRun->topLevelItem(i);
-			RunCommands.append(pItem->text(0) + "|" + pItem->text(1));
-		}
-		m_pBox->UpdateTextList("RunCommand", RunCommands, m_Template);
+		if (m_RecoveryChanged)
+			SaveRecoveryList();
 
+		if (m_AdvancedChanged)
+			SaveAdvanced();
+		SaveDebug();
 
-		m_pBox->SetNum("CopyLimitKb", ui.chkCopyLimit->isChecked() ? ui.txtCopyLimit->text().toInt() : -1);
-		m_pBox->SetBool("CopyLimitSilent", !ui.chkNoCopyWarn->isChecked());
+		if (m_TemplatesChanged)
+			SaveTemplates();
 
-		m_pBox->SetBool("NeverDelete", ui.chkProtectBox->isChecked());
-		m_pBox->SetBool("AutoDelete", ui.chkAutoEmpty->isChecked());
-
-		m_GeneralChanged = false;
+		if (m_FoldersChanged)
+			SaveFolders();
 	}
-
-	if (m_GroupsChanged)
-		SaveGroups();
-
-	if (m_ForcedChanged)
-		SaveForced();
-
-	if (m_StopChanged)
-		SaveStop();
-
-	if (m_StartChanged)
+	catch (SB_STATUS Status)
 	{
-		m_pBox->SetBool("NotifyStartRunAccessDenied", ui.chkStartBlockMsg->isChecked());
-
-		m_StartChanged = false;
+		theGUI->CheckResults(QList<SB_STATUS>() << Status, theGUI);
 	}
 
-	if (m_INetBlockChanged)
-	{
-		m_pBox->SetBool("PromptForInternetAccess", ui.chkINetBlockPrompt->isChecked());
-		m_pBox->SetBool("NotifyInternetAccessDenied", ui.chkINetBlockMsg->isChecked());
+	m_pBox->SetRefreshOnChange(true);
+	m_pBox->GetAPI()->CommitIniChanges();
 
-		m_INetBlockChanged = false;
-	}
-
-	if (m_AccessChanged)
-		SaveAccessList();
-
-	if (m_RecoveryChanged)
-		SaveRecoveryList();
-
-	if (m_AdvancedChanged)
-	{
-		if (ui.chkPreferExternalManifest->isChecked()) m_pBox->SetBool("PreferExternalManifest", true);
-		else m_pBox->DelValue("PreferExternalManifest");
-
-		WriteAdvancedCheck(ui.chkProtectSCM, "UnrestrictedSCM", "", "y");
-		WriteAdvancedCheck(ui.chkRestrictServices, "RunServicesAsSystem", "", "y");
-		WriteAdvancedCheck(ui.chkProtectSystem, "ExposeBoxedSystem", "", "y");
-		
-		WriteAdvancedCheck(ui.chkOpenProtectedStorage, "OpenProtectedStorage", "y", "");
-		if(ui.chkOpenCredentials->isEnabled())
-			WriteAdvancedCheck(ui.chkOpenCredentials, "OpenCredentials", "y", "");
-		WriteAdvancedCheck(ui.chkOpenSmartCard, "OpenSmartCard", "", "n");
-		WriteAdvancedCheck(ui.chkOpenBluetooth, "OpenBluetooth", "y", "");
-		//WriteAdvancedCheck(ui.chkOpenLsaEndpoint, "OpenLsaEndpoint", "y", "");
-
-		WriteAdvancedCheck(ui.chkAddToJob, "NoAddProcessToJob", "", "y");
-
-		QStringList AutoExec;
-		for (int i = 0; i < ui.lstAutoExec->count(); i++)
-			AutoExec.append(ui.lstAutoExec->item(i)->text());
-		m_pBox->UpdateTextList("AutoExec", AutoExec, m_Template);
-
-
-
-		WriteAdvancedCheck(ui.chkFileTrace, "FileTrace", "*");
-		WriteAdvancedCheck(ui.chkPipeTrace, "PipeTrace", "*");
-		WriteAdvancedCheck(ui.chkKeyTrace, "KeyTrace", "*");
-		WriteAdvancedCheck(ui.chkIpcTrace, "IpcTrace", "*");
-		WriteAdvancedCheck(ui.chkGuiTrace, "GuiTrace", "*");
-		WriteAdvancedCheck(ui.chkComTrace, "ClsidTrace", "*");
-		WriteAdvancedCheck(ui.chkDbgTrace, "DebugTrace", "y");
-		WriteAdvancedCheck(ui.chkErrTrace, "ErrorTrace", "y");
-
-		WriteAdvancedCheck(ui.chkHideOtherBoxes, "HideOtherBoxes");
-
-		QStringList Processes;
-		for (int i = 0; i < ui.lstProcesses->count(); i++)
-			Processes.append(ui.lstProcesses->item(i)->text());
-		m_pBox->UpdateTextList("HideHostProcess", Processes, m_Template);
-
-		QStringList Users;
-		for (int i = 0; i < ui.lstUsers->count(); i++)
-			Users.append(ui.lstUsers->item(i)->text());
-		m_pBox->SetText("Enabled", Users.count() > 0 ? "y," + Users.join(",") : "y");
-		WriteAdvancedCheck(ui.chkMonitorAdminOnly, "MonitorAdminOnly");
-
-		m_AdvancedChanged = false;
-	}
-
-	foreach(QCheckBox* pCheck, m_DebugOptions.keys())
-	{
-		SDbgOpt& DbgOption = m_DebugOptions[pCheck];
-		if (!DbgOption.Changed)
-			continue;
-		WriteAdvancedCheck(pCheck, DbgOption.Name, DbgOption.Value);
-		DbgOption.Changed = false;
-	}
-
-	if (m_TemplatesChanged)
-		SaveTemplates();
+	if (UpdatePaths)
+		TriggerPathReload();
 }
 
-void COptionsWindow::apply()
+bool COptionsWindow::apply()
 {
-	if (m_pBox->GetText("Enabled").isEmpty()) {
+	if (m_pBox->GetText("Enabled").isEmpty() && !(m_Template && m_pBox->GetName().mid(9, 6).compare("Local_", Qt::CaseInsensitive) == 0)) {
 		QMessageBox::critical(this, "Sandboxie-Plus", tr("This sandbox has been deleted hence configuration can not be saved."));
-		return;
+		return false;
 	}
 
+	CloseINetEdit();
+	CloseNetFwEdit();
 	CloseAccessEdit();
+	CloseOptionEdit();
+    CloseNetProxyEdit();
 
 	if (!ui.btnEditIni->isEnabled())
 		SaveIniSection();
 	else
+	{
+		if (m_GeneralChanged) {
+			auto pBoxEx = m_pBox.objectCast<CSandBoxPlus>();
+			if (ui.chkEncrypt->isChecked() && !QFile::exists(pBoxEx->GetBoxImagePath())) {
+				if (m_Password.isEmpty())
+					OnSetPassword();
+				if (m_Password.isEmpty())
+					return false;
+				pBoxEx->ImBoxCreate(m_ImageSize / 1024, m_Password);
+			}
+		}
+
 		SaveConfig();
+	}
 
 	LoadConfig();
 
-	emit OptionsChanged();
+	UpdateCurrentTab();
+
+	//emit OptionsChanged();
+
+	ui.buttonBox->button(QDialogButtonBox::Apply)->setEnabled(false);
+
+	return true;
 }
 
 void COptionsWindow::ok()
 {
-	apply();
-
-	this->close();
+	if(apply())
+		close();
 }
 
 void COptionsWindow::reject()
 {
 	if (m_GeneralChanged
+	 || m_CopyRulesChanged
 	 || m_GroupsChanged
 	 || m_ForcedChanged
 	 || m_StopChanged
 	 || m_StartChanged
 	// ||  m_RestrictionChanged
 	 || m_INetBlockChanged
+	 || m_NetFwRulesChanged
+	 || m_DnsFilterChanged
+	 || m_NetProxyChanged
 	 || m_AccessChanged
 	 || m_TemplatesChanged
+	 || m_FoldersChanged
 	 || m_RecoveryChanged
 	 || m_AdvancedChanged)
 	{
@@ -760,229 +1123,42 @@ void COptionsWindow::reject()
 	this->close();
 }
 
-void COptionsWindow::OnGeneralChanged()
+void COptionsWindow::showTab(const QString& Name)
 {
-	m_GeneralChanged = true;
+	QWidget* pWidget = this->findChild<QWidget*>("tab" + Name);
 
-	ui.lblCopyLimit->setEnabled(ui.chkCopyLimit->isChecked());
-	ui.txtCopyLimit->setEnabled(ui.chkCopyLimit->isChecked());
-	ui.lblCopyLimit->setText(tr("kilobytes (%1)").arg(FormatSize(ui.txtCopyLimit->text().toULongLong() * 1024)));
-	ui.chkNoCopyWarn->setEnabled(ui.chkCopyLimit->isChecked());
+	if (ui.tabs) {
+		for (int i = 0; i < ui.tabs->count(); i++) {
+			QGridLayout* pGrid = qobject_cast<QGridLayout*>(ui.tabs->widget(i)->layout());
+			QTabWidget* pSubTabs = pGrid ? qobject_cast<QTabWidget*>(pGrid->itemAt(0)->widget()) : NULL;
+			if(ui.tabs->widget(i) == pWidget)
+				ui.tabs->setCurrentIndex(i);
+			else if(pSubTabs) {
+				for (int j = 0; j < pSubTabs->count(); j++) {
+					if (pSubTabs->widget(j) == pWidget) {
+						ui.tabs->setCurrentIndex(i);
+						pSubTabs->setCurrentIndex(j);
+					}
+				}
+			}
+		}
+	} 
+	else
+		m_pStack->setCurrentWidget(pWidget);
 
-	ui.chkAutoEmpty->setEnabled(!ui.chkProtectBox->isChecked());
-
-	ui.chkOpenSpooler->setEnabled(!ui.chkBlockSpooler->isChecked());
-	ui.chkPrintToFile->setEnabled(!ui.chkBlockSpooler->isChecked());
+	CSandMan::SafeShow(this);
 }
 
-void COptionsWindow::OnPickColor()
-{
-	QColor color = QColorDialog::getColor(m_BorderColor, this, "Select color");
-	if (!color.isValid())
-		return;
-	m_GeneralChanged = true;
-	m_BorderColor = color;
-	ui.btnBorderColor->setStyleSheet("background-color: " + m_BorderColor.name());
-}
-
-void COptionsWindow::OnAddAutoCmd()
-{
-	QString Value = QInputDialog::getText(this, "Sandboxie-Plus", tr("Please enter a program path"), QLineEdit::Normal);
-	if (Value.isEmpty())
-		return;
-
-	AddAutoRunItem(Value, 0);
-	m_GeneralChanged = true;
-}
-
-void COptionsWindow::OnAddAutoExe()
-{
-	QString Value = QFileDialog::getOpenFileName(this, tr("Select Program"), "", tr("Executables (*.exe *.cmd);;All files (*.*)")).replace("/", "\\");;
-	if (Value.isEmpty())
-		return;
-
-	AddAutoRunItem(Value, 0);
-	m_GeneralChanged = true;
-}
-
-void COptionsWindow::OnDelAutoSvc()
-{
-	QString Value = QInputDialog::getText(this, "Sandboxie-Plus", tr("Please enter a service identifier"), QLineEdit::Normal);
-	if (Value.isEmpty())
-		return;
-
-	AddAutoRunItem(Value, 1);
-	m_GeneralChanged = true;
-}
-
-void COptionsWindow::AddAutoRunItem(const QString& Value, int Type)
-{
-	QTreeWidgetItem* pItem = new QTreeWidgetItem();
-	pItem->setText(0, Type ? tr("Service") : tr("Program"));
-	pItem->setData(0, Qt::UserRole, Type);
-	pItem->setText(1, Value);
-	pItem->setFlags(pItem->flags() | Qt::ItemIsEditable);
-	ui.treeAutoStart->addTopLevelItem(pItem);
-}
-
-void COptionsWindow::OnDelAuto()
-{
-	QTreeWidgetItem* pItem = ui.treeAutoStart->currentItem();
-	if (!pItem)
-		return;
-
-	delete pItem;
-	m_GeneralChanged = true;
-}
-
-void COptionsWindow::OnBrowsePath()
-{
-	QString Value = QFileDialog::getOpenFileName(this, tr("Select Program"), "", tr("Executables (*.exe|*.cmd)")).replace("/", "\\");;
-	if (Value.isEmpty())
-		return;
-
-	QString Name = QInputDialog::getText(this, "Sandboxie-Plus", tr("Please enter a menu title"), QLineEdit::Normal);
-	if (Name.isEmpty())
-		return;
-
-	AddRunItem(Name, Value);
-	m_GeneralChanged = true;
-}
-
-void COptionsWindow::OnAddCommand()
-{
-	QString Value = QInputDialog::getText(this, "Sandboxie-Plus", tr("Please enter a command"), QLineEdit::Normal);
-	if (Value.isEmpty())
-		return;
-
-	QString Name = QInputDialog::getText(this, "Sandboxie-Plus", tr("Please enter a menu title"), QLineEdit::Normal);
-	if (Name.isEmpty())
-		return;
-
-	AddRunItem(Name, Value);
-	m_GeneralChanged = true;
-}
-
-void COptionsWindow::AddRunItem(const QString& Name, const QString& Command)
-{
-	QTreeWidgetItem* pItem = new QTreeWidgetItem();
-	pItem->setText(0, Name);
-	pItem->setText(1, Command);
-	pItem->setFlags(pItem->flags() | Qt::ItemIsEditable);
-	ui.treeRun->addTopLevelItem(pItem);
-}
-
-void COptionsWindow::OnDelCommand()
-{
-	QTreeWidgetItem* pItem = ui.treeRun->currentItem();
-	if (!pItem)
-		return;
-
-	delete pItem;
-	m_GeneralChanged = true;
-}
-
-void COptionsWindow::SetProgramItem(QString Program, QTreeWidgetItem* pItem, int Column)
+void COptionsWindow::SetProgramItem(QString Program, QTreeWidgetItem* pItem, int Column, const QString& Suffix, bool bList)
 {
 	pItem->setData(Column, Qt::UserRole, Program);
 	if (Program.left(1) == "<")
 		Program = tr("Group: %1").arg(Program.mid(1, Program.length() - 2));
-	else
+	else if (Program.isEmpty() || Program == "*")
+		Program = tr("All Programs");
+	else if(bList)
 		m_Programs.insert(Program);
-	pItem->setText(Column, Program);
-}
-
-void COptionsWindow::LoadGroups()
-{
-	m_TemplateGroups.clear();
-	ui.treeGroups->clear();
-
-	QMultiMap<QString, QStringList> GroupMap; // if we have a duplicate we want to know it
-	QSet<QString> LocalGroups;
-
-	QStringList ProcessGroups = m_pBox->GetTextList("ProcessGroup", m_Template);
-	foreach(const QString& Group, ProcessGroups)
-	{
-		QStringList Entries = Group.split(",");
-		QString GroupName = Entries.takeFirst();
-		GroupMap.insertMulti(GroupName, Entries);
-		LocalGroups.insert(GroupName);
-	}
-
-	foreach(const QString& Template, m_pBox->GetTemplates())
-	{
-		foreach(const QString& Group, m_pBox->GetTextListTmpl("ProcessGroup", Template))
-		{
-			m_TemplateGroups.insert(Group);
-			QStringList Entries = Group.split(",");
-			QString GroupName = Entries.takeFirst();
-			if (LocalGroups.contains(GroupName))
-				continue; // local group definitions overwrite template once
-			GroupMap.insertMulti(GroupName, Entries);
-		}
-	}
-
-	for(QMultiMap<QString, QStringList>::iterator I = GroupMap.begin(); I != GroupMap.end(); ++I)
-	{
-		QString GroupName = I.key();
-		QStringList Entries = I.value();
-		QTreeWidgetItem* pItem = new QTreeWidgetItem();
-		pItem->setData(0, Qt::UserRole, GroupName);
-		if (GroupName.length() > 2)
-			GroupName = GroupName.mid(1, GroupName.length() - 2);
-		pItem->setText(0, GroupName);
-		for (int i = 0; i < Entries.count(); i++) 
-		{
-			QTreeWidgetItem* pSubItem = new QTreeWidgetItem();
-			SetProgramItem(Entries[i], pSubItem, 0);
-			pItem->addChild(pSubItem);
-		}
-		ui.treeGroups->addTopLevelItem(pItem);
-	}
-	ui.treeGroups->expandAll();
-
-	m_GroupsChanged = false;
-}
-
-void COptionsWindow::SaveGroups()
-{
-	QStringList ProcessGroups;
-	for (int i = 0; i < ui.treeGroups->topLevelItemCount(); i++)
-	{
-		QTreeWidgetItem* pItem = ui.treeGroups->topLevelItem(i);
-		QString GroupName = pItem->data(0, Qt::UserRole).toString();
-		QStringList Programs;
-		for (int j = 0; j < pItem->childCount(); j++)
-			Programs.append(pItem->child(j)->data(0, Qt::UserRole).toString());
-		QString Group = GroupName + "," + Programs.join(",");
-		if (m_TemplateGroups.contains(Group))
-			continue; // don't save unchanged groups to local config
-		ProcessGroups.append(Group);
-	}
-
-	m_pBox->UpdateTextList("ProcessGroup", ProcessGroups, m_Template);
-
-	m_GroupsChanged = false;
-}
-
-void COptionsWindow::OnAddGroup()
-{
-	QString Value = QInputDialog::getText(this, "Sandboxie-Plus", tr("Please enter a name for the new group"), QLineEdit::Normal, "NewGroup");
-	if (Value.isEmpty())
-		return;
-	
-	for (int i = 0; i < ui.treeGroups->topLevelItemCount(); i++) {
-		QTreeWidgetItem* pItem = ui.treeGroups->topLevelItem(i);
-		if (pItem->text(0).compare(Value, Qt::CaseInsensitive) == 0)
-			return;
-	}
-
-	QTreeWidgetItem* pItem = new QTreeWidgetItem();
-	pItem->setText(0, Value);
-	pItem->setData(0, Qt::UserRole, "<" + Value + ">");
-	ui.treeGroups->addTopLevelItem(pItem);
-
-	m_GroupsChanged = true;
+	pItem->setText(Column, Program + Suffix);
 }
 
 QString COptionsWindow::SelectProgram(bool bOrGroup)
@@ -993,9 +1169,9 @@ QString COptionsWindow::SelectProgram(bool bOrGroup)
 
 	if (bOrGroup)
 	{
-		for (int i = 0; i < ui.treeGroups->topLevelItemCount(); i++) {
-			QTreeWidgetItem* pItem = ui.treeGroups->topLevelItem(i);
-			progDialog.addItem(tr("Group: %1").arg(pItem->text(0)), pItem->data(0, Qt::UserRole).toString());
+		foreach(const QString Group, GetCurrentGroups()){
+			QString GroupName = Group.mid(1, Group.length() - 2);
+			progDialog.addItem(tr("Group: %1").arg(GroupName), Group);
 		}
 	}
 
@@ -1016,1222 +1192,90 @@ QString COptionsWindow::SelectProgram(bool bOrGroup)
 	return Program;
 }
 
-void COptionsWindow::OnAddProg()
+void COptionsWindow::OnTab(QWidget* pTab)
 {
-	QTreeWidgetItem* pItem = ui.treeGroups->currentItem();
-	while (pItem && pItem->parent())
-		pItem = pItem->parent();
+	m_pCurrentTab = pTab;
 
-	if (!pItem)
-	{
-		QMessageBox::warning(this, "SandboxiePlus", tr("Please select group first."));
-		return;
-	}
-
-	QString Value = SelectProgram();
-	if (Value.isEmpty())
-		return;
-
-	QTreeWidgetItem* pSubItem = new QTreeWidgetItem();
-	SetProgramItem(Value, pSubItem, 0);
-	pItem->addChild(pSubItem);
-
-	m_GroupsChanged = true;
-}
-
-void COptionsWindow::OnDelProg()
-{
-	QTreeWidgetItem* pItem = ui.treeGroups->currentItem();
-	if (!pItem)
-		return;
-
-	delete pItem;
-
-	m_GroupsChanged = true;
-}
-
-void COptionsWindow::CopyGroupToList(const QString& Groupe, QTreeWidget* pTree)
-{
-	pTree->clear();
-
-	for (int i = 0; i < ui.treeGroups->topLevelItemCount(); i++) 
-	{
-		QTreeWidgetItem* pItem = ui.treeGroups->topLevelItem(i);
-		if (pItem->data(0, Qt::UserRole).toString().compare(Groupe, Qt::CaseInsensitive) == 0)
-		{
-			for (int j = 0; j < pItem->childCount(); j++)
-			{
-				QString Value = pItem->child(j)->data(0, Qt::UserRole).toString();
-
-				QTreeWidgetItem* pSubItem = new QTreeWidgetItem();
-				SetProgramItem(Value, pSubItem, 0);
-				pTree->addTopLevelItem(pSubItem);
-			}
-			break;
-		}
-	}
-}
-
-void COptionsWindow::LoadForced()
-{
-	ui.treeForced->clear();
-
-	foreach(const QString& Value, m_pBox->GetTextList("ForceProcess", m_Template))
-		AddForcedEntry(Value, 1);
-
-	foreach(const QString& Value, m_pBox->GetTextList("ForceFolder", m_Template))
-		AddForcedEntry(Value, 2);
-
-	if (ui.chkShowForceTmpl->isChecked())
-	{
-		foreach(const QString& Template, m_pBox->GetTemplates())
-		{
-			foreach(const QString& Value, m_pBox->GetTextListTmpl("ForceProcess", Template))
-				AddForcedEntry(Value, 1, Template);
-
-			foreach(const QString& Value, m_pBox->GetTextListTmpl("ForceFolder", Template))
-				AddForcedEntry(Value, 2, Template);
-		}
-	}
-
-	m_ForcedChanged = false;
-}
-
-void COptionsWindow::AddForcedEntry(const QString& Name, int type, const QString& Template)
-{
-	QTreeWidgetItem* pItem = new QTreeWidgetItem();
-	pItem->setText(0, (type == 1 ? tr("Process") : tr("Folder")) + (Template.isEmpty() ? "" : (" (" + Template + ")")));
-	pItem->setData(0, Qt::UserRole, Template.isEmpty() ? type : -1);
-	SetProgramItem(Name, pItem, 1);
-	ui.treeForced->addTopLevelItem(pItem);
-}
-
-void COptionsWindow::SaveForced()
-{
-	QStringList ForceProcess;
-	QStringList ForceFolder;
-	for (int i = 0; i < ui.treeForced->topLevelItemCount(); i++)
-	{
-		QTreeWidgetItem* pItem = ui.treeForced->topLevelItem(i);
-		int Type = pItem->data(0, Qt::UserRole).toInt();
-		if (Type == -1)
-			continue; // entry from template
-		switch (Type)
-		{
-		case 1:	ForceProcess.append(pItem->data(1, Qt::UserRole).toString()); break;
-		case 2: ForceFolder.append(pItem->data(1, Qt::UserRole).toString()); break;
-		}
-	}
-
-	m_pBox->UpdateTextList("ForceProcess", ForceProcess, m_Template);
-	m_pBox->UpdateTextList("ForceFolder", ForceFolder, m_Template);
-
-	m_ForcedChanged = false;
-}
-
-void COptionsWindow::OnForceProg()
-{
-	QString Value = SelectProgram();
-	if (Value.isEmpty())
-		return;
-	AddForcedEntry(Value, 1);
-	m_ForcedChanged = true;
-}
-
-void COptionsWindow::OnForceDir()
-{
-	QString Value = QFileDialog::getExistingDirectory(this, tr("Select Directory")).replace("/", "\\");
-	if (Value.isEmpty())
-		return;
-	AddForcedEntry(Value, 2);
-	m_ForcedChanged = true;
-}
-
-void COptionsWindow::OnDelForce()
-{
-	DeleteAccessEntry(ui.treeForced->currentItem());
-	m_ForcedChanged = true;
-}
-
-void COptionsWindow::LoadStop()
-{
-	ui.treeStop->clear();
-
-	foreach(const QString& Value, m_pBox->GetTextList("LingerProcess", m_Template))
-		AddStopEntry(Value, 1);
-
-	foreach(const QString& Value, m_pBox->GetTextList("LeaderProcess", m_Template))
-		AddStopEntry(Value, 2);
-
-	if (ui.chkShowStopTmpl->isChecked())
-	{
-		foreach(const QString& Template, m_pBox->GetTemplates())
-		{
-			foreach(const QString& Value, m_pBox->GetTextListTmpl("LingerProcess", Template))
-				AddStopEntry(Value, 1, Template);
-
-			foreach(const QString& Value, m_pBox->GetTextListTmpl("LeaderProcess", Template))
-				AddStopEntry(Value, 2, Template);
-		}
-	}
-
-	m_StopChanged = false;
-}
-
-void COptionsWindow::AddStopEntry(const QString& Name, int type, const QString& Template)
-{
-	QTreeWidgetItem* pItem = new QTreeWidgetItem();
-	pItem->setText(0, (type == 1 ? tr("Lingerer") : tr("Leader")) + (Template.isEmpty() ? "" : (" (" + Template + ")")));
-	pItem->setData(0, Qt::UserRole, Template.isEmpty() ? type : -1);
-	SetProgramItem(Name, pItem, 1);
-	ui.treeStop->addTopLevelItem(pItem);
-}
-
-void COptionsWindow::SaveStop()
-{
-	QStringList LingerProcess;
-	QStringList LeaderProcess;
-	for (int i = 0; i < ui.treeStop->topLevelItemCount(); i++)
-	{
-		QTreeWidgetItem* pItem = ui.treeStop->topLevelItem(i);
-		int Type = pItem->data(0, Qt::UserRole).toInt();
-		if (Type == -1)
-			continue; // entry from template
-		switch (Type)
-		{
-		case 1:	LingerProcess.append(pItem->data(1, Qt::UserRole).toString()); break;
-		case 2: LeaderProcess.append(pItem->data(1, Qt::UserRole).toString()); break;
-		}
-	}
-
-	m_pBox->UpdateTextList("LingerProcess", LingerProcess, m_Template);
-	m_pBox->UpdateTextList("LeaderProcess", LeaderProcess, m_Template);
-
-	m_StopChanged = false;
-}
-
-void COptionsWindow::OnAddLingering()
-{
-	QString Value = SelectProgram();
-	if (Value.isEmpty())
-		return;
-	AddStopEntry(Value, 1);
-	m_StopChanged = true;
-}
-
-void COptionsWindow::OnAddLeader()
-{
-	QString Value = SelectProgram();
-	if (Value.isEmpty())
-		return;
-	AddStopEntry(Value, 2);
-	m_StopChanged = true;
-}
-
-void COptionsWindow::OnDelStopProg()
-{
-	DeleteAccessEntry(ui.treeStop->currentItem());
-	m_StopChanged = true;
-}
-
-void COptionsWindow::OnRestrictStart()
-{
-	// only selected
-	bool Enable = ui.radStartSelected->isChecked();
-	if (Enable)
-		SetAccessEntry(eIPC, "!<StartRunAccess>", eClosed, "*");
-	else
-		DelAccessEntry(eIPC, "!<StartRunAccess>", eClosed, "*");
-
-	// all except selected
-	Enable = ui.radStartExcept->isChecked();
-	if (Enable)
-		SetAccessEntry(eIPC, "<StartRunAccess>", eClosed, "*");
-	else
-		DelAccessEntry(eIPC, "<StartRunAccess>", eClosed, "*");
-
-	ui.chkStartBlockMsg->setEnabled(!ui.radStartAll->isChecked());
-	//m_StartChanged = true;
-}
-
-void COptionsWindow::OnAddStartProg()
-{
-	AddProgToGroup(ui.treeStart, "<StartRunAccess>");
-	//m_StartChanged = true;
-}
-
-void COptionsWindow::OnDelStartProg()
-{
-	DelProgFromGroup(ui.treeStart, "<StartRunAccess>");
-	//m_StartChanged = true;
-}
-
-void COptionsWindow::OnBlockINet()
-{
-	bool Enable = ui.chkBlockINet->isChecked();
-	ui.chkINetBlockPrompt->setEnabled(Enable);
-	ui.chkINetBlockMsg->setEnabled(Enable);
-	if (Enable)
-		SetAccessEntry(eFile, "!<InternetAccess>", eClosed, "InternetAccessDevices");
-	else
-		DelAccessEntry(eFile, "!<InternetAccess>", eClosed, "InternetAccessDevices");
-	//m_INetBlockChanged = true;
-}
-
-void COptionsWindow::OnAddINetProg()
-{
-	AddProgToGroup(ui.treeINet, "<InternetAccess>");
-	//m_INetBlockChanged = true;
-}
-
-void COptionsWindow::OnDelINetProg()
-{
-	DelProgFromGroup(ui.treeINet, "<InternetAccess>");
-	//m_INetBlockChanged = true;
-}
-
-void COptionsWindow::AddProgToGroup(QTreeWidget* pTree, const QString& Groupe)
-{
-	QString Value = SelectProgram();
-	if (Value.isEmpty())
-		return;
-
-	QTreeWidgetItem* pItem = new QTreeWidgetItem();
-	SetProgramItem(Value, pItem, 0);
-	pTree->addTopLevelItem(pItem);
-
-	AddProgToGroup(Value, Groupe);
-}
-
-void COptionsWindow::AddProgToGroup(const QString& Value, const QString& Groupe)
-{
-	QTreeWidgetItem* pGroupItem = NULL;
-	for (int i = 0; i < ui.treeGroups->topLevelItemCount(); i++)
-	{
-		QTreeWidgetItem* pCurItem = ui.treeGroups->topLevelItem(i);
-		if (pCurItem->data(0, Qt::UserRole).toString().compare(Groupe, Qt::CaseInsensitive) == 0)
-		{
-			pGroupItem = pCurItem;
-			break;
-		}
-	}
-
-	if (!pGroupItem)
-	{
-		pGroupItem = new QTreeWidgetItem();
-		pGroupItem->setText(0, Groupe.mid(1, Groupe.length()-2));
-		pGroupItem->setData(0, Qt::UserRole, Groupe);
-		ui.treeGroups->addTopLevelItem(pGroupItem);
-	}
-
-	QTreeWidgetItem* pProgItem = new QTreeWidgetItem();
-	SetProgramItem(Value, pProgItem, 0);
-	pGroupItem->addChild(pProgItem);
-
-	m_GroupsChanged = true;
-}
-
-void COptionsWindow::DelProgFromGroup(QTreeWidget* pTree, const QString& Groupe)
-{
-	QTreeWidgetItem* pItem = pTree->currentItem();
-	if (!pItem)
-		return;
-
-	QString Value = pItem->data(0, Qt::UserRole).toString();
-
-	delete pItem;
-
-	for (int i = 0; i < ui.treeGroups->topLevelItemCount(); i++)
-	{
-		QTreeWidgetItem* pGroupItem = ui.treeGroups->topLevelItem(i);
-		if (pGroupItem->data(0, Qt::UserRole).toString().compare(Groupe, Qt::CaseInsensitive) == 0)
-		{
-			for (int j = 0; j < pGroupItem->childCount(); j++)
-			{
-				QTreeWidgetItem* pProgItem = pGroupItem->child(j);
-				if (pProgItem->data(0, Qt::UserRole).toString().compare(Value, Qt::CaseInsensitive) == 0)
-				{
-					delete pProgItem;
-					m_GroupsChanged = true;
-					break;
-				}
-			}
-			break;
-		}
-	}
-}
-
-QTreeWidgetItem* COptionsWindow::GetAccessEntry(EAccessType Type, const QString& Program, EAccessMode Mode, const QString& Path)
-{
-	for (int i = 0; i < ui.treeAccess->topLevelItemCount(); i++)
-	{
-		QTreeWidgetItem* pItem = ui.treeAccess->topLevelItem(i);
-		if (pItem->data(0, Qt::UserRole).toInt() == Type
-		 && pItem->data(1, Qt::UserRole).toString().compare(Program, Qt::CaseInsensitive) == 0
-		 && pItem->data(2, Qt::UserRole).toInt() == Mode
-		 && pItem->data(3, Qt::UserRole).toString().compare(Path, Qt::CaseInsensitive) == 0)
-			return pItem;
-	}
-	return NULL;
-}
-
-void COptionsWindow::SetAccessEntry(EAccessType Type, const QString& Program, EAccessMode Mode, const QString& Path)
-{
-	if (GetAccessEntry(Type, Program, Mode, Path) != NULL)
-		return; // already set
-	m_AccessChanged = true;
-	AddAccessEntry(Type, Mode, Program, Path);
-}
-
-void COptionsWindow::DelAccessEntry(EAccessType Type, const QString& Program, EAccessMode Mode, const QString& Path)
-{
-	if(QTreeWidgetItem* pItem = GetAccessEntry(Type, Program, Mode, Path))
-	{
-		delete pItem;
-		m_AccessChanged = true;
-	}
-}
-
-QString COptionsWindow::AccessTypeToName(EAccessEntry Type)
-{
-	switch (Type)
-	{
-	case eOpenFilePath:		return "OpenFilePath";
-	case eOpenPipePath:		return "OpenPipePath";
-	case eClosedFilePath:	return "ClosedFilePath";
-	case eReadFilePath:		return "ReadFilePath";
-	case eWriteFilePath:	return "WriteFilePath";
-
-	case eOpenKeyPath:		return "OpenKeyPath";
-	case eClosedKeyPath:	return "ClosedKeyPath";
-	case eReadKeyPath:		return "ReadKeyPath";
-	case eWriteKeyPath:		return "WriteKeyPath";
-
-	case eOpenIpcPath:		return "OpenIpcPath";
-	case eClosedIpcPath:	return "ClosedIpcPath";
-
-	case eOpenWinClass:		return "OpenWinClass";
-
-	case eOpenCOM:			return "OpenClsid";
-	case eClosedCOM:		return "ClosedClsid";
-	case eClosedCOM_RT:		return "ClosedRT";
-	}
-	return "Unknown";
-}
-
-void COptionsWindow::LoadAccessList()
-{
-	ui.treeAccess->clear();
-
-	for (int i = 0; i < eMaxAccessType; i++)
-	{
-		foreach(const QString& Value, m_pBox->GetTextList(AccessTypeToName((EAccessEntry)i), m_Template))
-			ParseAndAddAccessEntry((EAccessEntry)i, Value);
-	}
-
-	if (ui.chkShowAccessTmpl->isChecked())
-	{
-		foreach(const QString& Template, m_pBox->GetTemplates())
-		{
-			for (int i = 0; i < eMaxAccessType; i++)
-			{
-				foreach(const QString& Value, m_pBox->GetTextListTmpl(AccessTypeToName((EAccessEntry)i), Template))
-					ParseAndAddAccessEntry((EAccessEntry)i, Value, Template);
-			}
-		}
-	}
-
-	m_AccessChanged = false;
-}
-
-void COptionsWindow::ParseAndAddAccessEntry(EAccessEntry EntryType, const QString& Value, const QString& Template)
-{
-	EAccessType	Type;
-	EAccessMode	Mode;
-	switch (EntryType)
-	{
-	case eOpenFilePath:		Type = eFile;	Mode = eDirect;	break;
-	case eOpenPipePath:		Type = eFile;	Mode = eDirectAll; break;
-	case eClosedFilePath:	Type = eFile;	Mode = eClosed;	break;
-	case eReadFilePath:		Type = eFile;	Mode = eReadOnly; break;
-	case eWriteFilePath:	Type = eFile;	Mode = eWriteOnly; break;
-
-	case eOpenKeyPath:		Type = eKey;	Mode = eDirect;	break;
-	case eClosedKeyPath:	Type = eKey;	Mode = eClosed;	break;
-	case eReadKeyPath:		Type = eKey;	Mode = eReadOnly; break;
-	case eWriteKeyPath:		Type = eKey;	Mode = eWriteOnly; break;
-
-	case eOpenIpcPath:		Type = eIPC;	Mode = eDirect;	break;
-	case eClosedIpcPath:	Type = eIPC;	Mode = eClosed;	break;
-
-	case eOpenWinClass:		Type = eWnd;	Mode = eDirect;	break;
-
-	case eOpenCOM:			Type = eCOM;	Mode = eDirect;	break;
-	case eClosedCOM:		Type = eCOM;	Mode = eClosed;	break;
-	case eClosedCOM_RT:		Type = eCOM;	Mode = eClosedRT; break;
-
-	default:				return;
-	}
-
-	//
-	// Mind this special cases
-	// OpenIpcPath=$:program.exe <- full access into the address space of a target process running outside the sandbox. 
-	// OpenWinClass=$:program.exe <- permits to use the PostThreadMessage API to send a message directly to a thread running outside the sandbox. 
-	// This form of the setting does not support wildcards.
-	//
-
-	QStringList Values = Value.split(",");
-	if (Values.count() >= 2) 
-		AddAccessEntry(Type, Mode, Values[0], Values[1], Template);
-	else if (Values[0].left(2) == "$:") // special cases
-		AddAccessEntry(Type, Mode, Values[0].mid(2), "$", Template);
-	else // all programs
-		AddAccessEntry(Type, Mode, "", Values[0], Template);
-}
-
-QString COptionsWindow::GetAccessModeStr(EAccessMode Mode)
-{
-	switch (Mode)
-	{
-	case eDirect:		return tr("Direct");
-	case eDirectAll:	return tr("Direct All");
-	case eClosed:		return tr("Closed");
-	case eClosedRT:		return tr("Closed RT");
-	case eReadOnly:		return tr("Read Only");
-	case eWriteOnly:	return tr("Hidden");
-	}
-	return tr("Unknown");
-}
-
-QString COptionsWindow::GetAccessTypeStr(EAccessType Type)
-{
-	switch (Type)
-	{
-	case eFile:			return tr("File/Folder");
-	case eKey:			return tr("Registry");
-	case eIPC:			return tr("IPC Path");
-	case eWnd:			return tr("Wnd Class");
-	case eCOM:			return tr("COM Object");
-	}
-	return tr("Unknown");
-}
-
-void COptionsWindow::OnBrowseFile()
-{
-	QString Value = QFileDialog::getOpenFileName(this, tr("Select File"), "", tr("All Files (*.*)")).replace("/", "\\");
-	if (Value.isEmpty())
-		return;
-
-	AddAccessEntry(eFile, eDirect, "", Value);
-}
-
-void COptionsWindow::OnBrowseFolder()
-{
-	QString Value = QFileDialog::getExistingDirectory(this, tr("Select Directory")).replace("/", "\\");
-	if (Value.isEmpty())
-		return;
-
-	AddAccessEntry(eFile, eDirect, "", Value);
-}
-
-void COptionsWindow::AddAccessEntry(EAccessType	Type, EAccessMode Mode, QString Program, const QString& Path, const QString& Template)
-{
-	QTreeWidgetItem* pItem = new QTreeWidgetItem();
-
-	pItem->setText(0, GetAccessTypeStr(Type) + (Template.isEmpty() ? "" : " (" + Template + ")"));
-	pItem->setData(0, Qt::UserRole, !Template.isEmpty() ? -1 : (int)Type);
-
-	pItem->setData(1, Qt::UserRole, Program);
-	bool bAll = Program.isEmpty();
-	if (bAll)
-		Program = tr("All Programs");
-	bool Not = Program.left(1) == "!";
-	if (Not)
-		Program.remove(0, 1);
-	if (Program.left(1) == "<")
-		Program = tr("Group: %1").arg(Program.mid(1, Program.length() - 2));
-	else if(!bAll)
-		m_Programs.insert(Program);
-	pItem->setText(1, (Not ? "NOT " : "") + Program);
-	
-	pItem->setText(2, GetAccessModeStr(Mode));
-	pItem->setData(2, Qt::UserRole, (int)Mode);
-
-	pItem->setText(3, Path);
-	pItem->setData(3, Qt::UserRole, Path);
-
-	ui.treeAccess->addTopLevelItem(pItem);
-}
-
-QString COptionsWindow::MakeAccessStr(EAccessType Type, EAccessMode Mode)
-{
-	switch (Type)
-	{
-	case eFile:
-		switch (Mode)
-		{
-		case eDirect:		return "OpenFilePath";
-		case eDirectAll:	return "OpenPipePath";
-		case eClosed:		return "ClosedFilePath";
-		case eReadOnly:		return "ReadFilePath";
-		case eWriteOnly:	return "WriteFilePath";
-		}
-		break;
-	case eKey:
-		switch (Mode)
-		{
-		case eDirect:		return "OpenKeyPath";
-		case eClosed:		return "ClosedKeyPath";
-		case eReadOnly:		return "ReadKeyPath";
-		case eWriteOnly:	return "WriteKeyPath";
-		}
-		break;
-	case eIPC:
-		switch (Mode)
-		{
-		case eDirect:		return "OpenIpcPath";
-		case eClosed:		return "ClosedIpcPath";
-		}
-		break;
-	case eWnd:
-		switch (Mode)
-		{
-		case eDirect:		return "OpenWinClass";
-		}
-		break;
-	case eCOM:
-		switch (Mode)
-		{
-		case eDirect:		return "OpenClsid";
-		case eClosed:		return "ClosedClsid";
-		case eClosedRT:		return "ClosedRT";
-		}
-		break;
-	}
-	return "Unknown";
-}
-
-void COptionsWindow::OnAccessItemClicked(QTreeWidgetItem* pItem, int Column)
-{
-	if (Column != 0)
-		return;
-
-	CloseAccessEdit(pItem);
-}
-
-void COptionsWindow::CloseAccessEdit(bool bSave)
-{
-	for (int i = 0; i < ui.treeAccess->topLevelItemCount(); i++)
-	{
-		QTreeWidgetItem* pItem = ui.treeAccess->topLevelItem(i);
-		CloseAccessEdit(pItem, bSave);
-	}
-}
-
-void COptionsWindow::CloseAccessEdit(QTreeWidgetItem* pItem, bool bSave)
-{
-	QWidget* pProgram = ui.treeAccess->itemWidget(pItem, 1);
-	if (!pProgram)
-		return;
-
-	QHBoxLayout* pLayout = (QHBoxLayout*)pProgram->layout();
-	QToolButton* pNot = (QToolButton*)pLayout->itemAt(0)->widget();
-	QComboBox* pCombo = (QComboBox*)pLayout->itemAt(1)->widget();
-
-	QComboBox* pMode = (QComboBox*)ui.treeAccess->itemWidget(pItem, 2);
-	QLineEdit* pPath = (QLineEdit*)ui.treeAccess->itemWidget(pItem, 3);
-
-	QString Program = pCombo->currentText();
-	int Index = pCombo->findText(Program);
-	if (Index != -1)
-		Program = pCombo->itemData(Index, Qt::UserRole).toString();
-	if (!Program.isEmpty() && Program.left(1) != "<")
-		m_Programs.insert(Program);
-
-	if (bSave)
-	{
-		if (pItem->data(0, Qt::UserRole).toInt() == eCOM)
-		{
-			bool isGUID = pPath->text().length() == 38 && pPath->text().left(1) == "{" && pPath->text().right(1) == "}";
-			switch (pMode->currentData().toInt())
-			{
-			case eDirect:
-			case eClosed:
-				if (!isGUID) {
-					QMessageBox::critical(this, "SandboxiePlus", tr("COM objects must be specified by their GUID, like: {00000000-0000-0000-0000-000000000000}"));
-					return;
-				}
-				break;
-			case eClosedRT:
-				if (isGUID) {
-					QMessageBox::critical(this, "SandboxiePlus", tr("RT interfaces must be specified by their name."));
-					return;
-				}
-				break;
-			}
-		}
-
-		pItem->setText(1, (pNot->isChecked() ? "NOT " : "") + pCombo->currentText());
-		pItem->setData(1, Qt::UserRole, (pNot->isChecked() ? "!" : "") + Program);
-		pItem->setText(2, GetAccessModeStr((EAccessMode)pMode->currentData().toInt()));
-		pItem->setData(2, Qt::UserRole, pMode->currentData());
-		pItem->setText(3, pPath->text());
-		pItem->setData(3, Qt::UserRole, pPath->text());
-	}
-
-	ui.treeAccess->setItemWidget(pItem, 1, NULL);
-	ui.treeAccess->setItemWidget(pItem, 2, NULL);
-	ui.treeAccess->setItemWidget(pItem, 3, NULL);
-
-	m_AccessChanged = true;
-}
-
-QList<COptionsWindow::EAccessMode> COptionsWindow::GetAccessModes(EAccessType Type)
-{
-	switch (Type)
-	{
-	case eFile:			return QList<EAccessMode>() << eDirect << eDirectAll << eClosed << eReadOnly << eWriteOnly;
-	case eKey:			return QList<EAccessMode>() << eDirect << eClosed << eReadOnly << eWriteOnly;
-	case eIPC:			return QList<EAccessMode>() << eDirect << eClosed;
-	case eWnd:			return QList<EAccessMode>() << eDirect;
-	case eCOM:			return QList<EAccessMode>() << eDirect << eClosed << eClosedRT;
-	}
-	return QList<EAccessMode>();
-}
-
-void COptionsWindow::OnAccessItemDoubleClicked(QTreeWidgetItem* pItem, int Column)
-{
-	//if (Column == 0)
-	//	return;
-
-	int Type = pItem->data(0, Qt::UserRole).toInt();
-	if (Type == -1) {
-		QMessageBox::warning(this, "SandboxiePlus", tr("Template values can not be edited."));
-		return;
-	}
-
-	QString Program = pItem->data(1, Qt::UserRole).toString();
-
-	QWidget* pProgram = new QWidget();
-	pProgram->setAutoFillBackground(true);
-	QHBoxLayout* pLayout = new QHBoxLayout();
-	pLayout->setMargin(0);
-	pLayout->setSpacing(0);
-	pProgram->setLayout(pLayout);
-	QToolButton* pNot = new QToolButton(pProgram);
-	pNot->setText("!");
-	pNot->setCheckable(true);
-	if (Program.left(1) == "!"){
-		pNot->setChecked(true);
-		Program.remove(0, 1);
-	}
-	pLayout->addWidget(pNot);
-	QComboBox* pCombo = new QComboBox(pProgram);
-	pCombo->addItem(tr("All Programs"), "");
-
-	for (int i = 0; i < ui.treeGroups->topLevelItemCount(); i++) {
-		QTreeWidgetItem* pItem = ui.treeGroups->topLevelItem(i);
-		pCombo->addItem(tr("Group: %1").arg(pItem->text(0)), pItem->data(0, Qt::UserRole).toString());
-	}
-
-	foreach(const QString & Name, m_Programs)
-		pCombo->addItem(Name, Name);
-
-	pCombo->setEditable(true);
-	int Index = pCombo->findData(Program);
-	pCombo->setCurrentIndex(Index);
-	if(Index == -1)
-		pCombo->setCurrentText(Program);
-	pLayout->addWidget(pCombo);
-
-	ui.treeAccess->setItemWidget(pItem, 1, pProgram);
-
-	QComboBox* pMode = new QComboBox();
-	foreach(EAccessMode Mode, GetAccessModes((EAccessType)Type))
-		pMode->addItem(GetAccessModeStr(Mode), (int)Mode);
-	pMode->setCurrentIndex(pMode->findData(pItem->data(2, Qt::UserRole)));
-	ui.treeAccess->setItemWidget(pItem, 2, pMode);
-
-	QLineEdit* pPath = new QLineEdit();
-	pPath->setText(pItem->data(3, Qt::UserRole).toString());
-	ui.treeAccess->setItemWidget(pItem, 3, pPath);
-}
-
-void COptionsWindow::DeleteAccessEntry(QTreeWidgetItem* pItem)
-{
-	if (!pItem)
-		return;
-
-	if (pItem->data(0, Qt::UserRole).toInt() == -1) {
-		QMessageBox::warning(this, "SandboxiePlus", tr("Template values can not be removed."));
-		return;
-	}
-
-	delete pItem;
-}
-
-void COptionsWindow::OnDelAccess()
-{
-	DeleteAccessEntry(ui.treeAccess->currentItem());
-	m_AccessChanged = true;
-}
-
-
-void COptionsWindow::SaveAccessList()
-{
-	CloseAccessEdit(true);
-
-	QStringList Keys = QStringList() << "OpenFilePath" << "OpenPipePath" << "ClosedFilePath" << "ReadFilePath" << "WriteFilePath"
-		<< "OpenKeyPath" << "ClosedKeyPath" << "ReadKeyPath" << "WriteKeyPath"
-		<< "OpenIpcPath" << "ClosedIpcPath" << "OpenWinClass" << "OpenClsid" << "ClosedClsid" << "ClosedRT";
-
-	QMap<QString, QList<QString>> AccessMap;
-	for (int i = 0; i < ui.treeAccess->topLevelItemCount(); i++)
-	{
-		QTreeWidgetItem* pItem = ui.treeAccess->topLevelItem(i);
-		int Type = pItem->data(0, Qt::UserRole).toInt();
-		if (Type == -1)
-			continue; // entry from template
-		int Mode = pItem->data(2, Qt::UserRole).toInt();
-		QString Program = pItem->data(1, Qt::UserRole).toString();
-		QString Value = pItem->data(3, Qt::UserRole).toString();
-		if (Value == "$") // special cases
-			Value = "$:" + Program;
-		else if (!Program.isEmpty())
-			Value.prepend(Program + ",");
-		AccessMap[MakeAccessStr((EAccessType)Type, (EAccessMode)Mode)].append(Value);
-	}
-
-	foreach(const QString& Key, Keys)
-		m_pBox->UpdateTextList(Key, AccessMap[Key], m_Template);
-
-	m_AccessChanged = false;
-}
-
-void COptionsWindow::LoadRecoveryList()
-{
-	ui.treeRecovery->clear();
-
-	foreach(const QString& Value, m_pBox->GetTextList("RecoverFolder", m_Template))
-		AddRecoveryEntry(Value, 1);
-
-	foreach(const QString& Value, m_pBox->GetTextList("AutoRecoverIgnore", m_Template))
-		AddRecoveryEntry(Value, 2);
-
-	if (ui.chkShowRecoveryTmpl->isChecked())
-	{
-		foreach(const QString& Template, m_pBox->GetTemplates())
-		{
-			foreach(const QString& Value, m_pBox->GetTextListTmpl("RecoverFolder", Template))
-				AddRecoveryEntry(Value, 1, Template);
-
-			foreach(const QString& Value, m_pBox->GetTextListTmpl("AutoRecoverIgnore", Template))
-				AddRecoveryEntry(Value, 2, Template);
-		}
-	}
-
-	ui.chkAutoRecovery->setChecked(m_pBox->GetBool("AutoRecover", false));
-
-	m_RecoveryChanged = false;
-}
-
-void COptionsWindow::AddRecoveryEntry(const QString& Name, int type, const QString& Template)
-{
-	QTreeWidgetItem* pItem = new QTreeWidgetItem();
-	pItem->setText(0, (type == 1 ? tr("Folder") : tr("Exclusion")) + (Template.isEmpty() ? "" : (" (" + Template + ")")));
-	pItem->setData(0, Qt::UserRole, Template.isEmpty() ? type : -1);
-	pItem->setText(1, Name);
-	pItem->setData(1, Qt::UserRole, Name);
-	ui.treeRecovery->addTopLevelItem(pItem);
-}
-
-void COptionsWindow::SaveRecoveryList()
-{
-	QStringList RecoverFolder;
-	QStringList AutoRecoverIgnore;
-	for (int i = 0; i < ui.treeRecovery->topLevelItemCount(); i++)
-	{
-		QTreeWidgetItem* pItem = ui.treeRecovery->topLevelItem(i);
-		int Type = pItem->data(0, Qt::UserRole).toInt();
-		if (Type == -1)
-			continue; // entry from template
-		switch (Type)
-		{
-		case 1:	RecoverFolder.append(pItem->data(1, Qt::UserRole).toString()); break;
-		case 2: AutoRecoverIgnore.append(pItem->data(1, Qt::UserRole).toString()); break;
-		}
-	}
-
-	m_pBox->UpdateTextList("RecoverFolder", RecoverFolder, m_Template);
-	m_pBox->UpdateTextList("AutoRecoverIgnore", AutoRecoverIgnore, m_Template);
-
-	m_pBox->SetBool("AutoRecover", ui.chkAutoRecovery->isChecked());
-
-	m_RecoveryChanged = false;
-}
-
-void COptionsWindow::OnAddRecFolder()
-{
-	QString Value = QFileDialog::getExistingDirectory(this, tr("Select Directory")).replace("/", "\\");
-	if (Value.isEmpty())
-		return;
-
-	AddRecoveryEntry(Value, 1);
-	m_RecoveryChanged = true;
-}
-
-void COptionsWindow::OnAddRecIgnore()
-{
-	QString Value = QFileDialog::getExistingDirectory(this, tr("Select Directory")).replace("/", "\\");
-	if (Value.isEmpty())
-		return;
-
-	AddRecoveryEntry(Value, 2);
-	m_RecoveryChanged = true;
-}
-
-void COptionsWindow::OnAddRecIgnoreExt()
-{
-	QString Value = QInputDialog::getText(this, "Sandboxie-Plus", tr("Please enter a file extension to be excluded"), QLineEdit::Normal);
-	if (Value.isEmpty())
-		return;
-
-	AddRecoveryEntry(Value, 2);
-	m_RecoveryChanged = true;
-}
-
-void COptionsWindow::OnDelRecEntry()
-{
-	QTreeWidgetItem* pItem = ui.treeRecovery->currentItem();
-	if (!pItem)
-		return;
-
-	if (pItem->data(0, Qt::UserRole).toInt() == -1) {
-		QMessageBox::warning(this, "SandboxiePlus", tr("Template values can not be removed."));
-		return;
-	}
-
-	delete pItem;
-	m_RecoveryChanged = true;
-}
-
-void COptionsWindow::OnAdvancedChanged()
-{
-	ui.chkOpenCredentials->setEnabled(!ui.chkOpenProtectedStorage->isChecked());
-	if (!ui.chkOpenCredentials->isEnabled()) ui.chkOpenCredentials->setChecked(true);
-
-	m_AdvancedChanged = true;
-}
-
-void COptionsWindow::OnNoWindowRename()
-{
-	if (ui.chkNoWindowRename->isChecked())
-		SetAccessEntry(eWnd, "", eDirect, "#");
-	else
-		DelAccessEntry(eWnd, "", eDirect, "#");
-	m_AdvancedChanged = true;
-}
-
-void COptionsWindow::OnDebugChanged()
-{
-	QCheckBox* pCheck = qobject_cast<QCheckBox*>(sender());
-	m_DebugOptions[pCheck].Changed = true;
-}
-
-void COptionsWindow::OnAddAutoExec()
-{
-	QString Process = QInputDialog::getText(this, "Sandboxie-Plus", tr("Please enter an auto exec command"));
-	if (Process.isEmpty())
-		return;
-
-	ui.lstAutoExec->addItem(Process);
-
-	m_AdvancedChanged = true;
-}
-
-void COptionsWindow::OnDelAutoExec()
-{
-	foreach(QListWidgetItem * pItem, ui.lstAutoExec->selectedItems())
-		delete pItem;
-
-	m_AdvancedChanged = true;
-}
-
-void COptionsWindow::OnAddProcess()
-{
-	QString Process = QInputDialog::getText(this, "Sandboxie-Plus", tr("Please enter a program file name"));
-	if (Process.isEmpty())
-		return;
-
-	ui.lstProcesses->addItem(Process);
-
-	m_AdvancedChanged = true;
-}
-
-void COptionsWindow::OnDelProcess()
-{
-	foreach(QListWidgetItem* pItem, ui.lstProcesses->selectedItems())
-		delete pItem;
-
-	m_AdvancedChanged = true;
-}
-
-#include <wtypes.h>
-#include <objsel.h>
-
-void COptionsWindow::OnAddUser()
-{
-	QStringList Users;
-
-	IDsObjectPicker *pObjectPicker = NULL;
-	HRESULT hr = CoCreateInstance(CLSID_DsObjectPicker, NULL, CLSCTX_INPROC_SERVER, IID_IDsObjectPicker, (void **)&pObjectPicker);
-	if (FAILED(hr))
-		return;
-
-	DSOP_SCOPE_INIT_INFO ScopeInit;
-	memset(&ScopeInit, 0, sizeof(DSOP_SCOPE_INIT_INFO));
-	ScopeInit.cbSize = sizeof(DSOP_SCOPE_INIT_INFO);
-	ScopeInit.flType = DSOP_SCOPE_TYPE_TARGET_COMPUTER | DSOP_SCOPE_TYPE_UPLEVEL_JOINED_DOMAIN | DSOP_SCOPE_TYPE_DOWNLEVEL_JOINED_DOMAIN;
-	ScopeInit.flScope = DSOP_SCOPE_FLAG_STARTING_SCOPE | DSOP_SCOPE_FLAG_DEFAULT_FILTER_USERS | DSOP_SCOPE_FLAG_DEFAULT_FILTER_GROUPS;
-	ScopeInit.FilterFlags.Uplevel.flBothModes = DSOP_FILTER_USERS | DSOP_FILTER_WELL_KNOWN_PRINCIPALS | DSOP_FILTER_BUILTIN_GROUPS
-		| DSOP_FILTER_UNIVERSAL_GROUPS_SE | DSOP_FILTER_GLOBAL_GROUPS_SE | DSOP_FILTER_DOMAIN_LOCAL_GROUPS_SE;
-	ScopeInit.FilterFlags.flDownlevel = DSOP_DOWNLEVEL_FILTER_USERS | DSOP_DOWNLEVEL_FILTER_LOCAL_GROUPS | DSOP_DOWNLEVEL_FILTER_GLOBAL_GROUPS;
-
-	DSOP_INIT_INFO InitInfo;
-	memset(&InitInfo, 0, sizeof(InitInfo));
-	InitInfo.cbSize = sizeof(InitInfo);
-	InitInfo.pwzTargetComputer = NULL;
-	InitInfo.cDsScopeInfos = 1;
-	InitInfo.aDsScopeInfos = &ScopeInit;
-	InitInfo.flOptions = DSOP_FLAG_MULTISELECT;
-
-	hr = pObjectPicker->Initialize(&InitInfo);
-
-	if (SUCCEEDED(hr))
-	{
-		IDataObject *pDataObject = NULL;
-		hr = pObjectPicker->InvokeDialog((HWND)this->winId(), &pDataObject);
-		if (SUCCEEDED(hr) && pDataObject)
-		{
-			FORMATETC formatEtc;
-			formatEtc.cfFormat = (CLIPFORMAT)RegisterClipboardFormat(CFSTR_DSOP_DS_SELECTION_LIST);
-			formatEtc.ptd = NULL;
-			formatEtc.dwAspect = DVASPECT_CONTENT;
-			formatEtc.lindex = -1;
-			formatEtc.tymed = TYMED_HGLOBAL;
-
-			STGMEDIUM stgMedium;
-			hr = pDataObject->GetData(&formatEtc, &stgMedium);
-			if (SUCCEEDED(hr))
-			{
-				PDS_SELECTION_LIST pResults = (PDS_SELECTION_LIST)GlobalLock(stgMedium.hGlobal);
-				if (pResults)
-				{
-					for (ULONG i = 0; i < pResults->cItems; i++)
-						Users.append(QString::fromWCharArray(pResults->aDsSelection[i].pwzName));
-					GlobalUnlock(stgMedium.hGlobal);
-				}
-			}
-			pDataObject->Release();
-		}
-	}
-	pObjectPicker->Release();
-
-
-	if (Users.isEmpty())
-		return;
-
-	ui.lstUsers->addItems(Users);
-}
-
-void COptionsWindow::OnDelUser()
-{
-	foreach(QListWidgetItem* pItem, ui.lstUsers->selectedItems())
-		delete pItem;
-}
-
-void COptionsWindow::LoadTemplates()
-{
-	m_AllTemplates.clear();
-	ui.cmbCategories->clear();
-
-	QStringList Templates;
-	for (int index = 0; ; index++)
-	{
-		QString Value = m_pBox->GetAPI()->SbieIniGet("", "", index);
-		if (Value.isNull())
-			break;
-		Templates.append(Value);
-	}
-
-	for (QStringList::iterator I = Templates.begin(); I != Templates.end();)
-	{
-		if (I->left(9).compare("Template_", Qt::CaseInsensitive) != 0 || *I == "Template_KnownConflicts") {
-			I = Templates.erase(I);
-			continue;
-		}
-	
-		QString Name = *I++;
-		QString Category = m_pBox->GetAPI()->SbieIniGet(Name, "Tmpl.Class", 0x40000000L); // CONF_GET_NO_GLOBAL);
-		QString Title = m_pBox->GetAPI()->SbieIniGet(Name, "Tmpl.Title", 0x40000000L); // CONF_GET_NO_GLOBAL);
-
-		if (Title.left(1) == "#")
-		{
-			int End = Title.mid(1).indexOf(",");
-			if (End == -1) End = Title.length() - 1;
-			int MsgNum = Title.mid(1, End).toInt();
-			Title = theAPI->GetSbieMsgStr(MsgNum, theGUI->m_LanguageId).arg(Title.mid(End + 2)).arg("");
-		}
-		if (Title.isEmpty()) Title = Name;
-		//else Title += " (" + Name + ")";
-		if (Title == "-")
-			continue; // skip separators
-
-		m_AllTemplates.insertMulti(Category, qMakePair(Name, Title));
-	}
-	
-	ui.cmbCategories->addItem(tr("All Categories"), "");
-	ui.cmbCategories->setCurrentIndex(0);
-	foreach(const QString& Category, m_AllTemplates.uniqueKeys())
-	{
-		if (Category.isEmpty()) 
-			continue;
-		ui.cmbCategories->addItem(Category, Category);
-	}
-
-	m_GlobalTemplates = m_pBox->GetAPI()->GetGlobalSettings()->GetTextList("Template", false);
-	m_BoxTemplates = m_pBox->GetTextList("Template", false);
-
-	ShowTemplates();
-}
-
-void COptionsWindow::ShowTemplates()
-{
-	ui.treeTemplates->clear();
-
-	QString Category = ui.cmbCategories->currentData().toString();
-	QString Filter = ui.txtTemplates->text();
-
-	for (QMultiMap<QString, QPair<QString, QString>>::iterator I = m_AllTemplates.begin(); I != m_AllTemplates.end(); ++I)
-	{
-		if (!Category.isEmpty() && I.key().compare(Category, Qt::CaseInsensitive) != 0)
-			continue;
-
-		QString Name = I.value().first.mid(9);
-
-		if (!Name.isEmpty() && Name.indexOf(Filter, 0, Qt::CaseInsensitive) == -1)
-			continue;
-
-		QTreeWidgetItem* pItem = new QTreeWidgetItem();
-		pItem->setText(0, I.key());
-		pItem->setData(1, Qt::UserRole, I.value().first);
-		pItem->setText(1, I.value().second);
-		//pItem->setFlags(pItem->flags() | Qt::ItemIsUserCheckable);
-		if(m_GlobalTemplates.contains(Name))
-			pItem->setCheckState(1, Qt::PartiallyChecked);
-		else if (m_BoxTemplates.contains(Name))
-			pItem->setCheckState(1, Qt::Checked);
-		else
-			pItem->setCheckState(1, Qt::Unchecked);
-		ui.treeTemplates->addTopLevelItem(pItem);
-	}
-}
-
-void COptionsWindow::OnTemplateClicked(QTreeWidgetItem* pItem, int Column)
-{
-	QString Name = pItem->data(1, Qt::UserRole).toString().mid(9);
-	if (m_GlobalTemplates.contains(Name)) {
-		QMessageBox::warning(this, "SandboxiePlus", tr("This template is enabled globally. To configure it, use the global options."));
-		pItem->setCheckState(1, Qt::PartiallyChecked);
-		return;
-	}
-
-	if (pItem->checkState(1) == Qt::Checked) {
-		if (!m_BoxTemplates.contains(Name)) {
-			m_BoxTemplates.append(Name);
-			m_TemplatesChanged = true;
-		}
-	}
-	else if (pItem->checkState(1) == Qt::Unchecked) {
-		if (m_BoxTemplates.contains(Name)) {
-			m_BoxTemplates.removeAll(Name);
-			m_TemplatesChanged = true;
-		}
-	}
-}
-
-void COptionsWindow::OnTemplateDoubleClicked(QTreeWidgetItem* pItem, int Column)
-{
-	QSharedPointer<CSbieIni> pTemplate = QSharedPointer<CSbieIni>(new CSbieIni(pItem->data(1, Qt::UserRole).toString(), m_pBox->GetAPI()));
-
-	COptionsWindow* pOptionsWindow = new COptionsWindow(pTemplate, pItem->text(1));
-	pOptionsWindow->show();
-}
-
-void COptionsWindow::SaveTemplates()
-{
-	m_pBox->UpdateTextList("Template", m_BoxTemplates, m_Template);
-
-	m_TemplatesChanged = false;
-}
-
-void COptionsWindow::OnTab()
-{
-	if (ui.tabs->currentWidget() == ui.tabEdit)
+	if (pTab == ui.tabEdit)
 	{
 		LoadIniSection();
-		ui.txtIniSection->setReadOnly(true);
+		//ui.txtIniSection->setReadOnly(true);
 	}
 	else 
 	{
 		if (m_ConfigDirty)
 			LoadConfig();
 
-		if (ui.tabs->currentWidget() == ui.tabStart)
-		{
-			if(GetAccessEntry(eIPC, "!<StartRunAccess>", eClosed, "*") != NULL)
-				ui.radStartSelected->setChecked(true);
-			else if (GetAccessEntry(eIPC, "<StartRunAccess>", eClosed, "*") != NULL)
-				ui.radStartExcept->setChecked(true);
-			else
-				ui.radStartAll->setChecked(true);
-			CopyGroupToList("<StartRunAccess>", ui.treeStart);
+		UpdateCurrentTab();
+	}
+}
 
-			OnRestrictStart();
-		}
-		else if (ui.tabs->currentWidget() == ui.tabInternet)
-		{
-			ui.chkBlockINet->setChecked(GetAccessEntry(eFile, "!<InternetAccess>", eClosed, "InternetAccessDevices") != NULL);
-			CopyGroupToList("<InternetAccess>", ui.treeINet);
+void COptionsWindow::UpdateCurrentTab()
+{
+	if (m_pCurrentTab == ui.tabRestrictions || m_pCurrentTab == ui.tabOptions || m_pCurrentTab == ui.tabGeneral) 
+	{
+		ui.chkVmRead->setChecked(IsAccessEntrySet(eIPC, "", eReadOnly, "$:*"));
+	}
+	else if (m_pCurrentTab == ui.tabStart || m_pCurrentTab == ui.tabForce)
+	{
+		if (IsAccessEntrySet(eIPC, "!<StartRunAccess>", eClosed, "*"))
+			ui.radStartSelected->setChecked(true);
+		else if (IsAccessEntrySet(eIPC, "<StartRunAccess>", eClosed, "*"))
+			ui.radStartExcept->setChecked(true);
+		else
+			ui.radStartAll->setChecked(true);
+		ui.treeStart->clear();
+		CopyGroupToList("<StartRunAccess>", ui.treeStart);
+		CopyGroupToList("<StartRunAccessDisabled>", ui.treeStart, true);
 
-			OnBlockINet();
-		}
-		else if (ui.tabs->currentWidget() == ui.tabAdvanced)
+		OnRestrictStart();
+	}
+	else if (m_pCurrentTab == ui.tabInternet || m_pCurrentTab == ui.tabINet || m_pCurrentTab == ui.tabNetConfig)
+	{
+		LoadBlockINet();
+	}
+	else if (m_pCurrentTab == ui.tabDNS || m_pCurrentTab == ui.tabNetProxy)
+	{
+		if (!m_HoldChange && !m_pCurrentTab->isEnabled())
+			theGUI->CheckCertificate(this, 2);
+	}
+	else if (m_pCurrentTab == ui.tabCOM) {
+		CheckOpenCOM();
+	}
+	else if (m_pCurrentTab == ui.tabWnd)
+	{
+		if (IsAccessEntrySet(eWnd, "", eOpen, "*"))
 		{
-			if (GetAccessEntry(eWnd, "", eDirect, "*") != NULL)
-			{
-				ui.chkNoWindowRename->setEnabled(false);
-				ui.chkNoWindowRename->setChecked(true);
-			}
-			else
-			{
-				ui.chkNoWindowRename->setEnabled(true);
-				ui.chkNoWindowRename->setChecked(GetAccessEntry(eWnd, "", eDirect, "#") != NULL);
-			}
+			ui.chkNoWindowRename->setEnabled(false);
+			ui.chkNoWindowRename->setChecked(true);
+		}
+		else
+		{
+			ui.chkNoWindowRename->setEnabled(true);
+			ui.chkNoWindowRename->setChecked(IsAccessEntrySet(eWnd, "", eOpen, "#"));
 		}
 	}
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Raw section ini Editor
+//
+
 void COptionsWindow::SetIniEdit(bool bEnable)
 {
-	for (int i = 0; i < ui.tabs->count() - 1; i++) {
-		bool Enabled = ui.tabs->widget(i)->isEnabled();
-		ui.tabs->setTabEnabled(i, !bEnable && Enabled);
-		ui.tabs->widget(i)->setEnabled(Enabled);
+	if (m_pTree) {
+		m_pTree->setEnabled(!bEnable);
+	}
+	else {
+		for (int i = 0; i < ui.tabs->count() - 1; i++) {
+			bool Enabled = ui.tabs->widget(i)->isEnabled();
+			ui.tabs->setTabEnabled(i, !bEnable && Enabled);
+			ui.tabs->widget(i)->setEnabled(Enabled);
+		}
 	}
 	ui.btnSaveIni->setEnabled(bEnable);
 	ui.btnCancelEdit->setEnabled(bEnable);
-	ui.txtIniSection->setReadOnly(!bEnable);
+	//ui.txtIniSection->setReadOnly(!bEnable);
 	ui.btnEditIni->setEnabled(!bEnable);
 }
 
@@ -2246,26 +1290,47 @@ void COptionsWindow::OnSaveIni()
 	SetIniEdit(false);
 }
 
+void COptionsWindow::OnIniChanged()
+{
+	if (m_HoldChange)
+		return;
+	if(ui.btnEditIni->isEnabled())
+		SetIniEdit(true);
+	ui.buttonBox->button(QDialogButtonBox::Apply)->setEnabled(true);
+}
+
 void COptionsWindow::OnCancelEdit()
 {
 	SetIniEdit(false);
+	LoadIniSection();
 }
 
 void COptionsWindow::LoadIniSection()
 {
 	QString Section;
 
-	m_Settings = m_pBox->GetIniSection(NULL, m_Template);
-	
-	for (QList<QPair<QString, QString>>::const_iterator I = m_Settings.begin(); I != m_Settings.end(); ++I)
-		Section += I->first + "=" + I->second + "\n";
+	// Note: the service only caches sandboxie.ini not templates.ini, hence for global templates we need to load the section through the driver
+	if (m_Template && m_pBox->GetName().mid(9, 6).compare("Local_", Qt::CaseInsensitive) != 0)
+	{
+		m_Settings = m_pBox->GetIniSection(NULL, m_Template);
 
-	ui.txtIniSection->setPlainText(Section);
+		for (QList<QPair<QString, QString>>::const_iterator I = m_Settings.begin(); I != m_Settings.end(); ++I)
+			Section += I->first + "=" + I->second + "\n";
+	}
+	else
+		Section = m_pBox->GetAPI()->SbieIniGetEx(m_pBox->GetName(), "");
+
+	m_HoldChange = true;
+	//ui.txtIniSection->setPlainText(Section);
+	m_pCodeEdit->SetCode(Section);
+	m_HoldChange = false;
 }
 
 void COptionsWindow::SaveIniSection()
 {
 	m_ConfigDirty = true;
+
+	/*m_pBox->SetRefreshOnChange(false);
 
 	// Note: an incremental update would be more elegant but it would change the entry order in the ini,
 	//			hence it's better for the user to fully rebuild the section each time.
@@ -2286,14 +1351,43 @@ void COptionsWindow::SaveIniSection()
 		//if (!OldSettings.removeOne(Settings))
 		//	NewSettings.append(Settings);
 
-		m_pBox->InsertText(Settings.first, Settings.second);
+		m_pBox->AppendText(Settings.first, Settings.second);
 	}
 
 	//for (QList<QPair<QString, QString>>::const_iterator I = OldSettings.begin(); I != OldSettings.end(); ++I)
 	//	m_pBox->DelValue(I->first, I->second);
 	//
 	//for (QList<QPair<QString, QString>>::const_iterator I = NewSettings.begin(); I != NewSettings.end(); ++I)
-	//	m_pBox->InsertText(I->first, I->second);
+	//	m_pBox->AppendText(I->first, I->second);
 
-	LoadIniSection();
+	m_pBox->SetRefreshOnChange(true);
+	m_pBox->GetAPI()->CommitIniChanges();*/
+
+	//m_pBox->GetAPI()->SbieIniSet(m_pBox->GetName(), "", ui.txtIniSection->toPlainText());
+	m_pBox->GetAPI()->SbieIniSet(m_pBox->GetName(), "", m_pCodeEdit->GetCode());
+
+	//LoadIniSection();
+}
+
+#include "OptionsAccess.cpp"
+#include "OptionsAdvanced.cpp"
+#include "OptionsForce.cpp"
+#include "OptionsGeneral.cpp"
+#include "OptionsGrouping.cpp"
+#include "OptionsNetwork.cpp"
+#include "OptionsRecovery.cpp"
+#include "OptionsStart.cpp"
+#include "OptionsStop.cpp"
+#include "OptionsTemplates.cpp"
+
+#include <windows.h>
+
+void COptionsWindow::TriggerPathReload()
+{
+	//
+	// this message makes all boxes reload their path presets
+	//
+
+	DWORD bsm_app = BSM_APPLICATIONS;
+	BroadcastSystemMessage(BSF_POSTMESSAGE, &bsm_app, WM_DEVICECHANGE, 'sb', 0);
 }

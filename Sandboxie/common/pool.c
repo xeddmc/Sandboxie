@@ -25,6 +25,11 @@
 #include "lock.h"
 #include "defines.h"
 
+#ifndef KERNEL_MODE
+#ifdef _M_ARM64EC
+P_NtAllocateVirtualMemoryEx __sys_NtAllocateVirtualMemoryEx = NULL;
+#endif
+#endif
 
 //---------------------------------------------------------------------------
 // Parameters
@@ -113,6 +118,10 @@ static const ULONG Pool_Tag = 'loop';
 #define LARGE_CHUNK_SIZE    PAD_8(sizeof(LARGE_CHUNK))
 
 
+// Maximum possible size for a large chunk
+#define LARGE_CHUNK_MAXIMUM     (0xFFFFFFFFu - (LARGE_CHUNK_SIZE + POOL_PAGE_SIZE))
+
+
 //---------------------------------------------------------------------------
 // Structures and Types
 //---------------------------------------------------------------------------
@@ -187,7 +196,6 @@ static void *Pool_Alloc_Mem(ULONG size, ULONG tag);
 static void Pool_Free_Mem(void *ptr, ULONG tag);
 
 static PAGE *Pool_Alloc_Page(POOL *pool, ULONG tag);
-static void  Pool_Free_Page(PAGE *page);
 
 static ULONG Pool_Find_Cells(PAGE *page, ULONG size);
 
@@ -373,17 +381,38 @@ static const WCHAR *Pool_large_chunks_lock_Name = L"PoolLockL";
 
 ALIGNED void *Pool_Alloc_Mem(ULONG size, ULONG tag)
 {
-    void *ptr;
+    void *ptr = NULL;
 
     Pool_Timing(NULL);
 
     // size parameter will be a multiple of POOL_PAGE_SIZE, and this routine
     // must return memory allocated with page-alignment
 #ifdef KERNEL_MODE
-    ptr = ExAllocatePoolWithTag(PagedPool, size, tag);
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+    ptr = ExAllocatePool2(POOL_FLAG_PAGED, size, tag);
 #else
-    ptr = VirtualAlloc(0, size, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN,
-        ((UCHAR)tag == 0xFF ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE));
+    ptr = ExAllocatePoolWithTag(PagedPool, size, tag);
+#endif
+#else
+    SIZE_T RegionSize = size;
+#ifdef _M_ARM64EC
+    if ((UCHAR)tag == 0xEC) {
+
+        //
+        // this pool is designated for native ARM code in a EC process
+        //
+
+        MEM_EXTENDED_PARAMETER Parameter = { 0 };
+	    Parameter.Type = MemExtendedParameterAttributeFlags;
+	    Parameter.ULong64 = MEM_EXTENDED_PARAMETER_EC_CODE;
+
+        __sys_NtAllocateVirtualMemoryEx(NtCurrentProcess(), &ptr, &RegionSize, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN,
+            PAGE_EXECUTE_READWRITE, &Parameter, 1);
+    }
+    else
+#endif
+        NtAllocateVirtualMemory(NtCurrentProcess(), &ptr, 0, &RegionSize, MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN,
+            ((UCHAR)tag == 0xFF ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE));
 #endif
     // printf("Allocated %d bytes at %08X\n", size, ptr);
 
@@ -511,8 +540,13 @@ ALIGNED POOL *Pool_CreateTagged(ULONG tag)
 
 #elif defined(KERNEL_MODE)
 
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+    pool->lock = ExAllocatePool2(
+                                POOL_FLAG_NON_PAGED, sizeof(ERESOURCE), tag);
+#else
     pool->lock = ExAllocatePoolWithTag(
                                 NonPagedPool, sizeof(ERESOURCE), tag);
+#endif
     if (! pool->lock) {
         Pool_Free_Mem(page, tag);
         return NULL;
@@ -614,6 +648,9 @@ ALIGNED ULONG Pool_Delete(POOL *pool)
 
 ALIGNED void *Pool_Alloc(POOL *pool, ULONG size)
 {
+    if (size >= LARGE_CHUNK_MAXIMUM)
+        return NULL;
+
     void *ptr = NULL;
     if (size) {
 
@@ -931,7 +968,7 @@ ALIGNED void Pool_Free_Cells(void *ptr, ULONG size)
     POOL_LOCK(pages_lock);
 
     // if after de-allocation, a full page crosses threshold in reverse,
-    // we move it to the list of usuable pages
+    // we move it to the list of usable pages
 
     if (page->num_free < FULL_PAGE_THRESHOLD &&
             page->num_free + size >= FULL_PAGE_THRESHOLD) {

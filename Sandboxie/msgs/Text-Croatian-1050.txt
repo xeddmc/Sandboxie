@@ -1,7 +1,7 @@
 #----------------------------------------------------------------------------
 # SbieDrv
 #
-# Initialization errors issued to to the System event Log
+# Initialization errors issued to the System event Log
 #----------------------------------------------------------------------------
 
 1101;evt;inf;01
@@ -3084,7 +3084,7 @@ Sljedeće iznimke dozvoljavaju Web preglednicima pokrenutim u sandboxu da učine
 .
 
 4323;txt;01
-Forsiraj %2 da se pokreće u ovom sandboxu (samo u registriranoj verziji)
+Forsiraj %2 da se pokreće u ovom sandboxu
 .
 
 4324;txt;02
@@ -3686,6 +3686,10 @@ U protivnom kliknite Poništi za prekid instalacije.
 Odaberite DA za spremanje konfiguracijskih postavki u Sandboxie.ini datoteku.
 
 Odaberite NE za brisanje Sandboxie.ini datoteke i gubitak vaših konfiguracijskih postavki.
+.
+
+8055;ins;01
+Dostupno je mrežno ažuriranje Templates.ini i/ili prijevoda za ovu verziju sandboxiea, želite li ga instalirati?
 .
 
 #----------------------------------------------------------------------------

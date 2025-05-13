@@ -51,10 +51,12 @@ typedef struct _LSA_MESSAGE_XP {
 //---------------------------------------------------------------------------
 
 
+#ifdef XP_SUPPORT
 #ifndef _WIN64
 
 static ULONG Ipc_MSV10_AuthPackageNumber = 0;
 
+#endif
 #endif
 
 
@@ -136,6 +138,7 @@ _FX NTSTATUS Ipc_CheckPortRequest_Lsa(
             }
 
         }
+#ifdef XP_SUPPORT
 #ifndef _WIN64
         else { // xp support
 
@@ -166,6 +169,7 @@ _FX NTSTATUS Ipc_CheckPortRequest_Lsa(
                 }
             }
         }
+#endif
 #endif
 
     }
@@ -216,8 +220,6 @@ _FX NTSTATUS Ipc_CheckPortRequest_LsaEP(
 
             ULONG  len = msg->u1.s1.DataLength;
             UCHAR* ptr = (UCHAR*)((UCHAR*)msg + sizeof(PORT_MESSAGE));
-            int i = 0;
-            int rc = -2;
 
             ProbeForRead(ptr, len, sizeof(WCHAR));
 
@@ -330,7 +332,7 @@ _FX BOOLEAN Ipc_Filter_Lsa_Ep_Msg(PROCESS* proc, UCHAR uMsg)
 
     if (Session_MonitorCount && (proc->ipc_trace & (TRACE_ALLOW | TRACE_DENY))) {
 
-        USHORT mon_type = MONITOR_IPC;
+        ULONG mon_type = MONITOR_IPC;
 
         if (filter && (proc->ipc_trace & TRACE_DENY))
             mon_type |= MONITOR_DENY;
@@ -341,15 +343,15 @@ _FX BOOLEAN Ipc_Filter_Lsa_Ep_Msg(PROCESS* proc, UCHAR uMsg)
 
         if (mon_type) {
             WCHAR msg_str[24];
-            swprintf(msg_str, L" Msg: %02X", (ULONG)uMsg);
-            const WCHAR* strings[3] = { L"\\RPC Control\\LSARPC_ENDPOINT", msg_str, NULL };
-            Session_MonitorPutEx(mon_type, strings, NULL, PsGetCurrentProcessId(), PsGetCurrentThreadId());
+            RtlStringCbPrintfW(msg_str, sizeof(msg_str), L"Msg: %02X", (ULONG)uMsg);
+            Log_Debug_Msg(mon_type, msg_str, L"\\RPC Control\\LSARPC_ENDPOINT");
         }
     }
 
     return filter;
 }
 
+#ifdef XP_SUPPORT
 #ifndef _WIN64
 
 
@@ -378,4 +380,5 @@ _FX NTSTATUS Ipc_Api_SetLsaAuthPkg(PROCESS* proc, ULONG64* parms) // xp support
     return STATUS_SUCCESS;
 }
 
+#endif
 #endif

@@ -198,6 +198,14 @@ class CBoxPage : public CPropertyPage
     afx_msg void RestrictPgm_AddStar();
 
     //
+    // Not Implemented
+    //
+
+    void NotImplemented_OnInitDialog(CBox &box);
+
+    afx_msg void OnLinkLabel(NMHDR *pNMHDR, LRESULT *pResult);
+
+    //
     // File Access
     //
 
@@ -239,18 +247,18 @@ class CBoxPage : public CPropertyPage
     //
     // Print Spooler Restrictions
     //
-    void PrintSpooler_OnInitDialog(CBox &box);
-    void PrintSpooler_OnOK(CBox &box);
+    // void PrintSpooler_OnInitDialog(CBox &box);
+    // void PrintSpooler_OnOK(CBox &box);
 
     //
     // Low-Level Restrictions
     //
 
-    void LowLevel_OnInitDialog(CBox &box);
-    void LowLevel_OnOK(CBox &box);
+    // void LowLevel_OnInitDialog(CBox &box);
+    // void LowLevel_OnOK(CBox &box);
 
-    void Hardware_OnInitDialog(CBox &box);
-    void Hardware_OnOK(CBox &box);
+    // void Hardware_OnInitDialog(CBox &box);
+    // void Hardware_OnOK(CBox &box);
 
     //
     // User Accounts

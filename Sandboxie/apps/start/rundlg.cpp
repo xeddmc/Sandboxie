@@ -32,6 +32,7 @@
 #include "common/my_version.h"
 #define INITGUID
 #include <guiddef.h>
+#include <commdlg.h>
 
 
 //---------------------------------------------------------------------------
@@ -323,6 +324,7 @@ void PrepareRunAsAdmin(HWND hwnd, const WCHAR *BoxName, BOOLEAN JustAdmin)
     if (BoxName) {
 
         if ((BoxName == (WCHAR *)-1) ||
+                SbieApi_QueryConfBool(BoxName, L"UseSecurityMode", FALSE) ||
                 SbieApi_QueryConfBool(BoxName, L"DropAdminRights", FALSE)) {
 
             run_elevated_2 = FALSE;
@@ -486,7 +488,7 @@ INT_PTR RunDialogProc(
     static HWND hwndToolTip = NULL;
     HWND ctrl;
     OPENFILENAME ofn;
-    WCHAR boxname[64];
+    WCHAR boxname[BOXNAME_COUNT];
     WCHAR title[128];
     TOOLINFO ti;
 
@@ -508,11 +510,23 @@ INT_PTR RunDialogProc(
             SetDlgItemText(hwnd, IDCANCEL, SbieDll_FormatMessage0(MSG_3002));
             SetDlgItemText(hwnd, IDBROWSE, SbieDll_FormatMessage0(MSG_3003));
 
-            SetDlgItemText(hwnd, IDRUNDLGTEXT,
+            extern BOOL execute_open_with;
+            if (execute_open_with)
+            {
+                SetDlgItemText(hwnd, IDRUNDLGTEXT,
+                           SbieDll_FormatMessage0(MSG_3107));
+
+                extern PWSTR ChildCmdLine;
+                SetDlgItemText(hwnd, IDRUNDLGTEXT2, ChildCmdLine);
+            }
+            else
+            {
+                SetDlgItemText(hwnd, IDRUNDLGTEXT,
                            SbieDll_FormatMessage0(MSG_3103));
 
-            SetDlgItemText(hwnd, IDRUNDLGTEXT2,
+                SetDlgItemText(hwnd, IDRUNDLGTEXT2,
                            SbieDll_FormatMessage0(MSG_3104));
+            }
 
             //
             // position window

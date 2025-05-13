@@ -60,7 +60,7 @@ static ANSI_STRING Gui_BoxNameTitleA;
 //---------------------------------------------------------------------------
 
 
-_FX BOOLEAN Gui_InitTitle(void)
+_FX BOOLEAN Gui_InitTitle(HMODULE module)
 {
     WCHAR buf[10];
 
@@ -68,24 +68,33 @@ _FX BOOLEAN Gui_InitTitle(void)
     // initialize title variables
     //
 
-    SbieApi_QueryConfAsIs(NULL, L"BoxNameTitle", 0, buf, sizeof(buf));
-    if (*buf == L'y' || *buf == L'Y') {
+    SbieDll_GetSettingsForName(NULL, Dll_ImageName, L"BoxNameTitle", buf, sizeof(buf), NULL);
+    if (*buf == L'y' || *buf == L'Y') { // indicator + box name
+
+        const WCHAR* BoxName = Dll_BoxName;
+
+        NTSTATUS status;
+		WCHAR BoxAlias[MAX_PATH];
+		status = SbieApi_QueryConfAsIs(NULL, L"BoxAlias", 0, BoxAlias, ARRAYSIZE(BoxAlias));
+        if (NT_SUCCESS(status) && *BoxAlias)
+            BoxName = BoxAlias;
 
         UNICODE_STRING uni;
 
-        Gui_BoxNameTitleLen = wcslen(Dll_BoxName) + 3;
+        Gui_BoxNameTitleLen = wcslen(BoxName) + 3;
         Gui_BoxNameTitleW =
             Dll_Alloc((Gui_BoxNameTitleLen + 3) * sizeof(WCHAR));
         Gui_BoxNameTitleW[0] = Gui_TitleSuffixW[1];         // L'['
-        wcscpy(&Gui_BoxNameTitleW[1], Dll_BoxName);
+        wcscpy(&Gui_BoxNameTitleW[1], BoxName);
         wcscat(Gui_BoxNameTitleW, &Gui_TitleSuffixW[3]);    // L"]"
         wcscat(Gui_BoxNameTitleW, L" ");
 
         RtlInitUnicodeString(&uni, Gui_BoxNameTitleW);
         RtlUnicodeStringToAnsiString(&Gui_BoxNameTitleA, &uni, TRUE);
 
-    } else if (*buf == L'-')
+    } else if (*buf == L'-') // don't alter boxed window titles at all
         Gui_DisableTitle = TRUE;
+    //  else if(*buf == L'n' || *buf == L'N') means show indicator but not box name
 
     Gui_TitleSuffixW_len = wcslen(Gui_TitleSuffixW);
     Gui_TitleSuffixA_len = strlen(Gui_TitleSuffixA);

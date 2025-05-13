@@ -141,7 +141,7 @@ _FX void *Hook_GetZwServiceInternal(ULONG ServiceIndex)
     subcode = Hook_Find_ZwRoutine(ServiceIndex, &routine);
     if (subcode != 0) {
         WCHAR err[8];
-        swprintf(err, L"%d", subcode);
+        RtlStringCbPrintfW(err, sizeof(err), L"%d", subcode);
         Log_Msg1(MSG_HOOK_ZW_SERVICE, err);
         routine = NULL;
     }
@@ -162,8 +162,29 @@ _FX ULONG Hook_Find_ZwRoutine(ULONG ServiceNum, void **out_routine)
 
     // on 64-bit Windows, ZwXxx functions seem to be ordered arbitrarily
 
-    UCHAR *first_routine = (UCHAR *)ZwWaitForSingleObject;
-    UCHAR *last_routine  = (UCHAR *)ZwUnloadKey + 0x140;
+    UCHAR *first_routine = NULL;
+    UCHAR *last_routine  = NULL;
+
+    //
+    // Driver verifier messes with the Zw imports, and this breaks the Hook_Find_ZwRoutine routine
+    // to fix this we lookup the offsets of the real functions in the export table of ntoskrnl.exe
+    // and then use these correct offsets
+    //
+
+    UCHAR* kernel_base = (UCHAR*)Syscall_GetKernelBase();
+    if (kernel_base) {
+
+        ULONG_PTR offset1 = (ULONG_PTR)Dll_GetProc(Exe_NTOSKRNL, "ZwWaitForSingleObject", TRUE);
+        if (offset1) first_routine = kernel_base + offset1;
+
+        ULONG_PTR offset2 = (ULONG_PTR)Dll_GetProc(Exe_NTOSKRNL, "ZwUnloadKey", TRUE);
+        if (offset2) last_routine = kernel_base + offset2;
+    }
+
+    if(!first_routine) first_routine = (UCHAR *)ZwWaitForSingleObject;
+    if(!last_routine) last_routine   = (UCHAR *)ZwUnloadKey;
+
+    last_routine += 0x140;
 
     // scan the ZwXxx functions in NTOSKRNL, to find the one that invokes
     // the system service with the index we found
@@ -176,7 +197,7 @@ _FX ULONG Hook_Find_ZwRoutine(ULONG ServiceNum, void **out_routine)
 
         // DbgPrint("Address %X Byte %X\n", addr, *addr);
 
-        if (*(USHORT *)addr == 0xC033 && addr[2] == 0xC3) {
+        if (*(USHORT *)addr == 0xC033 && addr[2] == 0xC3) { // $Workaround$ - 3rd party fix
             // HAL7600 activation tool overwrites ZwLockProductActivationKeys
             // with 33 C0 C3 (xor eax,eax ; ret), but leaves the original
             // "xchg ax,ax" at the end of the original code, so we try to
@@ -194,6 +215,10 @@ _FX ULONG Hook_Find_ZwRoutine(ULONG ServiceNum, void **out_routine)
         // a ZwXxx system service redirector looks like this in XP 64-bit :-
         // 0x48 8B C4 FA 48 83 EC xx 50 9C 6A xx 48 8D xx xx xx xx xx 50 ...
         //  ... B8 xx xx xx xx E9 xx xx xx xx 66 90
+
+        // a ZwXxx system service redirector looks like this in Windows 10 64-bit
+        // 48 8B C4 FA 48 83 EC xx 50 9C 6A xx 48 8D xx xx
+        // xx xx xx 50 B8 xx xx xx xx E9 xx xx xx xx C3 90
 
         if (addr[0] != 0x48 || addr[1] != 0x8B)
             break;
@@ -218,7 +243,7 @@ _FX ULONG Hook_Find_ZwRoutine(ULONG ServiceNum, void **out_routine)
             break;
         addr += 5;
 
-        if (addr[0] != 0x66 || addr[1] != 0x90)
+        if ((addr[0] != 0x66 && addr[0] != 0xC3) || addr[1] != 0x90)
             break;
         addr += 2;
     }

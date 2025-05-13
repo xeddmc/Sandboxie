@@ -3075,7 +3075,7 @@ Pengecualian berikut ini mengizinkan peramban Web yang berjalan dalam sandbox in
 .
 
 4323;txt;01
-Paksa %2 agar berjalan dalam sandbox ini (Khusus versi terdaftar)
+Paksa %2 agar berjalan dalam sandbox ini
 .
 
 4324;txt;02
@@ -3673,6 +3673,10 @@ Apakah Anda ingin menyimpan konfigurasi berkas Sandboxie.ini?
 Pilih YA untuk menyimpan penataan konfigurasi dalam berkas Sandboxie.ini.
 
 Pilih TIDAK untuk menghapus berkas Sandboxie.ini dan memunahkan penataan konfigurasi Anda.
+.
+
+8055;ins;01
+Ada pembaruan online dari Templates.ini dan/atau terjemahan untuk versi sandboxie ini, apakah Anda ingin menginstalnya?
 .
 
 #----------------------------------------------------------------------------

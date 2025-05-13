@@ -149,7 +149,7 @@ void CCreateDialog::OnOK()
 
     int i = 0;
     int len = name.GetLength();
-    if (len <= 32) {
+    if (len <= (BOXNAME_COUNT - 2)) {
         for (; i < len; ++i) {
             if (name[i] >= L'0' && name[i] <= L'9')
                 continue;
@@ -173,6 +173,18 @@ void CCreateDialog::OnOK()
             errmsg = MSG_4665;
         else if (rc != STATUS_OBJECT_NAME_NOT_FOUND)
             errmsg = MSG_3668;
+    }
+
+    if (!errmsg && len <= 8) {
+        if(SbieDll_IsReservedFileName(name))
+            errmsg = MSG_3667;
+    }
+
+    if (!errmsg) {
+        if (_wcsicmp(name, L"GlobalSettings") == 0
+         || _wcsnicmp(name, L"UserSettings_", 13) == 0) {
+            errmsg = MSG_3667;
+        }
     }
 
     if (errmsg) {

@@ -57,7 +57,7 @@ NTSTATUS Stream_Read_More(
 
 #ifndef KERNEL_MODE
 
-__declspec(align(16)) NTSTATUS Stream_Open(
+NTSTATUS Stream_Open(
     OUT STREAM **out_stream,
     IN  HANDLE Handle)
 {
@@ -65,7 +65,7 @@ __declspec(align(16)) NTSTATUS Stream_Open(
 
     *out_stream = NULL;
 
-    stream = HeapAlloc(GetProcessHeap(), 0, PAGE_SIZE);
+    stream = (STREAM*)HeapAlloc(GetProcessHeap(), 0, PAGE_SIZE);
     if (! stream)
         return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -87,7 +87,7 @@ __declspec(align(16)) NTSTATUS Stream_Open(
 
 #ifdef KERNEL_MODE
 
-__declspec(align(16)) NTSTATUS Stream_Open(
+NTSTATUS Stream_Open(
     OUT STREAM **out_stream,
     IN  const WCHAR *FullPath,
     IN  ACCESS_MASK DesiredAccess,
@@ -105,7 +105,11 @@ __declspec(align(16)) NTSTATUS Stream_Open(
 
     *out_stream = NULL;
 
+#if (NTDDI_VERSION >= NTDDI_WIN10_VB)
+    stream = ExAllocatePool2(POOL_FLAG_PAGED, PAGE_SIZE, tzuk);
+#else
     stream = ExAllocatePoolWithTag(PagedPool, PAGE_SIZE, tzuk);
+#endif
     if (! stream)
         return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -160,7 +164,7 @@ __declspec(align(16)) NTSTATUS Stream_Open(
 // Stream_Close
 //---------------------------------------------------------------------------
 
-__declspec(align(16)) void Stream_Close(
+void Stream_Close(
     IN  STREAM *stream)
 {
 #ifndef KERNEL_MODE
@@ -176,7 +180,7 @@ __declspec(align(16)) void Stream_Close(
 // Stream_Read_More
 //---------------------------------------------------------------------------
 
-__declspec(align(16)) NTSTATUS Stream_Read_More(
+NTSTATUS Stream_Read_More(
     IN  STREAM *stream)
 {
     NTSTATUS status;
@@ -207,7 +211,7 @@ __declspec(align(16)) NTSTATUS Stream_Read_More(
 // Stream_Flush
 //---------------------------------------------------------------------------
 
-__declspec(align(16)) NTSTATUS Stream_Flush(
+NTSTATUS Stream_Flush(
     IN  STREAM *stream)
 {
     NTSTATUS status;
@@ -357,11 +361,82 @@ NTSTATUS Stream_Write_Long(
 }
 
 //---------------------------------------------------------------------------
+// Read_BOM
+//---------------------------------------------------------------------------
+
+ULONG Read_BOM(UCHAR** data, ULONG* len)
+{
+    ULONG encoding;
+
+    if (*len >= 3 && (*data)[0] == 0xEF && (*data)[1] == 0xBB && (*data)[2] == 0xBF) 
+    {
+        *data += 3;
+        *len -= 3;
+
+        encoding = 1;
+        //DbgPrint("sbie read ini, found UTF-8 Signature\n");
+    }
+    else if (*len >= 2 && (*data)[0] == 0xFF && (*data)[1] == 0xFE)
+    {
+        *data += 2;
+        *len -= 2;
+
+        encoding = 0;
+        //DbgPrint("sbie read ini, found Unicode (UTF-16 LE) BOM\n");
+    }
+    else if (*len >= 2 && (*data)[0] == 0xFE && (*data)[1] == 0xFF)
+    {
+        *data += 2;
+        *len -= 2;
+
+        encoding = 2;
+        //DbgPrint("sbie read ini, found Unicode (UTF-16 BE) BOM\n");
+    }
+    else
+    {
+        // If there is no BOM/Signature try to detect the file type
+        // Unicode Little Endian (windows wchar_t) will have the n*2+1 bytes 0 as long, as no higher unicode characters are used
+        BOOLEAN LooksUnicodeLE = TRUE;
+        // similrly Unicode Big Endian (byte swapped) will have the n*2 bytes 0 as long
+        BOOLEAN LooksUnicodeBE = TRUE;
+        // UTF-8 shouldn't have null bytes
+        for (ULONG pos = 0; (pos + 1) < min(*len, 16); pos += 2) // check first 8 char16's
+        {
+            if ((*data)[pos] != 0)
+                LooksUnicodeBE = FALSE;
+            if ((*data)[pos + 1] != 0)
+                LooksUnicodeLE = FALSE;
+        }
+
+        if (!LooksUnicodeLE && !LooksUnicodeBE)
+        {
+            encoding = 1;
+            //DbgPrint("sbie read ini, looks UTF-8 encoded\n");
+        }
+        else if (!LooksUnicodeLE && LooksUnicodeBE)
+        {
+            encoding = 2;
+            //DbgPrint("sbie read ini, looks Unicode (UTF-16 BE) encoded\n");
+        }
+        else
+        {
+            encoding = 0;
+            //if (LooksUnicodeLE && !LooksUnicodeBE)
+            //  DbgPrint("sbie read ini, looks Unicode (UTF-16 LE) encoded\n");
+            //else
+            //  DbgPrint("sbie read ini, encoding looks broken, assuming (UTF-16 LE)\n");
+        }
+    }
+
+    return encoding;
+}
+
+//---------------------------------------------------------------------------
 // Stream_Read_BOM
 //---------------------------------------------------------------------------
 
 NTSTATUS Stream_Read_BOM(
-    IN  STREAM* stream, 
+    IN  STREAM* stream,
     ULONG* encoding)
 {
     if (stream->data_len == 0) 
@@ -371,65 +446,7 @@ NTSTATUS Stream_Read_BOM(
             return status;
     }
 
-    if (stream->data_len >= 3 && stream->data[0] == 0xEF && stream->data[1] == 0xBB && stream->data[2] == 0xBF) 
-    {
-        stream->data_ptr += 3;
-        stream->data_len -= 3;
-
-        stream->encoding = 1;
-        //DbgPrint("sbie read ini, found UTF-8 Signature\n");
-    }
-    else if (stream->data_len >= 2 && stream->data[0] == 0xFF && stream->data[1] == 0xFE)
-    {
-        stream->data_ptr += 2;
-        stream->data_len -= 2;
-
-        stream->encoding = 0;
-        //DbgPrint("sbie read ini, found Unicode (UTF-16 LE) BOM\n");
-    }
-    else if (stream->data_len >= 2 && stream->data[0] == 0xFE && stream->data[1] == 0xFF)
-    {
-        stream->data_ptr += 2;
-        stream->data_len -= 2;
-
-        stream->encoding = 2;
-        //DbgPrint("sbie read ini, found Unicode (UTF-16 BE) BOM\n");
-    }
-    else
-    {
-        // If there is no BOM/Signature try to detect the file type
-        // Unicode Litle Endian (windows wchar_t) will have the n*2+1 bytes 0 as long, as no higher unicode chrakters are used
-        BOOLEAN LooksUnicodeLE = TRUE;
-        // similrly Unicode Big Endian (byte swaped) will have the n*2 bytes 0 as long
-        BOOLEAN LooksUnicodeBE = TRUE;
-        // UTF-8 shouldn't have null bytes
-        for (ULONG pos = 0; (pos + 1) < min(stream->data_len, 16); pos += 2) // check first 8 char16's
-        {
-            if (stream->data[pos] != 0)
-                LooksUnicodeBE = FALSE;
-            if (stream->data[pos + 1] != 0)
-                LooksUnicodeLE = FALSE;
-        }
-
-        if (!LooksUnicodeLE && !LooksUnicodeBE)
-        {
-            stream->encoding = 1;
-            //DbgPrint("sbie read ini, looks UTF-8 encoded\n");
-        }
-        else if (!LooksUnicodeLE && LooksUnicodeBE)
-        {
-            stream->encoding = 2;
-            //DbgPrint("sbie read ini, looks Unicode (UTF-16 BE) encoded\n");
-        }
-        else
-        {
-            stream->encoding = 0;
-            //if (LooksUnicodeLE && !LooksUnicodeBE)
-            //  DbgPrint("sbie read ini, looks Unicode (UTF-16 LE) encoded\n");
-            //else
-            //  DbgPrint("sbie read ini, encoding looks broken, assuming (UTF-16 LE)\n");
-        }
-    }
+    stream->encoding = Read_BOM(&stream->data_ptr, &stream->data_len);
 
     if (encoding) *encoding = stream->encoding;
 
@@ -444,7 +461,7 @@ NTSTATUS Stream_Read_Wchar(
     IN  STREAM* stream,
     OUT USHORT* v)
 {
-    if (stream->encoding == 0) // Unicode Litle Endian
+    if (stream->encoding == 0) // Unicode Little Endian
     {
         UCHAR* b = (UCHAR*)v;
         STREAM_GET_BYTE(b[0]);
@@ -486,7 +503,7 @@ NTSTATUS Stream_Read_Wchar(
             wchar_t lowShort = (wchar_t)(cur_byte & 0x3F);
 
             //Create the UTF-16 code unit, then increment the iterator
-            int unicode = (highShort << 8) | lowShort;
+            int unicode = (highShort << 6) | lowShort;
 
             //Check to make sure the "unicode" is in the range [0..D7FF] and [E000..FFFF].
             if ((0 <= unicode && unicode <= 0xD7FF) || (0xE000 <= unicode && unicode <= 0xFFFF)) {

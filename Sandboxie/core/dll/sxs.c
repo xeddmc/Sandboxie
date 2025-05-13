@@ -1,6 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
- * Copyright 2020 David Xanatos, xanasoft.com
+ * Copyright 2020-2023 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -1216,9 +1216,9 @@ _FX HANDLE Sxs_CreateActCtxW(ACTCTX *ActCtx)
     if (ActCtx->dwFlags & ACTCTX_FLAG_SET_PROCESS_DEFAULT) {
 
 #ifdef _WIN64
-        pActivationContextData = (ULONG_PTR *)(__readgsqword(0x60) + 0x2F8);
+        pActivationContextData = (ULONG_PTR *)(NtCurrentPeb() + 0x2F8);
 #else
-        pActivationContextData = (ULONG_PTR *)(__readfsdword(0x30) + 0x1F8);
+        pActivationContextData = (ULONG_PTR *)(NtCurrentPeb() + 0x1F8);
 #endif _WIN64
 
         if (*pActivationContextData) {
@@ -1654,9 +1654,8 @@ _FX BOOLEAN Sxs_InitKernel32(void)
         // if the sandbox setting DisableBoxedWinSxS=y
         //
 
-        if (Dll_ImageType == DLL_IMAGE_SANDBOXIE_RPCSS ||
-
-                SbieApi_QueryConfBool(NULL, L"DisableBoxedWinSxS", FALSE)) {
+        if (Dll_ImageType == DLL_IMAGE_SANDBOXIE_RPCSS || Dll_AppContainerToken ||
+                Config_GetSettingsForImageName_bool(L"DisableBoxedWinSxS", FALSE)) {
 
             Sxs_UseAltCreateActCtx = TRUE;
         }
@@ -1682,10 +1681,14 @@ _FX BOOLEAN Sxs_InitKernel32(void)
         }
     }
 
+    module = Dll_Ntdll;
+
     //
     // Opera hooks NtSetInformationThread. SboxDll calls __sys_NtSetInformationThread to bypass Opera hook.
     // See the comment about Thread_SetInformationThread_ChangeNotifyToken in Gui_ConnectToWindowStationAndDesktop
-    //
+    // 
+    // Tested with opera 117 and this workaround seems no longer required
+    // 
 
     NtSetInformationThread = GetProcAddress(Dll_Ntdll, "NtSetInformationThread");
     if (NtSetInformationThread) {
@@ -1698,8 +1701,6 @@ _FX BOOLEAN Sxs_InitKernel32(void)
 
     if (Dll_ImageType != DLL_IMAGE_TRUSTED_INSTALLER)
         return TRUE;
-
-    module = Dll_Ntdll;
 
     NtCreateTransaction   = GetProcAddress(module, "NtCreateTransaction");
     NtOpenTransaction     = GetProcAddress(module, "NtOpenTransaction");
@@ -1759,6 +1760,8 @@ _FX BOOLEAN Sxs_InitKernel32(void)
     //
 
     if (Dll_OsBuild >= 8400) {
+
+        module = Dll_KernelBase;
 
         typedef BOOL (*P_CheckTokenMembership)(
             HANDLE hToken, void *pSid, BOOL *IsMember);
@@ -1823,9 +1826,9 @@ _FX void Sxs_ActivateDefaultManifest(void *ImageBase)
         ULONG_PTR *pActivationContextData;
 
 #ifdef _WIN64
-        pActivationContextData = (ULONG_PTR *)(__readgsqword(0x60) + 0x2F8);
+        pActivationContextData = (ULONG_PTR *)(NtCurrentPeb() + 0x2F8);
 #else
-        pActivationContextData = (ULONG_PTR *)(__readfsdword(0x30) + 0x1F8);
+        pActivationContextData = (ULONG_PTR *)(NtCurrentPeb() + 0x1F8);
 #endif _WIN64
 
         *pActivationContextData = 0;
@@ -1863,6 +1866,64 @@ _FX void Sxs_ActivateDefaultManifest(void *ImageBase)
 
 
 //---------------------------------------------------------------------------
+// Sxs_CheckManifestForElevation
+//---------------------------------------------------------------------------
+
+
+_FX ULONG Sxs_CheckManifestForElevation(
+    const WCHAR* DosPath, 
+    BOOLEAN *pAsInvoker, 
+    BOOLEAN *pRequireAdministrator, 
+    BOOLEAN *pHighestAvailable)
+{
+    ACTCTX ActCtx;
+    SXS_ARGS args;
+    ULONG rc;
+
+    if (Dll_OsBuild < 6000)
+        return STATUS_NOT_IMPLEMENTED;
+
+    //
+    // invoke Sxs_GetPathAndText to get the manifest text
+    //
+
+    memzero(&args, sizeof(args));
+
+    if (! Sxs_AllocOrFreeBuffers(&args, TRUE))
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    memzero(&ActCtx, sizeof(ACTCTX));
+    ActCtx.cbSize = sizeof(ACTCTX);
+    ActCtx.lpSource = DosPath;
+
+    rc = STATUS_UNSUCCESSFUL;
+
+    if (Sxs_GetPathAndText(&ActCtx, &args)) {
+
+        rc = STATUS_SUCCESS; // manifest found
+
+        _strlwr(args.ManifestText);
+
+        if (pAsInvoker) *pAsInvoker = 
+            (strstr(args.ManifestText, "level='asinvoker'") 
+            || strstr(args.ManifestText, "level=\"asinvoker\""));
+
+        if (pRequireAdministrator) *pRequireAdministrator = 
+            (strstr(args.ManifestText, "level='requireadministrator'")
+            || strstr(args.ManifestText, "level=\"requireadministrator\""));
+
+        if (pHighestAvailable) *pHighestAvailable = 
+            (strstr(args.ManifestText, "level='highestavailable'")
+            || strstr(args.ManifestText, "level=\"highestavailable\""));
+    }
+
+    Sxs_AllocOrFreeBuffers(&args, FALSE);
+
+    return rc;
+}
+
+
+//---------------------------------------------------------------------------
 // Sxs_CheckManifestForCreateProcess
 //---------------------------------------------------------------------------
 
@@ -1870,9 +1931,8 @@ _FX void Sxs_ActivateDefaultManifest(void *ImageBase)
 _FX ULONG Sxs_CheckManifestForCreateProcess(const WCHAR *DosPath)
 {
     THREAD_DATA *TlsData = Dll_GetTlsData(NULL);
-    ACTCTX ActCtx;
-    SXS_ARGS args;
     ULONG rc, ElvType;
+    BOOLEAN AsInvoker, RequireAdministrator, HighestAvailable;
 
     //
     // Windows Vista UAC auto-elevates program names that includes words
@@ -1905,24 +1965,9 @@ _FX ULONG Sxs_CheckManifestForCreateProcess(const WCHAR *DosPath)
         return 0;
     }
 
-    //
-    // invoke Sxs_GetPathAndText to get the manifest text
-    //
+    rc = Sxs_CheckManifestForElevation(DosPath, &AsInvoker, &RequireAdministrator, &HighestAvailable);
 
-    memzero(&args, sizeof(args));
-
-    if (! Sxs_AllocOrFreeBuffers(&args, TRUE))
-        return STATUS_INSUFFICIENT_RESOURCES;
-
-    memzero(&ActCtx, sizeof(ACTCTX));
-    ActCtx.cbSize = sizeof(ACTCTX);
-    ActCtx.lpSource = DosPath;
-
-    rc = 0;
-
-    if (Sxs_GetPathAndText(&ActCtx, &args)) {
-
-        UCHAR *RequireAdministrator, *HighestAvailable;
+    if (NT_SUCCESS(rc)) {
 
         //
         // asInvoker means to use alternate manifest files in
@@ -1932,15 +1977,8 @@ _FX ULONG Sxs_CheckManifestForCreateProcess(const WCHAR *DosPath)
         // our Proc_CreateProcess caller to use SH32_DoRunAs
         //
 
-        _strlwr(args.ManifestText);
-
-        if (strstr(args.ManifestText, "level=\"asinvoker\""))
+        if (AsInvoker)
             TlsData->proc_create_process_as_invoker = TRUE;
-
-        RequireAdministrator =
-            strstr(args.ManifestText, "level=\"requireadministrator\"");
-        HighestAvailable =
-            strstr(args.ManifestText, "level=\"highestavailable\"");
 
         if (RequireAdministrator ||
                 (HighestAvailable && ElvType != TokenElevationTypeDefault)) {
@@ -1961,9 +1999,34 @@ _FX ULONG Sxs_CheckManifestForCreateProcess(const WCHAR *DosPath)
         }
     }
 
-    Sxs_AllocOrFreeBuffers(&args, FALSE);
-
     return rc;
+}
+
+
+//---------------------------------------------------------------------------
+// Sxs_PreferExternal
+//---------------------------------------------------------------------------
+
+
+_FX BOOLEAN Sxs_PreferExternal(THREAD_DATA *TlsData)
+{
+    if (!TlsData->proc_image_path)
+        return FALSE;
+
+    //
+    // KB5014019 breaks Edge, it seems that making Edge to start its child processes with
+    // PreferExternalManifest fixes the issue, but the main process must be loaded normally
+    // hence we have ExternalManifestHack that checks the parent and not the target
+    //
+
+    if (Config_GetSettingsForImageName_bool(L"ExternalManifestHack", FALSE))
+        return TRUE;
+
+    WCHAR *ptr1 = wcsrchr(TlsData->proc_image_path, L'\\');
+
+    WCHAR value[16];
+    SbieDll_GetSettingsForName(NULL, ptr1 + 1, L"PreferExternalManifest", value, sizeof(value), NULL);
+    return Config_String2Bool(value, FALSE);
 }
 
 
@@ -1981,82 +2044,79 @@ _FX BOOLEAN Sxs_KeyCallback(const WCHAR *path, HANDLE *out_handle)
     // a pre-set value for PreferExternalManifest
     //
 
-	if (!SbieApi_QueryConfBool(NULL, L"PreferExternalManifest", FALSE))
-		return FALSE;
-
     THREAD_DATA *TlsData = Dll_GetTlsData(NULL);
 
-    if (TlsData->proc_image_path) {
+    if (!Sxs_PreferExternal(TlsData))
+        return FALSE;
 
-        if (_wcsnicmp(path, L"\\Registry\\Machine\\", 18) == 0) {
+    if (_wcsnicmp(path, L"\\Registry\\Machine\\", 18) == 0) {
 
-            BOOLEAN redirect = FALSE;
+        BOOLEAN redirect = FALSE;
 
-            path += 18;
-            if (_wcsnicmp(path, L"Components", 10) == 0)
+        path += 18;
+        if (_wcsnicmp(path, L"Components", 10) == 0)
+            redirect = TRUE;
+
+        else if (_wcsnicmp(path, L"Software\\", 9) == 0) {
+
+            path += 9;
+
+            if (_wcsnicmp(path, L"Wow6432Node\\", 12) == 0)
+                path += 12;
+
+            if (0 == _wcsicmp(path,
+                    L"Microsoft\\Windows\\CurrentVersion\\SideBySide"))
                 redirect = TRUE;
+        }
 
-            else if (_wcsnicmp(path, L"Software\\", 9) == 0) {
+        if (redirect) {
 
-                path += 9;
+            const WCHAR *ValueName = L"PreferExternalManifest";
+            extern WCHAR *Support_SbieSvcKeyPath;
 
-                if (_wcsnicmp(path, L"Wow6432Node\\", 12) == 0)
-                    path += 12;
+            UNICODE_STRING objname;
+            OBJECT_ATTRIBUTES objattrs;
+            HANDLE handle;
 
-                if (0 == _wcsicmp(path,
-                        L"Microsoft\\Windows\\CurrentVersion\\SideBySide"))
-                    redirect = TRUE;
-            }
+            InitializeObjectAttributes(
+                &objattrs, &objname, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-            if (redirect) {
+            RtlInitUnicodeString(&objname, Support_SbieSvcKeyPath);
 
-                const WCHAR *ValueName = L"PreferExternalManifest";
-                extern WCHAR *Support_SbieSvcKeyPath;
+            if (0 != __sys_NtOpenKey(&handle, KEY_READ, &objattrs))
+                handle = NULL;
 
-                UNICODE_STRING objname;
-                OBJECT_ATTRIBUTES objattrs;
-                HANDLE handle;
+            if (handle) {
 
-                InitializeObjectAttributes(
-                    &objattrs, &objname, OBJ_CASE_INSENSITIVE, NULL, NULL);
+                union {
+                    KEY_VALUE_PARTIAL_INFORMATION kvpi;
+                    ULONG space[6];
+                } info;
+                ULONG len;
 
-                RtlInitUnicodeString(&objname, Support_SbieSvcKeyPath);
+                RtlInitUnicodeString(&objname, ValueName);
 
-                if (0 != __sys_NtOpenKey(&handle, KEY_READ, &objattrs))
-                    handle = NULL;
+                if (0 != NtQueryValueKey(
+                        handle, &objname, KeyValuePartialInformation,
+                        &info, sizeof(info), &len))
+                    info.kvpi.Type = 0;
 
-                if (handle) {
+                if (info.kvpi.Type == REG_DWORD             &&
+                    info.kvpi.DataLength == sizeof(ULONG)   &&
+                    *(ULONG *)info.kvpi.Data != 0) {
 
-                    union {
-                        KEY_VALUE_PARTIAL_INFORMATION kvpi;
-                        ULONG space[6];
-                    } info;
-                    ULONG len;
+                    //WCHAR txt[1024];
+                    //Sbie_snwprintf(txt, 1024, L"REDIR KEY - %s\n", path);
+                    //OutputDebugString(txt);
 
-                    RtlInitUnicodeString(&objname, ValueName);
-
-                    if (0 != NtQueryValueKey(
-                            handle, &objname, KeyValuePartialInformation,
-                            &info, sizeof(info), &len))
-                        info.kvpi.Type = 0;
-
-                    if (info.kvpi.Type == REG_DWORD             &&
-                        info.kvpi.DataLength == sizeof(ULONG)   &&
-                        *(ULONG *)info.kvpi.Data != 0) {
-
-                        //WCHAR txt[1024];
-                        //Sbie_snwprintf(txt, 1024, L"REDIR KEY - %s\n", path);
-                        //OutputDebugString(txt);
-
-                        *out_handle = handle;
-                        return TRUE;
-                    }
-
-                    CloseHandle(handle);
+                    *out_handle = handle;
+                    return TRUE;
                 }
 
-                SbieApi_Log(2205, ValueName);
+                CloseHandle(handle);
             }
+
+            SbieApi_Log(2205, ValueName);
         }
     }
 
@@ -2078,96 +2138,93 @@ _FX BOOLEAN Sxs_FileCallback(const WCHAR *path, HANDLE *out_handle)
     // our installation home directory
     //
 
-	if (!SbieApi_QueryConfBool(NULL, L"PreferExternalManifest", FALSE))
-		return FALSE;
-
     THREAD_DATA *TlsData = Dll_GetTlsData(NULL);
 
-    if (TlsData->proc_image_path) {
+    if (!Sxs_PreferExternal(TlsData))
+        return FALSE;
 
-        const WCHAR *_Manifest_Txt = L"\\Manifest1.txt";
-        const WCHAR *_Config_Txt   = L"\\Manifest2.txt";
-        const WCHAR *_Empty_Txt    = L"\\Manifest0.txt";
-        const WCHAR *FileName = NULL;
-        ULONG  FileSize = 0;
+    const WCHAR *_Manifest_Txt = L"\\Manifest1.txt";
+    const WCHAR *_Config_Txt   = L"\\Manifest2.txt";
+    const WCHAR *_Empty_Txt    = L"\\Manifest0.txt";
+    const WCHAR *FileName = NULL;
+    ULONG  FileSize = 0;
 
-        WCHAR *ptr1 = wcsrchr(TlsData->proc_image_path, L'\\');
-        WCHAR *ptr2 = wcsrchr(path, L'\\');
-        ULONG len = 0;
-        if (ptr1)
-            len = wcslen(ptr1);
+    WCHAR *ptr1 = wcsrchr(TlsData->proc_image_path, L'\\');
+    WCHAR *ptr2 = wcsrchr(path, L'\\');
+    ULONG len = 0;
+    if (ptr1)
+        len = wcslen(ptr1);
 
-        if (len && ptr2 && _wcsnicmp(ptr1, ptr2, len) == 0) {
+    if (len && ptr2 && _wcsnicmp(ptr1, ptr2, len) == 0) {
 
-            if (_wcsicmp(ptr2 + len, Sxs_manifest) == 0) {
-                FileName = _Manifest_Txt;
-                FileSize = 364;
+        if (_wcsicmp(ptr2 + len, Sxs_manifest) == 0) {
+            FileName = _Manifest_Txt;
+            FileSize = 364;
 
-            } else if (_wcsicmp(ptr2 + len, Sxs_config) == 0) {
-                FileName = _Config_Txt;
-                FileSize = 92;
-            }
+        } else if (_wcsicmp(ptr2 + len, Sxs_config) == 0) {
+            FileName = _Config_Txt;
+            FileSize = 92;
         }
+    }
 
-        if (FileName && (! TlsData->proc_create_process_as_invoker)) {
+    if (FileName && (! TlsData->proc_create_process_as_invoker)) {
 
-            //
-            // if the EXE does not explicitly say in its manifest:
-            //          requestedExecutionLevel level="asInvoker"
-            // then we use the empty manifest/config files, to allow
-            // UAC to use its auto-elevation heuristics
-            //
+        //
+        // if the EXE does not explicitly say in its manifest:
+        //          requestedExecutionLevel level="asInvoker"
+        // then we use the empty manifest/config files, to allow
+        // UAC to use its auto-elevation heuristics
+        //
 
-            FileName = _Empty_Txt;
-            FileSize = 2;
-        }
+        FileName = _Empty_Txt;
+        FileSize = 2;
+    }
 
-        if (FileName) {
+    if (FileName) {
 
-            HANDLE handle;
+        HANDLE handle;
 
-            WCHAR *FilePath = Dll_AllocTemp(MAX_PATH * 2 * sizeof(WCHAR));
-            SbieApi_GetHomePath(NULL, 0, FilePath, MAX_PATH);
-            wcscat(FilePath, FileName);
+        WCHAR *FilePath = Dll_AllocTemp(MAX_PATH * 2 * sizeof(WCHAR));
+        wcscpy(FilePath, Dll_HomeDosPath);
+        wcscat(FilePath, FileName);
 
-            //OutputDebugString(L"*** *** ***\n");
-            //OutputDebugString(FilePath);
-            //OutputDebugString(L"*** *** ***\n");
+        //OutputDebugString(L"*** *** ***\n");
+        //OutputDebugString(FilePath);
+        //OutputDebugString(L"*** *** ***\n");
 
-            handle = CreateFile(FilePath, FILE_READ_DATA, FILE_SHARE_READ,
-                                NULL, OPEN_EXISTING, 0, NULL);
+        handle = CreateFile(FilePath, FILE_READ_DATA, FILE_SHARE_READ,
+                            NULL, OPEN_EXISTING, 0, NULL);
 
-            Dll_Free(FilePath);
+        Dll_Free(FilePath);
 
-            if (handle == INVALID_HANDLE_VALUE)
-                handle = NULL;
+        if (handle == INVALID_HANDLE_VALUE)
+            handle = NULL;
 
-            if (handle) {
+        if (handle) {
 
-                IO_STATUS_BLOCK IoStatusBlock;
-                FILE_NETWORK_OPEN_INFORMATION open_info;
+            IO_STATUS_BLOCK IoStatusBlock;
+            FILE_NETWORK_OPEN_INFORMATION open_info;
 
-                NTSTATUS status = NtQueryInformationFile(
-                    handle, &IoStatusBlock, &open_info,
-                    sizeof(FILE_NETWORK_OPEN_INFORMATION),
-                    FileNetworkOpenInformation);
+            NTSTATUS status = NtQueryInformationFile(
+                handle, &IoStatusBlock, &open_info,
+                sizeof(FILE_NETWORK_OPEN_INFORMATION),
+                FileNetworkOpenInformation);
 
-                if (NT_SUCCESS(status) &&
-                                open_info.EndOfFile.QuadPart == FileSize) {
+            if (NT_SUCCESS(status) &&
+                            open_info.EndOfFile.QuadPart == FileSize) {
 
-                    //WCHAR txt[1024];
-                    //Sbie_snwprintf(txt, 1024, L"REDIR FILE - %s\n", path);
-                    //OutputDebugString(txt);
+                //WCHAR txt[1024];
+                //Sbie_snwprintf(txt, 1024, L"REDIR FILE - %s\n", path);
+                //OutputDebugString(txt);
 
-                    *out_handle = handle;
-                    return TRUE;
-                }
-
-                CloseHandle(handle);
+                *out_handle = handle;
+                return TRUE;
             }
 
-            SbieApi_Log(2205, FileName + 1);
+            CloseHandle(handle);
         }
+
+        SbieApi_Log(2205, FileName + 1);
     }
 
     return FALSE;

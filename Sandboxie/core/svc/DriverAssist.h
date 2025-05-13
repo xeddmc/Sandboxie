@@ -24,6 +24,9 @@
 #ifndef _MY_DRIVERASSIST_H
 #define _MY_DRIVERASSIST_H
 
+#include <map>
+#include <vector>
+#include <string>
 
 class DriverAssist
 {
@@ -40,10 +43,14 @@ public:
 
     static bool IsDriverReady();
 
+    static bool LookupSidCached(const PSID pSid, 
+        WCHAR *UserName, ULONG* UserNameLen);
 
 private:
 
     DriverAssist();
+
+	~DriverAssist();
 
     bool InitializePortAndThreads();
 
@@ -86,6 +93,12 @@ private:
     void RestartHostInjectedSvcs();
 
     //
+    // mounted registry hive
+    //
+
+    void HiveMounted(void *_msg);
+
+    //
     // unmount registry hive
     //
 
@@ -95,9 +108,9 @@ private:
     // log messages to file
     //
 
-    void LogMessage();
+    void LogMessage(void *_msg);
 
-    void LogMessage_Single(ULONG code, wchar_t* data);
+    void LogMessage_Single(ULONG code, wchar_t* data, ULONG pid);
     void LogMessage_Multi(ULONG msgid, const WCHAR *path, const WCHAR *text);
     void LogMessage_Write(const WCHAR *path, const WCHAR *text);
 
@@ -109,6 +122,16 @@ private:
 
     void InjectLow(void *_msg);
 	HANDLE InjectLow_OpenProcess(void *_msg);
+
+    //
+    // SbieLogin
+    //
+
+    void InitSIDs();
+
+    bool GetSandboxieSID(const WCHAR* boxname, UCHAR* SandboxieLogonSid, DWORD dwSidSize);
+
+    void CleanUpSIDs();
 
     //
     // data
@@ -125,13 +148,15 @@ private:
 
 	ULONG m_last_message_number;
 
+    std::map<std::wstring, std::wstring> m_SidCache;
+
     //
     // critical sections
     //
 
     CRITICAL_SECTION m_LogMessage_CritSec;
     CRITICAL_SECTION m_critSecHostInjectedSvcs;
-
+    CRITICAL_SECTION m_SidCache_CritSec;
 };
 
 

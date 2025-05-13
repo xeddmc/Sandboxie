@@ -40,33 +40,6 @@ const WCHAR *ServiceTitle = SANDBOXIE L" BITS";
 
 
 //---------------------------------------------------------------------------
-// my_CreateFileMapping
-//---------------------------------------------------------------------------
-
-
-HANDLE my_CreateFileMappingW(
-    HANDLE hFile,
-    LPSECURITY_ATTRIBUTES lpAttributes,
-    DWORD flProtect,
-    DWORD dwMaximumSizeHigh,
-    DWORD dwMaximumSizeLow,
-    LPCWSTR lpName)
-{
-    typedef HANDLE (__stdcall *P_CreateFileMappingW)(
-        HANDLE hFile,
-        LPSECURITY_ATTRIBUTES lpAttributes,
-        DWORD flProtect,
-        DWORD dwMaximumSizeHigh,
-        DWORD dwMaximumSizeLow,
-        LPCWSTR lpName);
-
-    return ((P_CreateFileMappingW)__sys_CreateFileMappingW)(
-        hFile, lpAttributes, flProtect,
-        dwMaximumSizeHigh, dwMaximumSizeLow, lpName);
-}
-
-
-//---------------------------------------------------------------------------
 // my_LogonUserW
 //---------------------------------------------------------------------------
 
@@ -125,7 +98,9 @@ int __stdcall WinMain(
     BOOL hook_success = TRUE;
     BOOL ok;
 
-    SetupExceptionHandler();
+    //while(!IsDebuggerPresent()) Sleep(500); __debugbreak();
+
+    Check_Windows_7();
 
     HOOK_WIN32(CoImpersonateClient);
     HOOK_WIN32(LogonUserW);

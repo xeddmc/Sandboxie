@@ -1,5 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
+ * Copyright 2020-2024 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -166,6 +167,7 @@ _FX WCHAR *Scm_GetServiceConfigString(SERVICE_QUERY_RPL *rpl, UCHAR type)
 {
     ULONG_PTR ptr;
 
+#ifndef _WIN64
     if (Dll_IsWow64) {
 
         //
@@ -181,7 +183,9 @@ _FX WCHAR *Scm_GetServiceConfigString(SERVICE_QUERY_RPL *rpl, UCHAR type)
         else if (type == 'P')
             ptr = (ULONG_PTR)cfg->lpBinaryPathName;
 
-    } else {
+    } else 
+#endif
+    {
 
         //
         // if not Wow64 then caller bitness matches bitness of SbieSvc
@@ -253,6 +257,7 @@ _FX void *Scm_QueryBoxedServiceByName(
             // lpLoadOrderGroup and lpDependencies
                            + sizeof(WCHAR) * 2;
 
+#ifndef _WIN64
         if (Dll_IsWow64) {
 
             //
@@ -266,6 +271,7 @@ _FX void *Scm_QueryBoxedServiceByName(
 
             service_config_len += 5 * sizeof(ULONG);
         }
+#endif
 
         //
         // DisplayName
@@ -338,19 +344,23 @@ _FX void *Scm_QueryBoxedServiceByName(
         service_config_len = sizeof(SERVICE_DESCRIPTION)
                            + (wcslen(ServiceNm) + 1) * sizeof(WCHAR);
 
+#ifndef _WIN64
         if (Dll_IsWow64) {
             // set up extra space for lpDescription
             service_config_len += sizeof(ULONG);
         }
+#endif
 
     } else if (with_service_config == SERVICE_CONFIG_FAILURE_ACTIONS) {
 
         service_config_len = sizeof(SERVICE_FAILURE_ACTIONS);
 
+#ifndef _WIN64
         if (Dll_IsWow64)  {
             // set up extra space for lpRebootMsg, lpCommand and lpsaActions
             service_config_len += 3 * sizeof(ULONG);
         }
+#endif
 
     } else if (with_service_config == 3 || with_service_config == 4) {
 
@@ -460,7 +470,7 @@ _FX void *Scm_QueryBoxedServiceByName(
         //
 
         ULONG pid;
-        WCHAR boxname[34];
+        WCHAR boxname[BOXNAME_COUNT];
         WCHAR imagename[96];
         ULONG session_id;
         WCHAR *ptr, *ptr2;
@@ -622,6 +632,7 @@ after_service_status:
         // for the pointer fields
         //
 
+#ifndef _WIN64
         if (Dll_IsWow64) {
 
             p_lpBinaryPathName = (ULONG_PTR *)(base +
@@ -637,7 +648,9 @@ after_service_status:
 
             next = (WCHAR *)(base + sizeof(QUERY_SERVICE_CONFIG_64));
 
-        } else {
+        } else 
+#endif
+        {
 
             p_lpBinaryPathName = (ULONG_PTR *)(base +
                 FIELD_OFFSET(QUERY_SERVICE_CONFIG, lpBinaryPathName));
@@ -713,8 +726,10 @@ after_service_status:
 
         ULONG_PTR base = (ULONG_PTR)&rpl->service_config;
         ULONG offset = sizeof(ULONG_PTR);
+#ifndef _WIN64
         if (Dll_IsWow64)
             offset += sizeof(ULONG);
+#endif
         *(ULONG_PTR *)base = offset;
         wcscpy((WCHAR *)(base + offset), ServiceNm);
     }
@@ -797,11 +812,11 @@ _FX void *Scm_QueryServiceByHandle(
 
 
 //---------------------------------------------------------------------------
-// Scm_QueryServiceStatusEx
+// Scm_QueryServiceStatusExImpl
 //---------------------------------------------------------------------------
 
 
-_FX BOOL Scm_QueryServiceStatusEx(
+_FX BOOL Scm_QueryServiceStatusExImpl(
     SC_HANDLE hService, SC_STATUS_TYPE InfoLevel,
     LPBYTE lpBuffer, DWORD cbBufSize, LPDWORD pcbBytesNeeded)
 {
@@ -830,20 +845,73 @@ _FX BOOL Scm_QueryServiceStatusEx(
 
 
 //---------------------------------------------------------------------------
+// Scm_HookQueryServiceStatusEx
+//---------------------------------------------------------------------------
+
+
+_FX ULONG_PTR Scm_HookQueryServiceStatusEx(VOID* hook)
+{
+	__my_QueryServiceStatusEx = hook;
+	return (ULONG_PTR)Scm_QueryServiceStatusExImpl;
+}
+
+
+//---------------------------------------------------------------------------
+// Scm_QueryServiceStatusEx
+//---------------------------------------------------------------------------
+
+
+_FX BOOL Scm_QueryServiceStatusEx(
+	SC_HANDLE hService, SC_STATUS_TYPE InfoLevel,
+	LPBYTE lpBuffer, DWORD cbBufSize, LPDWORD pcbBytesNeeded)
+{
+	if (__my_QueryServiceStatusEx)
+		return __my_QueryServiceStatusEx(hService, InfoLevel, lpBuffer, cbBufSize, pcbBytesNeeded);
+	return Scm_QueryServiceStatusExImpl(hService, InfoLevel, lpBuffer, cbBufSize, pcbBytesNeeded);
+}
+
+
+//---------------------------------------------------------------------------
+// Scm_QueryServiceStatusImpl
+//---------------------------------------------------------------------------
+
+
+_FX BOOL Scm_QueryServiceStatusImpl(
+    SC_HANDLE hService, SERVICE_STATUS *lpServiceStatus)
+{
+    SERVICE_STATUS_PROCESS status;
+    ULONG len = sizeof(SERVICE_STATUS_PROCESS);
+    BOOL ok = Scm_QueryServiceStatusExImpl(
+        hService, SC_STATUS_PROCESS_INFO, (BYTE *)&status, len, &len);
+    if (ok)
+        memcpy(lpServiceStatus, &status, sizeof(SERVICE_STATUS));
+    return ok;
+}
+
+
+//---------------------------------------------------------------------------
+// Scm_HookQueryServiceStatus
+//---------------------------------------------------------------------------
+
+
+_FX ULONG_PTR Scm_HookQueryServiceStatus(VOID* hook)
+{
+	__my_QueryServiceStatus = hook;
+	return (ULONG_PTR)Scm_QueryServiceStatusImpl;
+}
+
+
+//---------------------------------------------------------------------------
 // Scm_QueryServiceStatus
 //---------------------------------------------------------------------------
 
 
 _FX BOOL Scm_QueryServiceStatus(
-    SC_HANDLE hService, SERVICE_STATUS *lpServiceStatus)
+	SC_HANDLE hService, SERVICE_STATUS *lpServiceStatus)
 {
-    SERVICE_STATUS_PROCESS status;
-    ULONG len = sizeof(SERVICE_STATUS_PROCESS);
-    BOOL ok = Scm_QueryServiceStatusEx(
-        hService, SC_STATUS_PROCESS_INFO, (BYTE *)&status, len, &len);
-    if (ok)
-        memcpy(lpServiceStatus, &status, sizeof(SERVICE_STATUS));
-    return ok;
+	if (__my_QueryServiceStatus)
+		return __my_QueryServiceStatus(hService, lpServiceStatus);
+	return Scm_QueryServiceStatusImpl(hService, lpServiceStatus);
 }
 
 
@@ -870,6 +938,7 @@ _FX BOOL Scm_QueryServiceConfigW(
         return FALSE;
     }
 
+#ifndef _WIN64
     if (Dll_IsWow64) {
 
         //
@@ -928,7 +997,9 @@ _FX BOOL Scm_QueryServiceConfigW(
             *optr = L'\0';
         }
 
-    } else {
+    } else 
+#endif
+    {
 
         //
         // copy 32-bit QUERY_SERVICE_CONFIGW structure to caller
@@ -1212,19 +1283,19 @@ _FX BOOL Scm_EnumServicesStatusX(
     while (*names) {
 
         if (hService)
-            Scm_CloseServiceHandle(hService);
+            Scm_CloseServiceHandleImpl(hService);
 
         ServiceName = names;
         ServiceNameLen = wcslen(ServiceName) + 1;
         names += ServiceNameLen;
         ++idx;
 
-        hService = Scm_OpenServiceW(
+        hService = Scm_OpenServiceWImpl(
                         hSCManager, ServiceName, SERVICE_QUERY_STATUS);
         if (! hService)
             continue;
 
-        if (! Scm_QueryServiceStatusEx(
+        if (! Scm_QueryServiceStatusExImpl(
                 hService, SC_STATUS_PROCESS_INFO,
                 (BYTE *)&ss, sizeof(SERVICE_STATUS_PROCESS), &svclen))
             continue;
@@ -1322,7 +1393,7 @@ _FX BOOL Scm_EnumServicesStatusX(
     }
 
     if (hService)
-        Scm_CloseServiceHandle(hService);
+        Scm_CloseServiceHandleImpl(hService);
 
     Dll_Free(cfg);
 

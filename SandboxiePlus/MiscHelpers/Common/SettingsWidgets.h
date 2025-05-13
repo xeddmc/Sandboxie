@@ -13,7 +13,7 @@ public:
 		setPlainText(Lines.join("\r\n"));
 	}
 	QStringList			GetLines(){
-		return toPlainText().split(QRegExp("\r?\n"));
+		return toPlainText().split(QRegularExpression("\r?\n"));
 	}
 };
 
@@ -137,12 +137,16 @@ class MISCHELPERS_EXPORT CPathEdit: public CTxtEdit
 {
     Q_OBJECT
 public:
-	CPathEdit(bool bDirs = false, QWidget *parent = 0);
+	CPathEdit(bool bDirs = false, bool bCombo = false, QWidget *parent = 0);
 
 	QLineEdit*			GetEdit()						{return m_pEdit;}
+	QComboBox*			GetCombo()						{return m_pCombo;}
 
 	void				SetText(const QString& Text)	{m_pEdit->setText(Text);}
 	QString				GetText()						{return m_pEdit->text();}
+	void				SetDefault(const QString& Text)	{m_pEdit->setPlaceholderText(Text);}
+	void				SetWindowsPaths(bool bSet = true) {m_bWinPath = bSet;}
+	void				SetFilter(const QString& Filter) {m_Filter = Filter;}
 
 signals:
 	void				textChanged(const QString& text);
@@ -150,8 +154,11 @@ signals:
 private slots:
 	void				Browse();
 protected:
+	QString			m_Filter;
 	QLineEdit*		m_pEdit;
+	QComboBox*		m_pCombo;
 	bool			m_bDirs;
+	bool			m_bWinPath;
 };
 
 ///////////////////////////////////////////////////
@@ -192,6 +199,12 @@ public:
 
 	QVariant				GetData() {return itemData(currentIndex());}
 };
+
+void MISCHELPERS_EXPORT FixComboBoxEditing(QComboBox* pBox);
+void MISCHELPERS_EXPORT SetComboBoxValue(QComboBox* pBox, const QVariant& Value);
+QVariant MISCHELPERS_EXPORT GetComboBoxValue(QComboBox* pBox);
+void MISCHELPERS_EXPORT AddColoredComboBoxEntry(QComboBox* pBox, const QString& Text, const QColor& Color, const QVariant& Data = QVariant());
+void MISCHELPERS_EXPORT ColorComboBox(QComboBox* pBox);
 
 ///////////////////////////////////////////////////
 //
@@ -338,7 +351,7 @@ public:
 	{
 		QWidget* pWidget = new CActionWidget(pControll->parentWidget());
         QHBoxLayout* pLayout = new QHBoxLayout();
-		pLayout->setMargin(0);
+		pLayout->setContentsMargins(0,0,0,0);
 
 		if(!IconFile.isEmpty())
 		{
@@ -418,4 +431,43 @@ public:
 
 signals:
 	void checkStateChanged(int Index, Qt::CheckState state);
+};
+
+
+///////////////////////////////////////////////////
+// CConfigDialog
+
+
+class MISCHELPERS_EXPORT CConfigDialog : public QDialog
+{
+	Q_OBJECT
+
+public:
+	CConfigDialog(QWidget* parent = Q_NULLPTR);
+
+public slots:
+	void OnSearchOption();
+
+	void OnItemClicked(QTreeWidgetItem* pItem, int Column);
+
+protected:
+	QWidget* ConvertToTree(QTabWidget* pTabs);
+
+	QWidget* AddConfigSearch(QTabWidget* pTabs);
+
+	virtual void OnTab(QWidget* pTab) = 0;
+
+	QTabWidget* m_pTabs;
+
+	QStackedLayout* m_pStack;
+	QLineEdit* m_pSearch;
+	QTreeWidget* m_pTree;
+
+	QWidget* m_pCurrentTab;
+
+private:
+	int m_SearchI;
+	int m_SearchJ;
+	int m_SearchP;
+	QWidget* m_LastFound;
 };

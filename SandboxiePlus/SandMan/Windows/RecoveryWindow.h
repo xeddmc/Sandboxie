@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QtWidgets/QMainWindow>
+#include <QFileIconProvider>
 #include "ui_RecoveryWindow.h"
 #include "SbiePlusAPI.h"
 class CSimpleTreeModel;
@@ -35,23 +36,34 @@ class CRecoveryWindow : public QDialog
 	Q_OBJECT
 
 public:
-	CRecoveryWindow(const CSandBoxPtr& pBox, QWidget *parent = Q_NULLPTR);
+	CRecoveryWindow(const CSandBoxPtr& pBox, bool bImmediate = false, QWidget *parent = Q_NULLPTR);
 	~CRecoveryWindow();
+
+	bool		IsDeleteDialog() const;
+	bool		IsDeleteSnapshots() { return m_DeleteSnapshots; }
 
 	virtual void accept() {}
 	virtual void reject() { this->close(); }
+
+signals:
+	void		Closed();
 
 public slots:
 	int			exec();
 
 	int			FindFiles();
+	void		SelectFiles();
+	void		AddFile(const QString& FilePath, const QString& BoxPath);
 
 private slots:
 	void		OnAddFolder();
-	void		OnRecover()		{ RecoverFiles(false); }
-	void		OnRecoverTo()	{ RecoverFiles(true); }
+	void		OnRecover();
+	void		OnDelete();
+	void		OnTargetChanged();
 	void		OnDeleteAll();
-
+	void		OnDeleteEverything();
+	void		OnCloseUntil();
+	void		OnAutoDisable();
 	void		OnCount(quint32 fileCount, quint32 folderCount, quint64 totalSize);
 
 protected:
@@ -59,19 +71,38 @@ protected:
 
 	int			FindFiles(const QString& Folder);
 	int			FindBoxFiles(const QString& Folder);
-	int			FindFiles(const QString& RecParent, const QString& BoxedFolder, const QString& RealFolder);
+	QPair<int, quint64> FindFiles(const QString& BoxedFolder, const QString& RealFolder, const QString& Name, const QString& ParentID = QString());
 
-	void		RecoverFiles(bool bBrowse);
+	struct SRecItem {
+		QString FullPath;
+		QString RelPath;
+	};
+
+	QMap<QString, SRecItem> GetFiles();
+
+	void		RecoverFiles(bool bBrowse, QString RecoveryFolder = QString());
 
 	CSandBoxPtr m_pBox;
 
 	QMap<QVariant, QVariantMap> m_FileMap;
+	QSet<QString> m_NewFiles;
 
 	QStringList m_RecoveryFolders;
 
 	CRecoveryCounter* m_pCounter;
 
+	int m_LastTargetIndex;
+	bool m_bTargetsChanged;
+	bool m_bReloadPending;
+	bool m_DeleteSnapshots;
+	bool m_bImmediate;
+
 private:
 	Ui::RecoveryWindow ui;
+	QAction* m_pRemember;
+	
 	CSimpleTreeModel* m_pFileModel;
+	QSortFilterProxyModel*	m_pSortProxy;
+
+	QFileIconProvider m_IconProvider;
 };

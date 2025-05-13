@@ -1,5 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
+ * Copyright 2023 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -132,7 +133,9 @@ static LRESULT Gui_SendMessageA_MdiCreate(HWND hWnd, LPARAM lParam);
 
 static LRESULT Gui_DispatchMessage8(const MSG *lpmsg, ULONG IsAscii);
 
-static BOOLEAN Gui_Hook_DispatchMessage8(void);
+#ifndef _M_ARM64
+static BOOLEAN Gui_Hook_DispatchMessage8(HMODULE module);
+#endif
 
 static P_DispatchMessage8          __sys_DispatchMessage8       = 0;
 
@@ -160,7 +163,7 @@ BOOLEAN Gui_DispatchMessageCalled = FALSE;
 //---------------------------------------------------------------------------
 
 
-_FX BOOLEAN Gui_InitMsg(void)
+_FX BOOLEAN Gui_InitMsg(HMODULE module)
 {
     //
     // hook SendMessage and PostMessage family of functions
@@ -207,12 +210,24 @@ _FX BOOLEAN Gui_InitMsg(void)
 
 #else _WIN64
 
-    if (Dll_OsBuild < 8400) {
+    if (Dll_OsBuild >= 14942) { // Windows 10 1703 preview #7
+        HMODULE hWin32u = GetModuleHandleA("win32u.dll");
+        __sys_DispatchMessage8 = (P_DispatchMessage8)GetProcAddress(hWin32u, "NtUserDispatchMessage");
+        SBIEDLL_HOOK_GUI(DispatchMessage8);
+    }
+    else if (Dll_OsBuild < 8400) {
         SBIEDLL_HOOK_GUI(DispatchMessageA);
         SBIEDLL_HOOK_GUI(DispatchMessageW);
-
-    } else if (! Gui_Hook_DispatchMessage8())
+    }
+    else 
+#ifndef _M_ARM64
+    if (!Gui_Hook_DispatchMessage8(module))
+#endif
+    {
+        SbieApi_Log(2205, L"DispatchMessage8");
         return FALSE;
+    }
+   
 
 #endif _WIN64
 
@@ -343,7 +358,7 @@ _FX LRESULT Gui_SendMessageTimeoutW(
             // the window of the owner of the clipboard data, in order
             // to test if the window is not hung, and display or hide
             // the Paste menu command accordingly.  make sure the
-            // command is displayed even for windows ouside the sandbox
+            // command is displayed even for windows outside the sandbox
             //
 
             if (hWnd == __sys_GetClipboardOwner()) {
@@ -394,7 +409,7 @@ _FX LRESULT Gui_PostMessageA(
 {
     LRESULT lResult;
 
-    if (uMsg == WM_DDE_DATA)
+    if (Gui_UseProxyService && uMsg == WM_DDE_DATA)
         lResult = Gui_DDE_DATA_Posting(hWnd, wParam, lParam);
     else {
 
@@ -402,7 +417,7 @@ _FX LRESULT Gui_PostMessageA(
                         'pm a', hWnd, uMsg, wParam, lParam, 0, 0, NULL);
     }
 
-    if ((ULONG_PTR)hWnd != XFF4 && (ULONG_PTR)hWnd != XFF8) {
+    if (Gui_UseProxyService && (ULONG_PTR)hWnd != XFF4 && (ULONG_PTR)hWnd != XFF8) {
 
         //
         // for some messages, we have to pretend the post was successful,
@@ -432,7 +447,7 @@ _FX LRESULT Gui_PostMessageW(
 {
     LRESULT lResult;
 
-    if (uMsg == WM_DDE_DATA)
+    if (Gui_UseProxyService && uMsg == WM_DDE_DATA)
         lResult = Gui_DDE_DATA_Posting(hWnd, wParam, lParam);
     else {
 
@@ -440,7 +455,7 @@ _FX LRESULT Gui_PostMessageW(
                         'pm w', hWnd, uMsg, wParam, lParam, 0, 0, NULL);
     }
 
-    if ((ULONG_PTR)hWnd != XFF4 && (ULONG_PTR)hWnd != XFF8) {
+    if (Gui_UseProxyService && (ULONG_PTR)hWnd != XFF4 && (ULONG_PTR)hWnd != XFF8) {
 
         //
         // for some messages, we have to pretend the post was successful,
@@ -497,7 +512,7 @@ _FX LRESULT Gui_SendPostMessageCommon(
     // boundary of the job object) then issue a direct call
     //
 
-    if ((! hWnd) || Gui_IsSameBox(hWnd, NULL, NULL)) {
+    if ((! hWnd) || !Gui_UseProxyService || Gui_IsSameBox(hWnd, NULL, NULL)) {
 
         if (hWnd && (which == 'pm w' || which == 'pm a')
                  && (uMsg >= WM_DDE_FIRST && uMsg <= WM_DDE_LAST)) {
@@ -588,7 +603,10 @@ _FX LRESULT Gui_SendPostMessageMulti(
     parm.uTimeout = uTimeout;
     parm.lpdwResult = lpdwResult;
 
-    Gui_EnumWindows(Gui_SendPostMessageMultiCallback, (LPARAM)&parm);
+    if(!Gui_UseProxyService && __sys_EnumWindows)
+		__sys_EnumWindows(Gui_SendPostMessageMultiCallback, (LPARAM)&parm);
+    else
+        Gui_EnumWindows(Gui_SendPostMessageMultiCallback, (LPARAM)&parm);
 
     return 1;
 }
@@ -742,7 +760,8 @@ _FX BOOLEAN Gui_PostThreadMessage_Check(ULONG idThread, UINT uMsg)
     //
 
     HANDLE ThreadHandle;
-    WCHAR name[48];
+    WCHAR boxname[BOXNAME_COUNT];
+    WCHAR temp[48];
     NTSTATUS status;
     ULONG ProcessId;
     ULONG session_id;
@@ -762,12 +781,12 @@ _FX BOOLEAN Gui_PostThreadMessage_Check(ULONG idThread, UINT uMsg)
         return TRUE;
 
     status = SbieApi_QueryProcess((HANDLE)(ULONG_PTR)ProcessId,
-                                  name, NULL, NULL, &session_id);
+                                  boxname, NULL, NULL, &session_id);
     if (! NT_SUCCESS(status))
         goto fail;
     if (session_id != Dll_SessionId)
         goto fail;
-    if (_wcsicmp(name, Dll_BoxName) != 0)
+    if (_wcsicmp(boxname, Dll_BoxName) != 0)
         goto fail;
 
     return TRUE;
@@ -779,8 +798,8 @@ _FX BOOLEAN Gui_PostThreadMessage_Check(ULONG idThread, UINT uMsg)
 fail:
 
     if (Dll_OsBuild >= 8400 &&
-            __sys_GetClipboardFormatNameW((ATOM)uMsg, name, 40) &&
-            _wcsicmp(name, L"MSUIM.Msg.LangBarModal") == 0) {
+            __sys_GetClipboardFormatNameW((ATOM)uMsg, temp, 40) &&
+            _wcsicmp(temp, L"MSUIM.Msg.LangBarModal") == 0) {
 
         //
         // on Windows 8, winkey+space pops up an input language dialog box,
@@ -792,8 +811,8 @@ fail:
         return TRUE;
     }
 
-    Sbie_snwprintf(name, 48, L"$:TID=%08X:MSG=%08X", idThread, uMsg);
-    SbieApi_MonitorPut(MONITOR_WINCLASS | MONITOR_DENY, name);
+    Sbie_snwprintf(temp, 48, L"$:TID=%08X:MSG=%08X", idThread, uMsg);
+    SbieApi_MonitorPut2(MONITOR_WINCLASS | MONITOR_DENY, temp, FALSE);
 
     return FALSE;
 }
@@ -848,8 +867,9 @@ _FX LRESULT Gui_DispatchMessage8(const MSG *lpmsg, ULONG IsAscii)
 // Gui_Hook_DispatchMessage8
 //---------------------------------------------------------------------------
 
-
-_FX BOOLEAN Gui_Hook_DispatchMessage8(void)
+#ifndef _M_ARM64
+// $HookHack$ - Custom, not automated, Hook
+_FX BOOLEAN Gui_Hook_DispatchMessage8(HMODULE module)
 {
     //
     // on Windows 8, the DispatchMessageA and DispatchMessageW functions
@@ -866,16 +886,6 @@ _FX BOOLEAN Gui_Hook_DispatchMessage8(void)
 
     UCHAR *a = (UCHAR *)__sys_DispatchMessageA;
     UCHAR *w = (UCHAR *)__sys_DispatchMessageW;
-
-    if (Dll_OsBuild >= 14942) {
-
-        HMODULE hWin32u;
-
-        hWin32u = GetModuleHandleA("win32u.dll");
-        __sys_DispatchMessage8 = (P_DispatchMessage8)GetProcAddress(hWin32u, "NtUserDispatchMessage");
-        SBIEDLL_HOOK_GUI(DispatchMessage8);
-        return TRUE;
-    }
 
     if (*(ULONG *)a == 0x000001BA && *(USHORT *)w == 0xD233) {
 
@@ -904,10 +914,9 @@ _FX BOOLEAN Gui_Hook_DispatchMessage8(void)
         }
     }
 
-    SbieApi_Log(2205, L"DispatchMessage8");
     return FALSE;
 }
-
+#endif
 
 #endif _WIN64
 

@@ -1,6 +1,6 @@
 /*
  *
- * Copyright (c) 2020, David Xanatos
+ * Copyright (c) 2020-2022, David Xanatos
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -27,6 +27,10 @@ typedef HRESULT(*P_DwmGetWindowAttribute)(HWND hWnd, DWORD dwAttribute, void *pv
 
 struct SBoxBorder
 {
+	HANDLE hThread;
+	UINT_PTR dwTimerId;
+	int FastTimerStartTicks;
+
 	CSandBox* pCurrentBox;
 	COLORREF BorderColor;
 	int BorderMode;
@@ -51,12 +55,41 @@ struct SBoxBorder
 
 const WCHAR *Sandboxie_WindowClassName = L"Sandboxie_BorderWindow";
 
+
+void WINAPI CBoxBorder__TimerProc(HWND hwnd, UINT uMsg, UINT_PTR dwTimerID, DWORD dwTime)
+{
+	CBoxBorder* This = (CBoxBorder*)GetWindowLongPtr(hwnd, 0);
+	This->TimerProc();
+}
+
+DWORD WINAPI CBoxBorder__ThreadFunc(LPVOID lpParam)
+{
+	CBoxBorder* This = ((CBoxBorder*)lpParam);
+	This->ThreadFunc();
+	return 0;
+}
+
 CBoxBorder::CBoxBorder(CSbieAPI* pApi, QObject* parent) : QObject(parent)
 {
 	m_Api = pApi;
 
 	m = new SBoxBorder;
 
+	m->hThread = CreateThread(NULL, 0, CBoxBorder__ThreadFunc, this, 0, NULL);
+}
+
+CBoxBorder::~CBoxBorder()
+{
+	PostThreadMessage(GetThreadId(m->hThread), WM_QUIT, 0, 0);
+
+	if(WaitForSingleObject(m->hThread, 10*1000) == WAIT_TIMEOUT)
+		TerminateThread(m->hThread, 0);
+
+	delete m;
+}
+
+void CBoxBorder::ThreadFunc()
+{
 	m->pCurrentBox = NULL;
 	m->BorderColor = RGB(0, 0, 0);
 	m->BorderMode = 0;
@@ -72,7 +105,7 @@ CBoxBorder::CBoxBorder(CSbieAPI* pApi, QObject* parent) : QObject(parent)
 	m->ThumbWidth = GetSystemMetrics(SM_CXHTHUMB);
 	m->ThumbHeight = GetSystemMetrics(SM_CYVTHUMB);
 
-	HMODULE dwmapi = LoadLibrary(L"dwmapi.dll");
+	HMODULE dwmapi = LoadLibraryW(L"dwmapi.dll");
 	if (dwmapi) {
 		m->DwmIsCompositionEnabled = (P_DwmIsCompositionEnabled)GetProcAddress(dwmapi, "DwmIsCompositionEnabled");
 		if (m->DwmIsCompositionEnabled) {
@@ -82,12 +115,12 @@ CBoxBorder::CBoxBorder(CSbieAPI* pApi, QObject* parent) : QObject(parent)
 		}
 	}
 
-	WNDCLASSEX wc;
+	WNDCLASSEXW wc;
 	wc.cbSize = sizeof(WNDCLASSEX);
 	wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS | CS_GLOBALCLASS;
 	wc.lpfnWndProc = ::DefWindowProc;
 	wc.cbClsExtra = 0;
-	wc.cbWndExtra = 0;
+	wc.cbWndExtra = sizeof(ULONG_PTR);
 	wc.hInstance = NULL; // (HINSTANCE)::GetModuleHandle(NULL);
 	wc.hIcon = NULL; // ::LoadIcon(wc.hInstance, L"AAAPPICON");
 	wc.hCursor = NULL; // ::LoadCursor(NULL, IDC_ARROW);
@@ -95,9 +128,9 @@ CBoxBorder::CBoxBorder(CSbieAPI* pApi, QObject* parent) : QObject(parent)
 	wc.lpszMenuName = NULL;
 	wc.lpszClassName = Sandboxie_WindowClassName;
 	wc.hIconSm = NULL;
-	if (ATOM lpClassName = RegisterClassEx(&wc))
+	if (ATOM lpClassName = RegisterClassExW(&wc))
 	{
-		m->BorderWnd = CreateWindowEx(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, (LPCWSTR)lpClassName,
+		m->BorderWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, (LPCWSTR)lpClassName,
 			Sandboxie_WindowClassName, WS_POPUP | WS_CLIPSIBLINGS, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, NULL, NULL, NULL, NULL);
 	}
 	if (!m->BorderWnd)
@@ -106,26 +139,34 @@ CBoxBorder::CBoxBorder(CSbieAPI* pApi, QObject* parent) : QObject(parent)
 	SetLayeredWindowAttributes(m->BorderWnd, 0, 192, LWA_ALPHA);
 	::ShowWindow(m->BorderWnd, SW_HIDE);
 
-	m_uTimerID = startTimer(10);
-}
+	SetWindowLongPtr(m->BorderWnd, 0, ULONG_PTR(this));
 
-CBoxBorder::~CBoxBorder()
-{
-	killTimer(m_uTimerID);
+	m->FastTimerStartTicks = 0;
+	m->dwTimerId = SetTimer(m->BorderWnd, 0, 100, CBoxBorder__TimerProc);
+
+	MSG  msg;
+	while (GetMessage(&msg, NULL, 0, 0))
+	{
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+
+	KillTimer(m->BorderWnd, m->dwTimerId);
 
 	if (m->BorderWnd) 
 	{
 		DestroyWindow(m->BorderWnd);
 		m->BorderWnd = NULL;
 	}
-
-	delete m;
 }
 
-void CBoxBorder::timerEvent(QTimerEvent* pEvent)
+void CBoxBorder::TimerProc() 
 {
-	if (pEvent->timerId() != m_uTimerID)
+    if (m->FastTimerStartTicks && GetTickCount() - m->FastTimerStartTicks >= 1000) {
+        m->FastTimerStartTicks = 0;
+        m->dwTimerId = SetTimer(m->BorderWnd, m->dwTimerId, 100, CBoxBorder__TimerProc);
 		return;
+    }
 
 	HWND hWnd = GetForegroundWindow();
 	if (!hWnd)
@@ -199,8 +240,18 @@ void CBoxBorder::timerEvent(QTimerEvent* pEvent)
 	{
 		RECT rect;
 		GetActiveWindowRect(hWnd, &rect);
-		if (NothingChanged(hWnd, &rect, pid))
-			return;
+
+		if (pid == m->ActivePid && hWnd == m->ActiveWnd) {
+			if (memcmp(&rect, &m->ActiveRect, sizeof(RECT)) == 0) { // sane rect
+				if (!m->TitleState || m->TitleState == (CheckMousePointer() ? 1 : -1))
+					return;
+			} 
+			else { // window is being moved, increase refresh speed
+                if (! m->FastTimerStartTicks)
+                    m->dwTimerId = SetTimer(m->BorderWnd, m->dwTimerId, 10, CBoxBorder__TimerProc);
+                m->FastTimerStartTicks = GetTickCount();
+            }
+		}
 
 		if (m->IsBorderVisible)
 			::ShowWindow(m->BorderWnd, SW_HIDE);
@@ -224,8 +275,8 @@ void CBoxBorder::timerEvent(QTimerEvent* pEvent)
 
 		const RECT *Desktop = &Monitor.rcMonitor;
 		if (rect.left <= Desktop->left  && rect.top <= Desktop->top    &&
-		  rect.right >= Desktop->right && rect.bottom >= Desktop->bottom &&
-		  (Style & WS_CAPTION) != WS_CAPTION) 
+			rect.right >= Desktop->right && rect.bottom >= Desktop->bottom &&
+			(Style & WS_CAPTION) != WS_CAPTION) 
 			return;
 
 		if (m->BorderMode == 2) {
@@ -233,24 +284,36 @@ void CBoxBorder::timerEvent(QTimerEvent* pEvent)
 				return;
 		}
 
-		Desktop = &Monitor.rcWork;
 
 		int ax = rect.left;
-		if (ax < Desktop->left)
+		if (rect.left < Desktop->left && (Desktop->left - rect.left) < (m->BorderWidth + 4))
 			ax = Desktop->left;
+
 		int ay = rect.top;
-		if (ay < Desktop->top)
+		if (rect.top < Desktop->top && (Desktop->top - rect.top) < (m->BorderWidth + 4))
 			ay = Desktop->top;
+
 		int aw = -ax;
-		if (rect.right <= Desktop->right)
-			aw += rect.right;
-		else
+		if (rect.right > Desktop->right && (rect.right - Desktop->right) < (m->BorderWidth + 4))
 			aw += Desktop->right;
-		int ah = -ay;
-		if (rect.bottom <= Desktop->bottom)
-			ah += rect.bottom;
 		else
+			aw += rect.right;
+
+		int ah = -ay;
+		if (rect.bottom > Desktop->bottom && (rect.bottom - Desktop->bottom) < (m->BorderWidth + 4))
 			ah += Desktop->bottom;
+		else
+			ah += rect.bottom;
+
+
+		// 
+		// in windows 10 and 11 if this is truly fullscreen the taskbar does not appear when hidden
+		// if its 1 px less on any side it works normally, so we pick bottom as that's where the taskbar usually is
+		// but with the taskbar to the side it would also work
+		//
+
+		if (rect.bottom == Monitor.rcWork.bottom) 
+			ah -= 1;
 
 
 		POINT Points[10];
@@ -277,17 +340,7 @@ void CBoxBorder::timerEvent(QTimerEvent* pEvent)
 
 		m->IsBorderVisible = TRUE;
 	}
-}
 
-bool CBoxBorder::NothingChanged(struct HWND__* hWnd, struct tagRECT* rect, quint32 pid)
-{
-	if (pid == m->ActivePid && hWnd == m->ActiveWnd) {
-		if (memcmp(rect, &m->ActiveRect, sizeof(RECT)) == 0) {
-			if (!m->TitleState || m->TitleState == (CheckMousePointer() ? 1 : -1))
-				return true;
-		}
-	}
-	return false;
 }
 
 void CBoxBorder::GetActiveWindowRect(struct HWND__* hWnd, struct tagRECT* rect)

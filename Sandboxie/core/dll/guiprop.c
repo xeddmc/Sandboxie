@@ -72,7 +72,9 @@ static ULONG Gui_SetWindowLongA(HWND hWnd, int nIndex, ULONG dwNew);
 static ULONG_PTR Gui_SetWindowLong8(
     HWND hWnd, int nIndex, ULONG_PTR dwNew, ULONG IsAscii);
 
-static BOOLEAN Gui_Hook_SetWindowLong8(void);
+#ifndef _M_ARM64
+static BOOLEAN Gui_Hook_SetWindowLong8(HMODULE module);
+#endif
 
 static ULONG Gui_GetClassLongW(HWND hWnd, int nIndex);
 
@@ -93,7 +95,9 @@ static ULONG_PTR Gui_SetWindowLongPtrA(
 static ULONG_PTR Gui_SetWindowLongPtr8(
     HWND hWnd, int nIndex, ULONG_PTR dwNew, ULONG IsAscii);
 
-static BOOLEAN Gui_Hook_SetWindowLongPtr8(void);
+#ifndef _M_ARM64
+static BOOLEAN Gui_Hook_SetWindowLongPtr8(HMODULE module);
+#endif
 
 static ULONG_PTR Gui_GetClassLongPtrW(HWND hWnd, int nIndex);
 
@@ -134,7 +138,7 @@ static P_SetWindowLongPtr8         __sys_SetWindowLongPtr8      = 0;
 //---------------------------------------------------------------------------
 
 
-_FX BOOLEAN Gui_InitProp(void)
+_FX BOOLEAN Gui_InitProp(HMODULE module)
 {
     //
     // initialize our Drag-n-Drop atoms
@@ -146,6 +150,9 @@ _FX BOOLEAN Gui_InitProp(void)
     // hook functions
     //
 
+    // DisableComProxy BEGIN
+    if (!SbieApi_QueryConfBool(NULL, L"DisableComProxy", FALSE))
+    // DisableComProxy END
     if (! SbieDll_IsOpenCOM()) {
 
         //
@@ -172,13 +179,25 @@ _FX BOOLEAN Gui_InitProp(void)
 
 #ifdef _WIN64
 
-        // new style hook on SetWindowLong on 64-bit Windows 8.1 and later
-        if (Dll_OsBuild < 9600) {
+        if (Dll_OsBuild >= 14942) { // Windows 10 1703 preview #7
+            HMODULE hWin32u = GetModuleHandleA("win32u.dll");
+            __sys_SetWindowLong8 = (P_SetWindowLong8) GetProcAddress(hWin32u, "NtUserSetWindowLong");
+            SBIEDLL_HOOK_GUI(SetWindowLong8);
+        }
+        else if (Dll_OsBuild < 9600) {
             SBIEDLL_HOOK_GUI(SetWindowLongA);
             SBIEDLL_HOOK_GUI(SetWindowLongW);
 
-        } else if (! Gui_Hook_SetWindowLong8())
+        } 
+        else
+#ifndef _M_ARM64
+        // new style hook on SetWindowLong on 64-bit Windows 8.1 and later
+        if (! Gui_Hook_SetWindowLong8(module))
+#endif
+        {
+            SbieApi_Log(2205, L"SetWindowLong8");
             return FALSE;
+        }
 
 #else ! _WIN64
 
@@ -196,13 +215,25 @@ _FX BOOLEAN Gui_InitProp(void)
         SBIEDLL_HOOK_GUI(GetWindowLongPtrA);
         SBIEDLL_HOOK_GUI(GetWindowLongPtrW);
 
-        // special hook on SetWindowLongPtr on 64-bit Windows 8 and later
-        if (Dll_OsBuild < 8400) {
+        if (Dll_OsBuild >= 14942) { // Windows 10 1703 preview #7
+            HMODULE hWin32u = GetModuleHandleA("win32u.dll");
+            __sys_SetWindowLongPtr8 = (P_SetWindowLongPtr8) GetProcAddress(hWin32u,"NtUserSetWindowLongPtr");
+            SBIEDLL_HOOK_GUI(SetWindowLongPtr8);
+        }
+        else if (Dll_OsBuild < 8400) {
             SBIEDLL_HOOK_GUI(SetWindowLongPtrA);
             SBIEDLL_HOOK_GUI(SetWindowLongPtrW);
 
-        } else if (! Gui_Hook_SetWindowLongPtr8())
+        } 
+        else 
+#ifndef _M_ARM64
+        // special hook on SetWindowLongPtr on 64-bit Windows 8 and later
+        if (! Gui_Hook_SetWindowLongPtr8(module))
+#endif
+        {
+            SbieApi_Log(2205, L"SetWindowLongPtr8");
             return FALSE;
+        }
 
         SBIEDLL_HOOK_GUI(GetClassLongPtrA);
         SBIEDLL_HOOK_GUI(GetClassLongPtrW);
@@ -378,16 +409,16 @@ _FX HANDLE Gui_GetPropW(HWND hWnd, const WCHAR *lpString)
 
         ULONG LastError = GetLastError();
 
-        if (! Gui_IsWindowAccessible(hWnd)) {
-            if (hWnd != __sys_GetDesktopWindow()) {
-                SetLastError(ERROR_INVALID_WINDOW_HANDLE);
-                return NULL;
-            }
+        BOOLEAN IsDesktop = (hWnd == __sys_GetDesktopWindow());
+
+        if (! Gui_IsWindowAccessible(hWnd) && !IsDesktop) {
+            SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+            return NULL;
         }
 
         lpString = Gui_ReplaceAtom(lpString);
 
-        if (Gui_IsSameBox(hWnd, NULL, NULL))
+        if (!Gui_UseProxyService || Gui_IsSameBox(hWnd, NULL, NULL) || IsDesktop)
             return __sys_GetPropW(hWnd, lpString);
         else
             return Gui_GetPropCommon(hWnd, lpString, TRUE, LastError);
@@ -419,16 +450,16 @@ _FX HANDLE Gui_GetPropA(HWND hWnd, const UCHAR *lpString)
 
         ULONG LastError = GetLastError();
 
-        if (! Gui_IsWindowAccessible(hWnd)) {
-            if (hWnd != __sys_GetDesktopWindow()) {
-                SetLastError(ERROR_INVALID_WINDOW_HANDLE);
-                return NULL;
-            }
+        BOOLEAN IsDesktop = (hWnd == __sys_GetDesktopWindow());
+
+        if (! Gui_IsWindowAccessible(hWnd) && !IsDesktop) {
+            SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+            return NULL;
         }
 
         lpString = Gui_ReplaceAtom(lpString);
 
-        if (Gui_IsSameBox(hWnd, NULL, NULL))
+        if (!Gui_UseProxyService || Gui_IsSameBox(hWnd, NULL, NULL) || IsDesktop)
             return __sys_GetPropA(hWnd, lpString);
         else
             return Gui_GetPropCommon(hWnd, lpString, TRUE, LastError);
@@ -539,7 +570,7 @@ _FX ULONG_PTR Gui_GetLongCommon(HWND hWnd, int nIndex, ULONG which)
     ULONG_PTR result;
     ULONG LastError = GetLastError();
 
-    if (Gui_IsSameBox(hWnd, NULL, NULL)) {
+    if (!Gui_UseProxyService || Gui_IsSameBox(hWnd, NULL, NULL)) {
 
         //
         // if target window is in the same sandbox (i.e. within the
@@ -1049,8 +1080,9 @@ _FX ULONG_PTR Gui_SetWindowLong8(
 // Gui_Hook_SetWindowLong8
 //---------------------------------------------------------------------------
 
-
-_FX BOOLEAN Gui_Hook_SetWindowLong8(void)
+#ifndef _M_ARM64
+// $HookHack$ - Custom, not automated, Hook
+_FX BOOLEAN Gui_Hook_SetWindowLong8(HMODULE module)
 {
     //
     // on Windows 8.1, the SetWindowLongA and SetWindowLongW functions
@@ -1067,16 +1099,6 @@ _FX BOOLEAN Gui_Hook_SetWindowLong8(void)
 
     UCHAR *a = (UCHAR *)__sys_SetWindowLongA;
     UCHAR *w = (UCHAR *)__sys_SetWindowLongW;
-
-    if (Dll_OsBuild >= 14942) {
-
-        HMODULE hWin32u;
-
-        hWin32u = GetModuleHandleA("win32u.dll");
-        __sys_SetWindowLong8 = (P_SetWindowLong8) GetProcAddress(hWin32u, "NtUserSetWindowLong");
-        SBIEDLL_HOOK_GUI(SetWindowLong8);
-        return TRUE;
-    }
 
     if (*(ULONG *)a == 0x0001B941 && *(ULONG *)w == 0xE9C93345) {
 
@@ -1105,10 +1127,9 @@ _FX BOOLEAN Gui_Hook_SetWindowLong8(void)
         return TRUE;
     }
     
-    SbieApi_Log(2205, L"SetWindowLong8");
     return FALSE;
 }
-
+#endif
 
 //---------------------------------------------------------------------------
 // Gui_SetWindowLongPtr8
@@ -1149,8 +1170,9 @@ _FX ULONG_PTR Gui_SetWindowLongPtr8(
 // Gui_Hook_SetWindowLongPtr8
 //---------------------------------------------------------------------------
 
-
-_FX BOOLEAN Gui_Hook_SetWindowLongPtr8(void)
+#ifndef _M_ARM64
+// $HookHack$ - Custom, not automated, Hook
+_FX BOOLEAN Gui_Hook_SetWindowLongPtr8(HMODULE module)
 {
     //
     // on Windows 8, the SetWindowLongPtrA and SetWindowLongPtrW functions
@@ -1168,14 +1190,6 @@ _FX BOOLEAN Gui_Hook_SetWindowLongPtr8(void)
     UCHAR *a = (UCHAR *)__sys_SetWindowLongPtrA;
     UCHAR *w = (UCHAR *)__sys_SetWindowLongPtrW;
 
-    if (Dll_OsBuild >= 14942) {
-        HMODULE hWin32u;
-        hWin32u = GetModuleHandleA("win32u.dll");
-        __sys_SetWindowLongPtr8 = (P_SetWindowLongPtr8) GetProcAddress(hWin32u,"NtUserSetWindowLongPtr");
-        SBIEDLL_HOOK_GUI(SetWindowLongPtr8);
-        return TRUE;
-    }
-
     if (*(ULONG *)a == 0x0001B941 && *(ULONG *)w == 0xE9C93345) {
 
         LONG a_offset = *(LONG *)(a + 7);
@@ -1192,10 +1206,9 @@ _FX BOOLEAN Gui_Hook_SetWindowLongPtr8(void)
         }
     }
 
-    SbieApi_Log(2205, L"SetWindowLongPtr8");
     return FALSE;
 }
-
+#endif
 
 //---------------------------------------------------------------------------
 // End 64-bit Get/SetWindowLongPtr functions

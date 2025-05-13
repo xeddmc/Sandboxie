@@ -1,6 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
- * Copyright 2020-2021 David Xanatos, xanasoft.com
+ * Copyright 2020-2024 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -48,8 +48,10 @@ extern __declspec(dllexport) int __CRTDECL Sbie_snprintf(char *_Buffer, size_t C
 #define TRUE_NAME_BUFFER        0
 #define COPY_NAME_BUFFER        1
 #define TMPL_NAME_BUFFER        2
-#define NAME_BUFFER_COUNT       3
-#define NAME_BUFFER_DEPTH       12
+#define NORM_NAME_BUFFER        3
+#define MISC_NAME_BUFFER        4 // 5 - 11
+#define NAME_BUFFER_COUNT       12
+#define NAME_BUFFER_DEPTH       16
 
 
 #ifdef _WIN64
@@ -61,7 +63,7 @@ extern __declspec(dllexport) int __CRTDECL Sbie_snprintf(char *_Buffer, size_t C
 #ifdef _WIN64
 
 // Pointer to 64-bit PEB_LDR_DATA is at offset 0x0018 of 64-bit PEB
-#define GET_ADDR_OF_PEB __readgsqword(0x60)
+#define GET_ADDR_OF_PEB NtCurrentPeb()
 #define GET_PEB_LDR_DATA (*(PEB_LDR_DATA **)(GET_ADDR_OF_PEB + 0x18))
 #define GET_PEB_IMAGE_BASE (*(ULONG_PTR *)(GET_ADDR_OF_PEB + 0x10))
 #define GET_PEB_MAJOR_VERSION (*(USHORT *)(GET_ADDR_OF_PEB + 0x118))
@@ -108,8 +110,11 @@ enum {
     DLL_IMAGE_ACROBAT_READER,
     DLL_IMAGE_OFFICE_OUTLOOK,
     DLL_IMAGE_OFFICE_EXCEL,
-    DLL_IMAGE_FLASH_PLAYER_SANDBOX,
+    DLL_IMAGE_FLASH_PLAYER_SANDBOX, // obsolete
     DLL_IMAGE_PLUGIN_CONTAINER,
+    DLL_IMAGE_OTHER_WEB_BROWSER,
+    DLL_IMAGE_OTHER_MAIL_CLIENT,
+    DLL_IMAGE_MOZILLA_THUNDERBIRD,
     DLL_IMAGE_LAST
 };
 
@@ -149,6 +154,7 @@ typedef struct _MY_LDR_WORKER_QUEUE_STUFF {
 }MY_LDR_WORKER_QUEUE_STUFF;
 #endif
 */
+
 typedef struct _THREAD_DATA {
 
     //
@@ -157,7 +163,8 @@ typedef struct _THREAD_DATA {
 
     WCHAR *name_buffer[NAME_BUFFER_COUNT][NAME_BUFFER_DEPTH];
     ULONG name_buffer_len[NAME_BUFFER_COUNT][NAME_BUFFER_DEPTH];
-    int depth;
+    int name_buffer_count[NAME_BUFFER_DEPTH];
+    int name_buffer_depth;
 
     //
     // locks
@@ -180,6 +187,12 @@ typedef struct _THREAD_DATA {
     ULONG file_dont_strip_write_access;
 
     //
+    // misc modules
+    //
+
+    HANDLE  scm_last_own_token;
+
+    //
     // proc module:  image path for a child process being started
     //
 
@@ -187,6 +200,7 @@ typedef struct _THREAD_DATA {
     BOOLEAN         proc_create_process_capture_image;
     BOOLEAN         proc_create_process_force_elevate;
     BOOLEAN         proc_create_process_as_invoker;
+    BOOLEAN         proc_create_process_fake_admin;
     BOOLEAN         proc_image_is_copy;
     WCHAR          *proc_image_path;
     WCHAR          *proc_command_line;
@@ -206,6 +220,8 @@ typedef struct _THREAD_DATA {
 
     ULONG           gui_create_window;
 
+    BOOLEAN         gui_hooks_installed;
+
     BOOL            gui_should_suppress_msgbox;
 
     //
@@ -217,6 +233,11 @@ typedef struct _THREAD_DATA {
     ULONG           SizeofPortMsg;
     BOOLEAN         bOperaFileDlgThread;
 
+    //
+    // rpc module
+    //
+
+    ULONG_PTR       rpc_caller;
 
 } THREAD_DATA;
 
@@ -232,17 +253,28 @@ extern HINSTANCE Dll_Instance;
 extern HMODULE Dll_Ntdll;
 extern HMODULE Dll_Kernel32;
 extern HMODULE Dll_KernelBase;
+extern HMODULE Dll_Win32u;
+// $Workaround$ - 3rd party fix
 extern HMODULE Dll_DigitalGuardian;
 
 extern const WCHAR *Dll_BoxName;
 extern const WCHAR *Dll_ImageName;
 extern const WCHAR *Dll_SidString;
 
+extern const WCHAR *Dll_HomeNtPath;
+extern ULONG Dll_HomeNtPathLen;
+extern const WCHAR *Dll_HomeDosPath;
+//extern ULONG Dll_HomeDosPathLen;
+
 extern const WCHAR *Dll_BoxFilePath;
+extern const WCHAR *Dll_BoxFileRawPath; // not reparsed nt path
+extern const WCHAR *Dll_BoxFileDosPath;
 extern const WCHAR *Dll_BoxKeyPath;
 extern const WCHAR *Dll_BoxIpcPath;
 
 extern ULONG Dll_BoxFilePathLen;
+extern ULONG Dll_BoxFileRawPathLen;
+extern ULONG Dll_BoxFileDosPathLen;
 extern ULONG Dll_BoxKeyPathLen;
 extern ULONG Dll_BoxIpcPathLen;
 extern ULONG Dll_SidStringLen;
@@ -250,14 +282,27 @@ extern ULONG Dll_SidStringLen;
 extern ULONG Dll_ProcessId;
 extern ULONG Dll_SessionId;
 
+extern ULONG Dll_DriverFlags;
 extern ULONG64 Dll_ProcessFlags;
 
+#ifndef _WIN64
 extern BOOLEAN Dll_IsWow64;
+#endif
+#ifdef _M_ARM64EC
+extern BOOLEAN Dll_IsArm64ec;
+#endif
+#ifndef _WIN64
+extern BOOLEAN Dll_IsXtAjit;
+#endif
 extern BOOLEAN Dll_IsSystemSid;
 extern BOOLEAN Dll_InitComplete;
+extern BOOLEAN Dll_EntryComplete;
 extern BOOLEAN Dll_RestrictedToken;
+extern BOOLEAN Dll_AppContainerToken;
 extern BOOLEAN Dll_ChromeSandbox;
 extern BOOLEAN Dll_FirstProcessInBox;
+extern BOOLEAN Dll_CompartmentMode;
+//extern BOOLEAN Dll_AlernateIpcNaming;
 
 extern ULONG Dll_ImageType;
 
@@ -267,6 +312,10 @@ extern ULONG Dll_Windows;
 extern PSECURITY_DESCRIPTOR Secure_NormalSD;
 extern PSECURITY_DESCRIPTOR Secure_EveryoneSD;
 
+extern BOOLEAN Secure_CopyACLs;
+
+extern BOOLEAN Secure_FakeAdmin;
+
 extern BOOLEAN Ldr_BoxedImage;
 
 extern WCHAR *Ldr_ImageTruePath;
@@ -274,6 +323,10 @@ extern WCHAR *Ldr_ImageTruePath;
 extern BOOLEAN Ipc_OpenCOM;
 
 extern const WCHAR *Scm_CryptSvc;
+
+extern BOOLEAN Dll_SbieTrace;
+extern BOOLEAN Dll_ApiTrace;
+extern BOOLEAN Dll_FileTrace;
 
 
 //---------------------------------------------------------------------------
@@ -297,6 +350,7 @@ extern const WCHAR *DllName_secur32;
 extern const WCHAR *DllName_sspicli;
 extern const WCHAR *DllName_mscoree;
 extern const WCHAR *DllName_ntmarta;
+extern const WCHAR *DllName_winmm;
 
 
 #define DllName_ole32_or_combase \
@@ -321,9 +375,20 @@ void Dll_FreeCode128(void *ptr);
 THREAD_DATA *Dll_GetTlsData(ULONG *pLastError);
 void Dll_FreeTlsData(void);
 
+//#define NAME_BUFFER_DEBUG
+#ifdef NAME_BUFFER_DEBUG
+WCHAR *Dll_GetTlsNameBuffer_(THREAD_DATA *data, ULONG which, ULONG size, char* func);
+void Dll_PushTlsNameBuffer_(THREAD_DATA *data, char* func);
+void Dll_PopTlsNameBuffer_(THREAD_DATA *data, char* func);
+#define Dll_GetTlsNameBuffer(x,y,z) Dll_GetTlsNameBuffer_(x, y, z, __FUNCTION__)
+#define Dll_PushTlsNameBuffer(x) Dll_PushTlsNameBuffer_(x, __FUNCTION__)
+#define Dll_PopTlsNameBuffer(x) Dll_PopTlsNameBuffer_(x, __FUNCTION__)
+#else
 WCHAR *Dll_GetTlsNameBuffer(THREAD_DATA *data, ULONG which, ULONG size);
 void Dll_PushTlsNameBuffer(THREAD_DATA *data);
 void Dll_PopTlsNameBuffer(THREAD_DATA *data);
+#endif
+
 
 
 //---------------------------------------------------------------------------
@@ -339,18 +404,10 @@ ULONG SbieDll_MatchPath(WCHAR path_code, const WCHAR *path);
 
 ULONG SbieDll_MatchPath2(WCHAR path_code, const WCHAR *path, BOOLEAN bCheckObjectExists, BOOLEAN bMonitorLog);
 
-#define PATH_OPEN_FLAG      0x10
-#define PATH_CLOSED_FLAG    0x20
-#define PATH_WRITE_FLAG     0x40
+void SbieDll_GetReadablePaths(WCHAR path_code, LIST **lists);
+void SbieDll_ReleaseFilePathLock();
 
-#define PATH_IS_OPEN(f)     (((f) & PATH_OPEN_FLAG) != 0)
-#define PATH_NOT_OPEN(f)    (((f) & PATH_OPEN_FLAG) == 0)
-
-#define PATH_IS_CLOSED(f)   (((f) & PATH_CLOSED_FLAG) != 0)
-#define PATH_NOT_CLOSED(f)  (((f) & PATH_CLOSED_FLAG) == 0)
-
-#define PATH_IS_WRITE(f)    (((f) & PATH_WRITE_FLAG) != 0)
-#define PATH_NOT_WRITE(f)   (((f) & PATH_WRITE_FLAG) == 0)
+BOOLEAN SbieDll_HasReadableSubPath(WCHAR path_code, const WCHAR* TruePath);
 
 
 //---------------------------------------------------------------------------
@@ -359,6 +416,8 @@ ULONG SbieDll_MatchPath2(WCHAR path_code, const WCHAR *path, BOOLEAN bCheckObjec
 
 
 void Dll_InitExeEntry(void);
+
+ULONG Dll_GetImageType(const WCHAR* ImageName);
 
 int Dll_NlsStrCmp(const WCHAR *s1, const WCHAR *s2, ULONG len);
 
@@ -371,14 +430,13 @@ NTSTATUS Dll_GetCurrentSidString(UNICODE_STRING *SidString);
 // Functions (dllhook)
 //---------------------------------------------------------------------------
 
-NTSTATUS Dll_GetSettingsForImageName(
-    const WCHAR* setting, WCHAR* value, ULONG value_size, const WCHAR* deftext);
-
 BOOLEAN Dll_SkipHook(const WCHAR *HookName);
 
 void *Dll_JumpStub(void *OldCode, void *NewCode, ULONG_PTR StubArg);
 
+#if !defined(_M_ARM64EC)
 ULONG_PTR *Dll_JumpStubData(void);
+#endif
 
 ULONG_PTR *Dll_JumpStubDataForCode(void *StubCode);
 
@@ -413,7 +471,7 @@ NTSTATUS Pipe_NtCreateFile(
     void *EaBuffer,
     ULONG EaLength);
 
-void File_DuplicateRecover(HANDLE OldFileHandle, HANDLE NewFileHandle);
+void Handle_SetupDuplicate(HANDLE OldFileHandle, HANDLE NewFileHandle);
 
 void File_DoAutoRecover(BOOLEAN force);
 
@@ -446,6 +504,7 @@ BOOLEAN File_IsBlockedNetParam(const WCHAR *BoxName);
 
 void File_GetSetDeviceMap(WCHAR *DeviceMap96);
 
+void File_NotifyRecover(HANDLE FileHandle, void* CloseParams);
 
 //---------------------------------------------------------------------------
 // Functions (key)
@@ -459,7 +518,7 @@ NTSTATUS Key_MarkDeletedAndClose(HANDLE KeyHandle);
 
 void Key_DiscardMergeByPath(const WCHAR *TruePath, BOOLEAN Recurse);
 
-void Key_NtClose(HANDLE KeyHandle);
+void Key_NtClose(HANDLE KeyHandle, void* CloseParams);
 
 HANDLE Key_GetTrueHandle(HANDLE KeyHandle, BOOLEAN *pIsOpenPath);
 
@@ -472,6 +531,8 @@ NTSTATUS Key_OpenOrCreateIfBoxed(
 void Key_DeleteValueFromCLSID(
     const WCHAR *Xxxid, const WCHAR *Guid, const WCHAR *ValueName);
 
+void Key_CreateBaseKeys();
+void File_CreateBaseFolders();
 
 //---------------------------------------------------------------------------
 // Functions (sxs)
@@ -481,6 +542,9 @@ void Key_DeleteValueFromCLSID(
 void Sxs_ActivateDefaultManifest(void *ImageBase);
 
 ULONG Sxs_CheckManifestForCreateProcess(const WCHAR *DosPath);
+
+ULONG Sxs_CheckManifestForElevation(const WCHAR* DosPath,
+    BOOLEAN* pAsInvoker, BOOLEAN* pRequireAdministrator, BOOLEAN* pHighestAvailable);
 
 BOOLEAN Sxs_KeyCallback(const WCHAR *path, HANDLE *out_handle);
 
@@ -495,9 +559,7 @@ BOOLEAN Sxs_FileCallback(const WCHAR *path, HANDLE *out_handle);
 HANDLE Scm_OpenKeyForService(
     const WCHAR *ServiceName, BOOLEAN ForWrite);
 
-BOOLEAN Scm_SecHostDll(HMODULE);
-
-void Scm_SecHostDll_W8(void);
+BOOLEAN SecHost_Init(HMODULE);
 
 
 //---------------------------------------------------------------------------
@@ -517,7 +579,7 @@ void Gui_AllowSetForegroundWindow(void);
 
 void Gdi_SplWow64(BOOLEAN Register);
 
-BOOLEAN Gdi_InitZero(void);
+BOOLEAN Gdi_InitZero(HMODULE module);
 
 void Gui_ResetClipCursor(void);
 
@@ -540,6 +602,8 @@ ULONG_PTR ProtectCall4(
     void *CallAddress,
     ULONG_PTR Arg1, ULONG_PTR Arg2, ULONG_PTR Arg3, ULONG_PTR Arg4);
 
+BOOL SH32_BreakoutDocument(const WCHAR* path, ULONG len);
+
 BOOL SH32_DoRunAs(
     const WCHAR *CmdLine, const WCHAR *WorkDir,
     PROCESS_INFORMATION *pi, BOOL *cancelled);
@@ -560,17 +624,22 @@ void Secure_InitSecurityDescriptors(void);
 
 BOOLEAN Secure_IsRestrictedToken(BOOLEAN CheckThreadToken);
 
+BOOLEAN Secure_IsAppContainerToken(HANDLE hToken);
+
 BOOLEAN Secure_IsLocalSystemToken(BOOLEAN CheckThreadToken);
 
 BOOL Proc_ImpersonateSelf(BOOLEAN Enable);
 
 BOOLEAN Taskbar_SHCore_Init(HMODULE hmodule);
 
+BOOLEAN Win32_Init(HMODULE hmodule);
+
 
 //---------------------------------------------------------------------------
 // Functions (init for DllMain)
 //---------------------------------------------------------------------------
 
+BOOLEAN Handle_Init(void);
 
 BOOLEAN Key_Init(void);
 
@@ -616,7 +685,7 @@ BOOLEAN Scm_Init_AdvApi(HMODULE);
 
 BOOLEAN Proc_Init_AdvApi(HMODULE);
 
-BOOLEAN Cred_Init_AdvApi(HMODULE);
+BOOLEAN Cred_Init(HMODULE);
 
 //BOOLEAN Lsa_Init_AdvApi(HMODULE module);
 
@@ -643,6 +712,7 @@ BOOLEAN Ole_Init(HMODULE);
 BOOLEAN Pst_Init(HMODULE);
 
 BOOLEAN Lsa_Init_Secur32(HMODULE);
+
 BOOLEAN Lsa_Init_SspiCli(HMODULE);
 
 BOOLEAN Setup_Init_SetupApi(HMODULE);
@@ -654,6 +724,8 @@ BOOLEAN SH32_Init(HMODULE);
 BOOLEAN SH32_Init_ZipFldr(HMODULE);
 
 BOOLEAN SH32_Init_UxTheme(HMODULE);
+
+BOOLEAN Kernel_Init();
 
 BOOLEAN Gui_Init(HMODULE);
 
@@ -687,9 +759,9 @@ BOOLEAN Com_Init_Ole32(HMODULE);
 
 BOOLEAN RpcRt_Init(HMODULE);
 
-BOOLEAN Secure_Init_Elevation(HMODULE);
-
 BOOLEAN UserEnv_Init(HMODULE);
+
+BOOLEAN UserEnv_InitVer(HMODULE);
 
 BOOLEAN Scm_OsppcDll(HMODULE);
 
@@ -703,15 +775,11 @@ BOOLEAN Proc_Init_AdvPack(HMODULE);
 
 BOOLEAN Custom_SilverlightAgCore(HMODULE);
 
-BOOLEAN Custom_MsgPlusLive(HMODULE);
-
 BOOLEAN Custom_OsppcDll(HMODULE);
 
 BOOLEAN Custom_InternetDownloadManager(HMODULE);
 
 BOOLEAN Custom_Avast_SnxHk(HMODULE);
-
-BOOLEAN Custom_EMET_DLL(HMODULE hmodule);
 
 BOOLEAN Custom_SYSFER_DLL(HMODULE hmodule);
 
@@ -719,13 +787,17 @@ BOOLEAN MsCorEE_Init(HMODULE hmodule);
 
 void Custom_ComServer(void);
 
-void Custom_Load_UxTheme(void);
+//void Custom_Load_UxTheme(void);
 
 NTSTATUS StopTailCallOptimization(NTSTATUS status);
 
 BOOLEAN Pdh_Init(HMODULE hmodule);
 
 BOOLEAN NsiRpc_Init(HMODULE);
+
+//BOOLEAN Wininet_Init(HMODULE);
+
+BOOLEAN Nsi_Init(HMODULE);
 
 BOOLEAN Ntmarta_Init(HMODULE);
 
@@ -735,16 +807,27 @@ BOOLEAN DigitalGuardian_Init(HMODULE);
 
 BOOLEAN ComDlg32_Init(HMODULE);
 
+DWORD Dll_rand(void);
 
 //---------------------------------------------------------------------------
 // Functions (Config)
 //---------------------------------------------------------------------------
 
+BOOLEAN Config_MatchImageGroup(
+    const WCHAR* group, ULONG group_len, const WCHAR* test_str,
+    ULONG depth);
 
-BOOLEAN Config_InitPatternList(const WCHAR* setting, LIST* list);
+BOOLEAN Config_MatchImage(
+    const WCHAR* pat_str, ULONG pat_len, const WCHAR* test_str,
+    ULONG depth);
 
-NTSTATUS Config_GetSettingsForImageName(
-    const WCHAR* setting, WCHAR* value, ULONG value_size, const WCHAR* deftext);
+WCHAR* Config_MatchImageAndGetValue(WCHAR* value, const WCHAR* ImageName, ULONG* pMode);
+
+BOOLEAN Config_InitPatternList(const WCHAR* boxname, const WCHAR* setting, LIST* list, BOOLEAN dos);
+
+VOID Config_FreePatternList(LIST* list);
+
+BOOLEAN Config_String2Bool(const WCHAR* value, BOOLEAN defval);
 
 BOOLEAN Config_GetSettingsForImageName_bool(const WCHAR* setting, BOOLEAN defval);
 

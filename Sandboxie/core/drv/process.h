@@ -51,11 +51,14 @@ struct _PROCESS {
     // changes to the linked list of PROCESS blocks are synchronized by
     // an exclusive lock on Process_ListLock
 
+#ifndef USE_PROCESS_MAP
     LIST_ELEM list_elem;
+#endif
 
     // process id
 
     HANDLE pid;
+    HANDLE starter_id;
 
     // process pool.  created on process creation.  it is freed in its
     // entirety when the process terminates
@@ -85,15 +88,23 @@ struct _PROCESS {
 
     ULONG ntdll32_base;
 
+    ULONG detected_image_type;
+
     // original process primary access token
 
     void *primary_token;
+
+    PSID *SandboxieLogonSid;
 
     // thread data
 
     PERESOURCE threads_lock;
 
+#ifdef USE_PROCESS_MAP
+    HASH_MAP thread_map;
+#else
     LIST threads;
+#endif
 
     // flags
 
@@ -117,22 +128,45 @@ struct _PROCESS {
 
     BOOLEAN change_notify_token_flag;
 
+    BOOLEAN bAppCompartment;
+
     BOOLEAN in_pca_job;
+    BOOLEAN can_use_jobs;
 
     UCHAR   create_console_flag;
+
+    BOOLEAN disable_monitor;
+
+    BOOLEAN always_close_for_boxed;
+    BOOLEAN dont_open_for_boxed;
+    BOOLEAN protect_host_images;
+    BOOLEAN use_security_mode;
+    BOOLEAN is_locked_down;
+    BOOLEAN open_all_nt;
+#ifdef USE_MATCH_PATH_EX
+    BOOLEAN restrict_devices;
+    BOOLEAN use_rule_specificity;
+    BOOLEAN use_privacy_mode;
+#endif
+    BOOLEAN confidential_box;
 
     ULONG call_trace;
 
     // file-related
 
     PERESOURCE file_lock;
+#ifdef USE_MATCH_PATH_EX
+    LIST normal_file_paths;             // PATTERN elements
+#endif
     LIST open_file_paths;               // PATTERN elements
     LIST closed_file_paths;             // PATTERN elements
     LIST read_file_paths;               // PATTERN elements
     LIST write_file_paths;              // PATTERN elements
+    BOOLEAN file_block_network_files;
     LIST blocked_dlls;
     ULONG file_trace;
     ULONG pipe_trace;
+    BOOLEAN disable_file_flt;
     BOOLEAN file_warn_internet;
     BOOLEAN file_warn_direct_access;
 	BOOLEAN AllowInternetAccess;
@@ -142,19 +176,30 @@ struct _PROCESS {
 
     PERESOURCE key_lock;
     KEY_MOUNT *key_mount;
+#ifdef USE_MATCH_PATH_EX
+    LIST normal_key_paths;              // PATTERN elements
+#endif
     LIST open_key_paths;                // PATTERN elements
     LIST closed_key_paths;              // PATTERN elements
     LIST read_key_paths;                // PATTERN elements
     LIST write_key_paths;               // PATTERN elements
     ULONG key_trace;
+    BOOLEAN disable_key_flt;
 
     // ipc-related
 
     PERESOURCE ipc_lock;
+#ifdef USE_MATCH_PATH_EX
+    LIST normal_ipc_paths;              // PATTERN elements
+#endif
     LIST open_ipc_paths;                // PATTERN elements
     LIST closed_ipc_paths;              // PATTERN elements
+    LIST read_ipc_paths;                // PATTERN elements
     ULONG ipc_trace;
+    BOOLEAN disable_object_flt;
+    BOOLEAN ipc_namespace_isoaltion;
     BOOLEAN ipc_warn_startrun;
+    BOOLEAN ipc_warn_open_proc;
     BOOLEAN ipc_block_password;
     BOOLEAN ipc_open_lsa_endpoint;
     BOOLEAN ipc_open_sam_endpoint;
@@ -193,13 +238,16 @@ void Process_Unload(BOOLEAN FreeLock);
 
 PROCESS *Process_Find(HANDLE ProcessId, KIRQL *out_irql);
 
+#ifdef XP_SUPPORT
 PROCESS *Process_FindSandboxed(HANDLE ProcessId, KIRQL *out_irql);
+#endif
 
+//PROCESS *Process_Find_ByHandle(HANDLE Handle, KIRQL *out_irql);
 
 // Start supervising a new process
 
-void Process_NotifyProcess_Create(
-    HANDLE ProcessId, HANDLE ParentId, BOX *box);
+BOOLEAN Process_NotifyProcess_Create(
+    HANDLE ProcessId, HANDLE ParentId, HANDLE CallerId, BOX *box);
 
 
 // Process_IsSameBox returns TRUE if the other process identified by
@@ -208,6 +256,11 @@ void Process_NotifyProcess_Create(
 
 BOOLEAN Process_IsSameBox(PROCESS *proc, PROCESS *proc2, ULONG_PTR proc2_pid);
 
+#ifdef DRV_BREAKOUT
+// Process_IsStarter returns TRUE if proc2 was started by proc1
+
+BOOLEAN Process_IsStarter(PROCESS* proc1, PROCESS* proc2);
+#endif
 
 // Process_MatchImage:  given an image name pattern 'pat_str', which
 // may contain wild cards, tests the image name 'test_str' against
@@ -226,15 +279,23 @@ BOOLEAN Process_MatchImage(
 // is suffixed unless the value already contains a star anywhere
 
 BOOLEAN Process_GetPaths(
-    PROCESS *proc, LIST *list, const WCHAR *setting_name, BOOLEAN AddStar);
+    PROCESS *proc, LIST *list, const WCHAR *section_name, const WCHAR *setting_name, BOOLEAN AddStar);
 
 
+#ifndef USE_MATCH_PATH_EX
 // Process_GetPaths2:  similar to Process_GetPaths, but adds the path
 // only if it does not already match the second path-list
 
 BOOLEAN Process_GetPaths2(
     PROCESS *proc, LIST *list, LIST *list2,
     const WCHAR *setting_name, BOOLEAN AddStar);
+#endif
+
+
+#ifdef USE_TEMPLATE_PATHS
+BOOLEAN Process_GetTemplatePaths(
+    PROCESS *proc, LIST *list, const WCHAR *setting_name);
+#endif
 
 
 // Process_AddPath:   given a process and the name of a path-list
@@ -257,6 +318,44 @@ const WCHAR *Process_MatchPath(
     LIST *open_list, LIST *closed_list,
     BOOLEAN *is_open, BOOLEAN *is_closed);
 
+// Process_MatchPathEx:  given a list that was previously initialized with
+// Process_GetPaths, tests if the passed string 'path' matches any pattern.
+// path_len specifies the number of characters in path, excluding the
+// null terminator, or in other words, path_len is wcslen(path).
+// Returns the highest priority true path permission
+
+#define TRUE_PATH_CLOSED_FLAG    0x00
+#define TRUE_PATH_READ_FLAG      0x10
+#define TRUE_PATH_WRITE_FLAG     0x20
+#define TRUE_PATH_OPEN_FLAG      0x30
+#define TRUE_PATH_MASK           0x30
+
+#define COPY_PATH_CLOSED_FLAG    0x00
+#define COPY_PATH_READ_FLAG      0x01
+#define COPY_PATH_WRITE_FLAG     0x02
+#define COPY_PATH_OPEN_FLAG      0x03
+#define COPY_PATH_MASK           0x03
+
+ULONG Process_MatchPathEx(
+    PROCESS *proc, const WCHAR *path, ULONG path_len, WCHAR path_code,
+    LIST *normal_list, 
+    LIST *open_list, LIST *closed_list,
+    LIST *read_list, LIST *write_list,
+    const WCHAR** patsrc);
+
+// Process_GetConf:  retrieves a configuration data value for a given process
+// use with Conf_AdjustUseCount to make sure the returned pointer is valid
+
+const WCHAR* Process_GetConfEx(BOX* box, const WCHAR* image_name, const WCHAR* setting);
+const WCHAR* Process_GetConf(PROCESS* proc, const WCHAR* setting);
+
+
+// Process_GetConf_bool:  parses a y/n setting.  this function does not
+// have to be protected with Conf_AdjustUseCount
+
+BOOLEAN Process_GetConfEx_bool(BOX* box, const WCHAR* image_name, const WCHAR* setting, BOOLEAN def);
+BOOLEAN Process_GetConf_bool(PROCESS* proc, const WCHAR* setting, BOOLEAN def);
+
 
 // Build a standard entry for hooks.  The standard entry calls
 // Process_Find(NULL, NULL).  If non-zero (this includes -1 for
@@ -277,10 +376,6 @@ void Process_DisableHookEntry(ULONG_PTR HookEntry);
 PROCESS *Process_GetCurrent(void);
 
 
-// Check for use of multiple sandboxes at once
-
-BOOLEAN Process_CheckTooManyBoxes(const BOX *box);
-
 
 // Returns ProcessName.exe for idProcess, allocated from the specified pool.
 // On return, *out_buf points to a UNICODE_STRING structure which points
@@ -297,10 +392,10 @@ void Process_GetProcessName(
 
 // Check if open_path contains setting "$:ProcessName.exe"
 // where ProcessName matches the specified idProcess.
-// If not contained, returns STATUS_ACCESS_DENIED with *pSetting = NULL
-// If contained, returns STATUS_SUCCESS with *pSetting -> matching setting
+// If not contained, returns FALSE with *pSetting = NULL
+// If contained, returns TRUE with *pSetting -> matching setting
 
-NTSTATUS Process_CheckProcessName(
+BOOLEAN Process_CheckProcessName(
     PROCESS *proc, LIST *open_paths, ULONG_PTR idProcess,
     const WCHAR **pSetting);
 
@@ -314,11 +409,27 @@ NTSTATUS Process_GetSidStringAndSessionId(
     UNICODE_STRING *SidString, ULONG *SessionId);
 
 
+// Get a string from a processes PEB
+
+void Process_GetStringFromPeb(
+    PEPROCESS ProcessObject, ULONG StringOffset, ULONG StringMaxLenInChars,
+    WCHAR **OutBuffer, ULONG *OutLength);
+
+// Get a processes command line
+
+void Process_GetCommandLine(
+    HANDLE ProcessId,
+    WCHAR **OutBuffer, ULONG *OutLength);
+
 // Get a box for a forced sandboxed process
 
 BOX *Process_GetForcedStartBox(
-    HANDLE ProcessId, HANDLE ParentId, const WCHAR *ImagePath, BOOLEAN bHostInject);
+    HANDLE ProcessId, HANDLE ParentId, const WCHAR *ImagePath, BOOLEAN* pHostInject, const WCHAR *pSidString);
 
+
+#ifdef DRV_BREAKOUT
+BOOLEAN Process_IsBreakoutProcess(BOX *box, const WCHAR *ImagePath);
+#endif
 
 // Manipulation of the List of Disabled Forced Processes:  (Process_List2)
 // Add ProcessId to list if ParentId is already listed
@@ -340,6 +451,11 @@ void Process_DfpDelete(HANDLE ProcessId);
 
 BOOLEAN Process_DfpCheck(HANDLE ProcessId, BOOLEAN *silent);
 
+// Force Child Processes
+
+VOID Process_FcpInsert(HANDLE ProcessId, const WCHAR* boxname);
+void Process_FcpDelete(HANDLE ProcessId);
+BOOLEAN Process_FcpCheck(HANDLE ProcessId, WCHAR* boxname);
 
 // Enumerate or count processes in a sandbox
 
@@ -355,13 +471,23 @@ void Process_LogMessage(PROCESS *proc, ULONG msgid);
 
 // Track process limit
 
-void Process_TrackProcessLimit(PROCESS *proc);
+//void Process_TrackProcessLimit(PROCESS *proc);
 
+// Terminate process
+
+BOOLEAN Process_TerminateProcess(PROCESS *proc);
 
 // Cancel process through SbieSvc
 
-void Process_CancelProcess(PROCESS *proc);
+BOOLEAN Process_CancelProcess(PROCESS *proc);
 
+// Terminate a process using a helper thread
+
+BOOLEAN Process_ScheduleKill(PROCESS *proc, LONG delay_ms);
+
+// Check if a process is part of the sandboxie installation
+
+VOID Process_IsSbieImage(const WCHAR *image_path, BOOLEAN *image_sbie, BOOLEAN *is_start_exe);
 
 // Check if process is running within a
 // Program Compatibility Assistant (PCA) job
@@ -405,14 +531,23 @@ NTSTATUS Process_Api_QueryPathList(PROCESS *proc, ULONG64 *parms);
 
 NTSTATUS Process_Api_Enum(PROCESS *proc, ULONG64 *parms);
 
+NTSTATUS Process_Api_Kill(PROCESS *proc, ULONG64 *parms);
+
 
 //---------------------------------------------------------------------------
 // Variables
 //---------------------------------------------------------------------------
 
 
+#ifdef USE_PROCESS_MAP
+extern HASH_MAP Process_Map;
+extern HASH_MAP Process_MapDfp;
+extern HASH_MAP Process_MapFcp;
+#else
 extern LIST Process_List;
 extern LIST Process_ListDfp;
+extern LIST Process_ListFcp;
+#endif
 extern PERESOURCE Process_ListLock;
 
 extern volatile BOOLEAN Process_ReadyToSandbox;

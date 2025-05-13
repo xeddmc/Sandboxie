@@ -1,6 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
- * Copyright 2020 David Xanatos, xanasoft.com
+ * Copyright 2020-2023 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -31,174 +31,189 @@
 #include <stdio.h>
 #include <psapi.h>
 
+#if defined(_M_ARM64) || defined(_M_ARM64EC)
+void* Hook_GetFFSTarget(void* ptr);
+void* Hook_GetXipTarget(void* ptr, int mode);
+void* SbieDll_Hook_arm(const char* SourceFuncName, void* SourceFunc, void* DetourFunc, HMODULE module);
+#endif
+
+//---------------------------------------------------------------------------
+// Variables
+//---------------------------------------------------------------------------
+
+
+BOOLEAN Gui_UseProxyService = TRUE;
+
+HWINSTA Gui_Dummy_WinSta = NULL;
+
 
 //---------------------------------------------------------------------------
 // Function Pointers in USER32.DLL
 //---------------------------------------------------------------------------
 
 
-        P_SetThreadDesktop          __sys_SetThreadDesktop          = NULL;
-        P_SwitchDesktop             __sys_SwitchDesktop             = NULL;
+P_SetThreadDesktop          __sys_SetThreadDesktop          = NULL;
+P_SwitchDesktop             __sys_SwitchDesktop             = NULL;
 
-        P_UserHandleGrantAccess     __sys_UserHandleGrantAccess     = NULL;
+P_UserHandleGrantAccess     __sys_UserHandleGrantAccess     = NULL;
 
-        P_GetFocus                  __sys_GetFocus                  = NULL;
+P_GetFocus                  __sys_GetFocus                  = NULL;
 
-        P_ShowWindow                __sys_ShowWindow                = NULL;
+P_ShowWindow                __sys_ShowWindow                = NULL;
 
-        P_ExitWindowsEx             __sys_ExitWindowsEx             = NULL;
+P_ExitWindowsEx             __sys_ExitWindowsEx             = NULL;
 
-        P_EndTask                   __sys_EndTask                   = NULL;
+P_EndTask                   __sys_EndTask                   = NULL;
 
-        P_ConsoleControl            __sys_ConsoleControl            = NULL;
+P_ConsoleControl            __sys_ConsoleControl            = NULL;
 
-        P_SwapMouseButton           __sys_SwapMouseButton           = NULL;
-        P_SetDoubleClickTime        __sys_SetDoubleClickTime        = NULL;
+P_SwapMouseButton           __sys_SwapMouseButton           = NULL;
+P_SetDoubleClickTime        __sys_SetDoubleClickTime        = NULL;
 
-        P_AnimateWindow             __sys_AnimateWindow             = NULL;
+P_AnimateWindow             __sys_AnimateWindow             = NULL;
 
-        P_GetClipboardFormatName    __sys_GetClipboardFormatNameA   = NULL;
-        P_GetClipboardFormatName    __sys_GetClipboardFormatNameW   = NULL;
+P_GetClipboardFormatName    __sys_GetClipboardFormatNameA   = NULL;
+P_GetClipboardFormatName    __sys_GetClipboardFormatNameW   = NULL;
 
-        P_RegisterClipboardFormat   __sys_RegisterClipboardFormatA  = NULL;
-        P_RegisterClipboardFormat   __sys_RegisterClipboardFormatW  = NULL;
+P_RegisterClipboardFormat   __sys_RegisterClipboardFormatA  = NULL;
+P_RegisterClipboardFormat   __sys_RegisterClipboardFormatW  = NULL;
 
-        P_RealGetWindowClass        __sys_RealGetWindowClassA       = NULL;
-        P_RealGetWindowClass        __sys_RealGetWindowClassW       = NULL;
+P_RealGetWindowClass        __sys_RealGetWindowClassA       = NULL;
+P_RealGetWindowClass        __sys_RealGetWindowClassW       = NULL;
 
-        P_GetWindowText             __sys_GetWindowTextA            = NULL;
-        P_GetWindowText             __sys_GetWindowTextW            = NULL;
+P_GetWindowText             __sys_GetWindowTextA            = NULL;
+P_GetWindowText             __sys_GetWindowTextW            = NULL;
 
-        P_CallWindowProc            __sys_CallWindowProcA           = NULL;
-        P_CallWindowProc            __sys_CallWindowProcW           = NULL;
+P_CallWindowProc            __sys_CallWindowProcA           = NULL;
+P_CallWindowProc            __sys_CallWindowProcW           = NULL;
 
-        P_CreateWindowEx            __sys_CreateWindowExA           = NULL;
-        P_CreateWindowEx            __sys_CreateWindowExW           = NULL;
+P_CreateWindowEx            __sys_CreateWindowExA           = NULL;
+P_CreateWindowEx            __sys_CreateWindowExW           = NULL;
 
-        P_DefWindowProc             __sys_DefWindowProcA            = NULL;
-        P_DefWindowProc             __sys_DefWindowProcW            = NULL;
+P_DefWindowProc             __sys_DefWindowProcA            = NULL;
+P_DefWindowProc             __sys_DefWindowProcW            = NULL;
 
-        P_ActivateKeyboardLayout    __sys_ActivateKeyboardLayout    = NULL;
+P_ActivateKeyboardLayout    __sys_ActivateKeyboardLayout    = NULL;
 
-        P_MoveWindow                __sys_MoveWindow                = NULL;
-        P_SetWindowPos              __sys_SetWindowPos              = NULL;
+P_MoveWindow                __sys_MoveWindow                = NULL;
+P_SetWindowPos              __sys_SetWindowPos              = NULL;
 
-        P_GetWindowInfo             __sys_GetWindowInfo             = NULL;
+P_GetWindowInfo             __sys_GetWindowInfo             = NULL;
 
-        P_RegisterClass             __sys_RegisterClassA            = NULL;
-        P_RegisterClass             __sys_RegisterClassW            = NULL;
-        P_RegisterClass             __sys_RegisterClassExA          = NULL;
-        P_RegisterClass             __sys_RegisterClassExW          = NULL;
+P_RegisterClass             __sys_RegisterClassA            = NULL;
+P_RegisterClass             __sys_RegisterClassW            = NULL;
+P_RegisterClass             __sys_RegisterClassExA          = NULL;
+P_RegisterClass             __sys_RegisterClassExW          = NULL;
 
-        P_UnregisterClass           __sys_UnregisterClassA          = NULL;
-        P_UnregisterClass           __sys_UnregisterClassW          = NULL;
+P_UnregisterClass           __sys_UnregisterClassA          = NULL;
+P_UnregisterClass           __sys_UnregisterClassW          = NULL;
 
-        P_GetClassInfo              __sys_GetClassInfoA             = NULL;
-        P_GetClassInfo              __sys_GetClassInfoW             = NULL;
-        P_GetClassInfo              __sys_GetClassInfoExA           = NULL;
-        P_GetClassInfo              __sys_GetClassInfoExW           = NULL;
+P_GetClassInfo              __sys_GetClassInfoA             = NULL;
+P_GetClassInfo              __sys_GetClassInfoW             = NULL;
+P_GetClassInfo              __sys_GetClassInfoExA           = NULL;
+P_GetClassInfo              __sys_GetClassInfoExW           = NULL;
 
-        P_GetClassName              __sys_GetClassNameA             = NULL;
-        P_GetClassName              __sys_GetClassNameW             = NULL;
+P_GetClassName              __sys_GetClassNameA             = NULL;
+P_GetClassName              __sys_GetClassNameW             = NULL;
 
-        P_EnumWindows               __sys_EnumWindows               = NULL;
-        P_EnumChildWindows          __sys_EnumChildWindows          = NULL;
-        P_EnumThreadWindows         __sys_EnumThreadWindows         = NULL;
-        P_EnumDesktopWindows        __sys_EnumDesktopWindows        = NULL;
+P_EnumWindows               __sys_EnumWindows               = NULL;
+P_EnumChildWindows          __sys_EnumChildWindows          = NULL;
+P_EnumThreadWindows         __sys_EnumThreadWindows         = NULL;
+P_EnumDesktopWindows        __sys_EnumDesktopWindows        = NULL;
 
-        P_EnumDesktops              __sys_EnumDesktopsA             = NULL;
-        P_EnumDesktops              __sys_EnumDesktopsW             = NULL;
+P_EnumDesktops              __sys_EnumDesktopsA             = NULL;
+P_EnumDesktops              __sys_EnumDesktopsW             = NULL;
 
-        P_FindWindow                __sys_FindWindowA               = NULL;
-        P_FindWindow                __sys_FindWindowW               = NULL;
+P_FindWindow                __sys_FindWindowA               = NULL;
+P_FindWindow                __sys_FindWindowW               = NULL;
 
-        P_FindWindowEx              __sys_FindWindowExA             = NULL;
-        P_FindWindowEx              __sys_FindWindowExW             = NULL;
+P_FindWindowEx              __sys_FindWindowExA             = NULL;
+P_FindWindowEx              __sys_FindWindowExW             = NULL;
 
-        P_GetDesktopWindow          __sys_GetDesktopWindow          = NULL;
-        P_GetShellWindow            __sys_GetShellWindow            = NULL;
+P_GetDesktopWindow          __sys_GetDesktopWindow          = NULL;
+P_GetShellWindow            __sys_GetShellWindow            = NULL;
 
-        P_GetProp                   __sys_GetPropA                  = NULL;
-        P_GetProp                   __sys_GetPropW                  = NULL;
+P_GetProp                   __sys_GetPropA                  = NULL;
+P_GetProp                   __sys_GetPropW                  = NULL;
 
-        P_SetProp                   __sys_SetPropA                  = NULL;
-        P_SetProp                   __sys_SetPropW                  = NULL;
+P_SetProp                   __sys_SetPropA                  = NULL;
+P_SetProp                   __sys_SetPropW                  = NULL;
 
-        P_RemoveProp                __sys_RemovePropA               = NULL;
-        P_RemoveProp                __sys_RemovePropW               = NULL;
+P_RemoveProp                __sys_RemovePropA               = NULL;
+P_RemoveProp                __sys_RemovePropW               = NULL;
 
-        P_GetWindowLong             __sys_GetWindowLongA            = NULL;
-        P_GetWindowLong             __sys_GetWindowLongW            = NULL;
+P_GetWindowLong             __sys_GetWindowLongA            = NULL;
+P_GetWindowLong             __sys_GetWindowLongW            = NULL;
 
-        P_SetWindowLong             __sys_SetWindowLongA            = NULL;
-        P_SetWindowLong             __sys_SetWindowLongW            = NULL;
+P_SetWindowLong             __sys_SetWindowLongA            = NULL;
+P_SetWindowLong             __sys_SetWindowLongW            = NULL;
 
-        P_GetClassLong              __sys_GetClassLongA             = NULL;
-        P_GetClassLong              __sys_GetClassLongW             = NULL;
+P_GetClassLong              __sys_GetClassLongA             = NULL;
+P_GetClassLong              __sys_GetClassLongW             = NULL;
 
 #ifdef _WIN64
 
-        P_GetWindowLongPtr          __sys_GetWindowLongPtrA         = NULL;
-        P_GetWindowLongPtr          __sys_GetWindowLongPtrW         = NULL;
+P_GetWindowLongPtr          __sys_GetWindowLongPtrA         = NULL;
+P_GetWindowLongPtr          __sys_GetWindowLongPtrW         = NULL;
 
-        P_SetWindowLongPtr          __sys_SetWindowLongPtrA         = NULL;
-        P_SetWindowLongPtr          __sys_SetWindowLongPtrW         = NULL;
+P_SetWindowLongPtr          __sys_SetWindowLongPtrA         = NULL;
+P_SetWindowLongPtr          __sys_SetWindowLongPtrW         = NULL;
 
-        P_GetClassLongPtr           __sys_GetClassLongPtrA          = NULL;
-        P_GetClassLongPtr           __sys_GetClassLongPtrW          = NULL;
+P_GetClassLongPtr           __sys_GetClassLongPtrA          = NULL;
+P_GetClassLongPtr           __sys_GetClassLongPtrW          = NULL;
 
 #endif _WIN64
 
-        P_SetWindowsHookEx          __sys_SetWindowsHookExA         = NULL;
-        P_SetWindowsHookEx          __sys_SetWindowsHookExW         = NULL;
+P_SetWindowsHookEx          __sys_SetWindowsHookExA         = NULL;
+P_SetWindowsHookEx          __sys_SetWindowsHookExW         = NULL;
 
-        P_UnhookWindowsHookEx       __sys_UnhookWindowsHookEx       = NULL;
+P_UnhookWindowsHookEx       __sys_UnhookWindowsHookEx       = NULL;
 
-        P_CreateDialogParam         __sys_CreateDialogParamA        = NULL;
-        P_CreateDialogParam         __sys_CreateDialogParamW        = NULL;
+P_CreateDialogParam         __sys_CreateDialogParamA        = NULL;
+P_CreateDialogParam         __sys_CreateDialogParamW        = NULL;
 
-        P_CreateDialogIndirectParam __sys_CreateDialogIndirectParamA
-                                                                    = NULL;
-        P_CreateDialogIndirectParam __sys_CreateDialogIndirectParamW
-                                                                    = NULL;
-        P_CreateDialogIndirectParamAorW
-                                    __sys_CreateDialogIndirectParamAorW
-                                                                    = NULL;
+P_CreateDialogIndirectParam __sys_CreateDialogIndirectParamA
+                                                            = NULL;
+P_CreateDialogIndirectParam __sys_CreateDialogIndirectParamW
+                                                            = NULL;
+P_CreateDialogIndirectParamAorW
+                            __sys_CreateDialogIndirectParamAorW
+                                                            = NULL;
 
-        P_DialogBoxParam            __sys_DialogBoxParamA           = NULL;
-        P_DialogBoxParam            __sys_DialogBoxParamW           = NULL;
+P_DialogBoxParam            __sys_DialogBoxParamA           = NULL;
+P_DialogBoxParam            __sys_DialogBoxParamW           = NULL;
 
-        P_DialogBoxIndirectParam    __sys_DialogBoxIndirectParamA   = NULL;
-        P_DialogBoxIndirectParam    __sys_DialogBoxIndirectParamW   = NULL;
+P_DialogBoxIndirectParam    __sys_DialogBoxIndirectParamA   = NULL;
+P_DialogBoxIndirectParam    __sys_DialogBoxIndirectParamW   = NULL;
 
-        P_DialogBoxIndirectParamAorW
-                                    __sys_DialogBoxIndirectParamAorW
-                                                                    = NULL;
+P_DialogBoxIndirectParamAorW
+                            __sys_DialogBoxIndirectParamAorW
+                                                            = NULL;
 
-        P_LoadString                __sys_LoadStringW               = NULL;
+P_LoadString                __sys_LoadStringW               = NULL;
 
-        P_RegisterDeviceNotification
-                                    __sys_RegisterDeviceNotificationA
-                                                                    = NULL;
-        P_RegisterDeviceNotification
-                                    __sys_RegisterDeviceNotificationW
-                                                                    = NULL;
-        P_UnregisterDeviceNotification
-                                    __sys_UnregisterDeviceNotification
-                                                                    = NULL;
-        P_MsgWaitForMultipleObjects __sys_MsgWaitForMultipleObjects = NULL;
+P_RegisterDeviceNotification
+                            __sys_RegisterDeviceNotificationA
+                                                            = NULL;
+P_RegisterDeviceNotification
+                            __sys_RegisterDeviceNotificationW
+                                                            = NULL;
+P_UnregisterDeviceNotification
+                            __sys_UnregisterDeviceNotification
+                                                            = NULL;
+P_MsgWaitForMultipleObjects __sys_MsgWaitForMultipleObjects = NULL;
 
-        P_PeekMessage               __sys_PeekMessageA              = NULL;
-        P_PeekMessage               __sys_PeekMessageW              = NULL;
+P_PeekMessage               __sys_PeekMessageA              = NULL;
+P_PeekMessage               __sys_PeekMessageW              = NULL;
 
-        P_MessageBoxW               __sys_MessageBoxW               = NULL;
-        P_MessageBoxExW             __sys_MessageBoxExW             = NULL;
+P_MessageBoxW               __sys_MessageBoxW               = NULL;
+P_MessageBoxExW             __sys_MessageBoxExW             = NULL;
 
-        P_WaitForInputIdle          __sys_WaitForInputIdle          = NULL;
+P_WaitForInputIdle          __sys_WaitForInputIdle          = NULL;
 
-        P_AttachThreadInput         __sys_AttachThreadInput         = NULL;
+P_AttachThreadInput         __sys_AttachThreadInput         = NULL;
 
-        P_GetOpenFileNameW          __sys_GetOpenFileNameW          = NULL;
+P_GetOpenFileNameW          __sys_GetOpenFileNameW          = NULL;
 
 
 //---------------------------------------------------------------------------
@@ -206,9 +221,9 @@
 //---------------------------------------------------------------------------
 
 
-static BOOLEAN Gui_Init2(void);
+static BOOLEAN Gui_Init2(HMODULE module);
 
-static BOOLEAN Gui_Init3(void);
+static BOOLEAN Gui_Init3(HMODULE module);
 
 static BOOL Gui_SetThreadDesktop(HDESK hDesktop);
 
@@ -248,7 +263,9 @@ static HWND Gui_CreateWindowExW(
     LPVOID lpParam);
 
 static BOOLEAN Gui_CanForwardMsg(
-    HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam/*, LRESULT* plResult*/);
+
+static VOID Gui_ProtectScreen(HWND hWnd);
 
 static LRESULT Gui_DefWindowProcA(
     HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
@@ -319,6 +336,10 @@ static DWORD Gui_WaitForInputIdle(HANDLE hProcess, DWORD dwMilliseconds);
 
 static BOOL Gui_AttachThreadInput(DWORD idAttach, DWORD idAttachTo, BOOL fAttach);
 
+static HDC Gui_CreateDCA(LPCSTR pwszDriver, LPCSTR pwszDevice, LPCSTR pszPort, const DEVMODEA* pdm);
+
+static HDC Gui_CreateDCW(LPCWSTR pwszDriver, LPCWSTR pwszDevice, LPCWSTR pszPort, const DEVMODEW* pdm);
+
 
 //---------------------------------------------------------------------------
 // GUI_IMPORT
@@ -353,10 +374,32 @@ _FX BOOLEAN Gui_Init(HMODULE module)
 
     const UCHAR *ProcName;
 
-    if (! Gdi_InitZero())       // only if Gdi_Init was not called yet
+    Gui_UseProtectScreen = SbieApi_QueryConfBool(NULL, L"CoverBoxedWindows", FALSE);
+
+    Gui_UseBlockCapture = SbieApi_QueryConfBool(NULL, L"BlockScreenCapture", FALSE);
+    if (Gui_UseBlockCapture)
+        Gdi_InitDCCache();
+
+    if (! Gdi_InitZero(module))       // only if Gdi_Init was not called yet
         return FALSE;
 
-    GUI_IMPORT___(GetWindowThreadProcessId);
+    // NoSbieDesk BEGIN
+
+    //
+    // Sandboxie is routing many gui related things through the service, 
+    // when we operate in app mode we don't need to do that hence
+    // disable the use of the gui proxy
+    //
+
+    Gui_UseProxyService = !(Dll_CompartmentMode || SbieApi_QueryConfBool(NULL, L"NoSandboxieDesktop", FALSE));
+    // NoSbieDesk END
+
+	GUI_IMPORT___(PrintWindow);
+	GUI_IMPORT___(GetWindowDC);
+	GUI_IMPORT___(GetDC);
+	GUI_IMPORT___(GetDCEx);
+	GUI_IMPORT___(ReleaseDC);
+	GUI_IMPORT___(GetWindowThreadProcessId);
     GUI_IMPORT___(SetThreadDesktop);
     GUI_IMPORT___(SwitchDesktop);
     GUI_IMPORT___(UserHandleGrantAccess);
@@ -377,6 +420,7 @@ _FX BOOLEAN Gui_Init(HMODULE module)
     GUI_IMPORT___(GetCursorPos);
     GUI_IMPORT___(SetCursorPos);
 
+	GUI_IMPORT___(SetTimer);
     GUI_IMPORT___(MsgWaitForMultipleObjects);
     GUI_IMPORT_AW(PeekMessage);
     GUI_IMPORT___(MessageBoxW);
@@ -390,13 +434,18 @@ _FX BOOLEAN Gui_Init(HMODULE module)
     GUI_IMPORT___(GetClipboardSequenceNumber);
     GUI_IMPORT_AW(GetClipboardFormatName);
     GUI_IMPORT_AW(RegisterClipboardFormat);
+    GUI_IMPORT___(SetClipboardData);
     GUI_IMPORT___(GetClipboardData);
+    GUI_IMPORT___(EmptyClipboard);
 
     GUI_IMPORT___(GetRawInputDeviceInfoA);
     GUI_IMPORT___(GetRawInputDeviceInfoW);
     
     GUI_IMPORT___(ExitWindowsEx);
     GUI_IMPORT___(EndTask);
+    // NoSbieCons BEGIN
+    if (!Dll_CompartmentMode && !SbieApi_QueryConfBool(NULL, L"NoSandboxieConsole", FALSE))
+	// NoSbieCons END
     if (Dll_OsBuild >= 8400) {
         GUI_IMPORT___(ConsoleControl);
     }
@@ -460,6 +509,10 @@ _FX BOOLEAN Gui_Init(HMODULE module)
     GUI_IMPORT_AW(GetWindowLong);
     GUI_IMPORT_AW(SetWindowLong);
     GUI_IMPORT_AW(GetClassLong);
+	GUI_IMPORT___(SetActiveWindow);
+	GUI_IMPORT___(BringWindowToTop);
+	GUI_IMPORT___(SwitchToThisWindow);
+	GUI_IMPORT___(ShowCursor);
 
 #ifdef _WIN64
 
@@ -476,6 +529,7 @@ _FX BOOLEAN Gui_Init(HMODULE module)
     GUI_IMPORT_AW(PostMessage);
     GUI_IMPORT_AW(PostThreadMessage);
     GUI_IMPORT_AW(DispatchMessage);
+	GUI_IMPORT___(ShutdownBlockReasonCreate)
 
     GUI_IMPORT_AW(SetWindowsHookEx);
     GUI_IMPORT___(UnhookWindowsHookEx);
@@ -509,38 +563,36 @@ import_fail:
     ok = TRUE;
 
     if (ok)
-        ok = Gui_InitClass();
+        ok = Gui_InitClass(module);
 
     if (ok)
-        ok = Gui_InitTitle();
+        ok = Gui_InitTitle(module);
 
     if (ok)
-        ok = Gui_Init2();
+        ok = Gui_Init2(module);
 
     if (ok)
-        ok = Gui_InitEnum();
+        ok = Gui_InitEnum(module);
 
     if (ok)
-        ok = Gui_InitProp();
+        ok = Gui_InitProp(module);
 
     if (ok)
-        ok = Gui_InitMsg();
+        ok = Gui_InitMsg(module);
 
     if (ok)
-        ok = Gui_InitWinHooks();
+        ok = Gui_InitDlgTmpl(module);
 
-    if (ok)
-        ok = Gui_InitDlgTmpl();
+    if (ok && SbieApi_QueryConfBool(NULL, L"BlockRegisterDeviceNotification", FALSE))
+        ok = Gui_Init3(module); // todo remove later
 
-    if (ok)
-        ok = Gui_Init3();
+    if (Gui_UseProxyService) {
 
-	// NoSbieDesk BEGIN
-	if (SbieApi_QueryConfBool(NULL, L"NoSandboxieDesktop", FALSE))
-		return ok;
-	// NoSbieDesk END
+        if (ok)
+            ok = Gui_InitWinHooks(module);
 
-    SBIEDLL_HOOK_GUI(AttachThreadInput);
+        SBIEDLL_HOOK_GUI(AttachThreadInput);
+    }
 
     return ok;
 }
@@ -551,15 +603,19 @@ import_fail:
 //---------------------------------------------------------------------------
 
 
-_FX BOOLEAN Gui_Init2(void)
+_FX BOOLEAN Gui_Init2(HMODULE module)
 {
     SBIEDLL_HOOK_GUI(ExitWindowsEx);
     SBIEDLL_HOOK_GUI(EndTask);
+    // NoSbieCons BEGIN
+    if (!Dll_CompartmentMode && !SbieApi_QueryConfBool(NULL, L"NoSandboxieConsole", FALSE))
+	// NoSbieCons END
     if (__sys_ConsoleControl) {
         SBIEDLL_HOOK_GUI(ConsoleControl);
     }
 
-    if (Gui_RenameClasses) {
+    //if (Gui_RenameClasses) {
+    if (! Dll_SkipHook(L"createwin")) {
 
         SBIEDLL_HOOK_GUI(CreateWindowExA);
         SBIEDLL_HOOK_GUI(CreateWindowExW);
@@ -585,29 +641,35 @@ _FX BOOLEAN Gui_Init2(void)
     if (! Gui_OpenAllWinClasses) {
 
         SBIEDLL_HOOK_GUI(UserHandleGrantAccess);
-        SBIEDLL_HOOK_GUI(IsWindow);
-        SBIEDLL_HOOK_GUI(IsWindowEnabled);
-        SBIEDLL_HOOK_GUI(IsWindowVisible);
-        SBIEDLL_HOOK_GUI(IsWindowUnicode);
-        SBIEDLL_HOOK_GUI(IsIconic);
-        SBIEDLL_HOOK_GUI(IsZoomed);
+
+        if(Gui_UseProxyService) {
+            SBIEDLL_HOOK_GUI(IsWindow);
+            SBIEDLL_HOOK_GUI(IsWindowEnabled);
+            SBIEDLL_HOOK_GUI(IsWindowVisible);
+            SBIEDLL_HOOK_GUI(IsWindowUnicode);
+            SBIEDLL_HOOK_GUI(IsIconic);
+            SBIEDLL_HOOK_GUI(IsZoomed);
+        }
+
         SBIEDLL_HOOK_GUI(MoveWindow);
         SBIEDLL_HOOK_GUI(SetWindowPos);
-        SBIEDLL_HOOK_GUI(MapWindowPoints);
-        SBIEDLL_HOOK_GUI(ClientToScreen);
-        SBIEDLL_HOOK_GUI(ScreenToClient);
-        SBIEDLL_HOOK_GUI(GetClientRect);
-        SBIEDLL_HOOK_GUI(GetWindowRect);
-        SBIEDLL_HOOK_GUI(GetWindowInfo);
+        if (Gui_UseProxyService) {
+            SBIEDLL_HOOK_GUI(MapWindowPoints);
+            SBIEDLL_HOOK_GUI(ClientToScreen);
+            SBIEDLL_HOOK_GUI(ScreenToClient);
+            SBIEDLL_HOOK_GUI(GetClientRect);
+            SBIEDLL_HOOK_GUI(GetWindowRect);
+            SBIEDLL_HOOK_GUI(GetWindowInfo);
+        }
         SBIEDLL_HOOK_GUI(AnimateWindow);
         SBIEDLL_HOOK_GUI(WaitForInputIdle);
         SBIEDLL_HOOK_GUI(ActivateKeyboardLayout);
     }
 
-    if (! Gui_InitMisc())
+    if (! Gui_InitMisc(module))
         return FALSE;
 
-    if (! Gui_DDE_Init())
+    if (! Gui_DDE_Init(module))
         return FALSE;
 
     return TRUE;
@@ -619,7 +681,7 @@ _FX BOOLEAN Gui_Init2(void)
 //---------------------------------------------------------------------------
 
 
-_FX BOOLEAN Gui_Init3(void)
+_FX BOOLEAN Gui_Init3(HMODULE module)
 {
     //
     // expect that both RegisterDeviceNotificationA and
@@ -650,6 +712,7 @@ _FX BOOLEAN Gui_Init3(void)
 
 _FX void Gui_InitWindows7(void)
 {
+    // $HookHack$ - Custom, not automated, Hook
     if (Dll_KernelBase) {
 
         //
@@ -691,11 +754,47 @@ _FX void Gui_InitWindows7(void)
             SourceFunc = (UCHAR *)(*pSourceFunc);
             if (! SourceFunc)
                 continue;
-
+            
             //
             // confirm the function starts with an indirect jmp,
             // and try to replace the value at [x]
             //
+
+#ifdef _M_ARM64EC
+
+            //  48 8B FF            mov         rdi,rdi  
+            //  55                  push        rbp  
+            //  48 8B EC            mov         rbp,rsp  
+            //  5D                  pop         rbp  
+            //  90                  nop  
+            //  E9 02 48 18 00      jmp         #__GSHandlerCheck_SEH_AMD64+138h (07FFB572B8190h) 
+           
+            //  B0FFFEF0            adrp        xip0,#NtdllScrollBarWndProc_A (07FFD30995000h)  
+            //  91018210            add         xip0,xip0,#0x60  
+            //  D61F0200            br          xip0  
+
+            //  F0001050            adrp        xip0,NtUserPfn (07FFD30BA0000h)  
+            //  F9426A10            ldr         xip0,[xip0,#0x4D0]  // DefWindowProcA/DefWindowProcW
+            //  D61F0200            br          xip0  
+
+            UCHAR* Target = Hook_GetFFSTarget(SourceFunc);
+            if(Target) {
+
+                Target = Hook_GetXipTarget(Target, 1); // adrp add br
+                Target = Hook_GetXipTarget(Target, 0); // adrp ldr br
+                
+                *pSourceFunc = (ULONG_PTR)SbieDll_Hook_arm(
+                    FuncName, Target, DetourFunc, NULL);
+            }
+            else // fall back to SbieDll_Hook
+#else
+
+#ifdef _M_ARM64
+            void* ptr = Hook_GetXipTarget(SourceFunc, 1); // adrp add br
+            ptr = Hook_GetXipTarget(ptr, 0); // adrp ldr br
+            if (ptr != SourceFunc)
+                *pSourceFunc = (ULONG_PTR)ptr;
+#else
 
 #ifdef _WIN64
 
@@ -724,8 +823,10 @@ _FX void Gui_InitWindows7(void)
                 *pSourceFunc = *(ULONG_PTR *)target;
             }
 
+#endif
+#endif
             *pSourceFunc = (ULONG_PTR)SbieDll_Hook(
-                FuncName, (void *)(*pSourceFunc), DetourFunc);
+                FuncName, (void *)(*pSourceFunc), DetourFunc, NULL);
         }
     }
 }
@@ -800,6 +901,11 @@ _FX BOOLEAN Gui_ConnectToWindowStationAndDesktop(HMODULE User32)
     ULONG_PTR rc = 0;
     ULONG errlvl = 0;
 
+    // NoSbieDesk BEGIN
+	if (Dll_CompartmentMode || SbieApi_QueryConfBool(NULL, L"NoSandboxieDesktop", FALSE))
+		return TRUE;
+	// NoSbieDesk END
+
     //
     // process is already connected to window station, connect to desktop
     //
@@ -866,148 +972,160 @@ _FX BOOLEAN Gui_ConnectToWindowStationAndDesktop(HMODULE User32)
             errlvl = 2;
         else {
 
-            //
-            // locate windowstation and desktop functions in user32 dll
-            //
-
-            P_SetProcessWindowStation _SetProcessWindowStation =
-                (P_SetProcessWindowStation)
-                    GetProcAddress(User32, "SetProcessWindowStation");
-
-            if (! __sys_SetThreadDesktop) {
-                // in the special case when USER32 is loaded before GDI32, as
-                // discussed in Gdi_InitZero, SetThreadDesktop is still zero
-                __sys_SetThreadDesktop = (P_SetThreadDesktop)
-                    GetProcAddress(User32, "SetThreadDesktop");
-            }
-
-            if ((! _SetProcessWindowStation) || (! __sys_SetThreadDesktop))
-                errlvl = 3;
+            if (SbieApi_QueryConfBool(NULL, L"OpenWndStation", FALSE))
+                _ProcessDesktop = (HDESK)-1;
             else {
 
                 //
-                // set DesktopName in ProcessParms to point to our dummy
-                // window station so the initial default connection can
-                // be made to a workstation that is accessible
+                // locate windowstation and desktop functions in user32 dll
                 //
 
-                UNICODE_STRING SaveDesktopName;
-#ifndef _WIN64
-                UNICODE_STRING64 SaveDesktopName64;
-                UNICODE_STRING64 *DesktopName64;
-#endif ! _WIN64
+                P_SetProcessWindowStation _SetProcessWindowStation =
+                    (P_SetProcessWindowStation)
+                    GetProcAddress(User32, "SetProcessWindowStation");
 
-                memcpy(&SaveDesktopName, &ProcessParms->DesktopName,
-                       sizeof(UNICODE_STRING));
+                P_GetProcessWindowStation _GetProcessWindowStation =
+                    (P_GetProcessWindowStation)
+                    GetProcAddress(User32, "GetProcessWindowStation");
 
-                RtlInitUnicodeString(
-                    &ProcessParms->DesktopName, rpl->name);
+                if (!__sys_SetThreadDesktop) {
+                    // in the special case when USER32 is loaded before GDI32, as
+                    // discussed in Gdi_InitZero, SetThreadDesktop is still zero
+                    __sys_SetThreadDesktop = (P_SetThreadDesktop)
+                        GetProcAddress(User32, "SetThreadDesktop");
+                }
 
-#ifndef _WIN64
-                //
-                // in a 32-bit process on 64-bit Windows, we actually need
-                // to change the DesktopName member in the 64-bit
-                // RTL_USER_PROCESS_PARAMETERS structure and not the
-                // 32-bit version of the structure.
-                //
-                // note that the 64-bit PEB will be in the lower 32-bits in
-                // a 32-bit process, so it is accessible, but its address is
-                // not available to us.   but the SbieSvc GUI Proxy process
-                // is 64-bit so it can send us the address of the 64-bit PEB
-                // in the reply datagram
-                //
-
-                if (Dll_IsWow64) {
+                if ((!_SetProcessWindowStation) || (!__sys_SetThreadDesktop))
+                    errlvl = 3;
+                else {
 
                     //
-                    // 64-bit PEB offset 0x20 -> RTL_USER_PROCESS_PARAMETERS
-                    // RTL_USER_PROCESS_PARAMETERS offset 0xC0 is DesktopName
+                    // set DesktopName in ProcessParms to point to our dummy
+                    // window station so the initial default connection can
+                    // be made to a workstation that is accessible
                     //
 
-                    ULONG ProcessParms64 = *(ULONG *)(rpl->peb64 + 0x20);
-                    DesktopName64 =
-                            (UNICODE_STRING64 *)(ProcessParms64 + 0xC0);
-
-                    memcpy(&SaveDesktopName64,
-                           DesktopName64, sizeof(UNICODE_STRING64));
-
-                    DesktopName64->Length = ProcessParms->DesktopName.Length;
-                    DesktopName64->MaximumLength =
-                                     ProcessParms->DesktopName.MaximumLength;
-                    DesktopName64->Buffer =
-                                     (ULONG)ProcessParms->DesktopName.Buffer;
-                }
+                    UNICODE_STRING SaveDesktopName;
+#ifndef _WIN64
+                    UNICODE_STRING64 SaveDesktopName64;
+                    UNICODE_STRING64* DesktopName64;
 #endif ! _WIN64
 
-                //
-                // note also that the default \Windows object directory
-                // (where the WindowStations object directory is located)
-                // grants access to Everyone, but this is not true for
-                // the per-session object directories \Sessions\N.
-                //
-                // our process token does not include the change notify
-                // privilege, so access to the window station object
-                // would have to validate each object directory in the
-                // path, and this would fail with our process token.
-                //
-                // to work around this, we issue a special request to
-                // SbieDrv through NtSetInformationThread which causes
-                // it to return with an impersonation token that includes
-                // the change notify privilege but is otherwise restricted
-                //
-                // see also:  file core/drv/thread_token.c function
-                // Thread_SetInformationThread_ChangeNotifyToken
-                //
+                    memcpy(&SaveDesktopName, &ProcessParms->DesktopName,
+                        sizeof(UNICODE_STRING));
 
-                rc = (ULONG_PTR)NtCurrentThread();
+                    RtlInitUnicodeString(
+                        &ProcessParms->DesktopName, rpl->name);
 
-				// OriginalToken BEGIN
-				if (SbieApi_QueryConfBool(NULL, L"OriginalToken", FALSE))
-					rc = 0;
-				else
-				// OriginalToken END
-                if (__sys_NtSetInformationThread)
-                {
-                    rc = __sys_NtSetInformationThread(NtCurrentThread(),
-                        ThreadImpersonationToken, &rc, sizeof(rc));
-                }
-                else
-                {
-                    rc = NtSetInformationThread(NtCurrentThread(),
+#ifndef _WIN64
+                    //
+                    // in a 32-bit process on 64-bit Windows, we actually need
+                    // to change the DesktopName member in the 64-bit
+                    // RTL_USER_PROCESS_PARAMETERS structure and not the
+                    // 32-bit version of the structure.
+                    //
+                    // note that the 64-bit PEB will be in the lower 32-bits in
+                    // a 32-bit process, so it is accessible, but its address is
+                    // not available to us.   but the SbieSvc GUI Proxy process
+                    // is 64-bit so it can send us the address of the 64-bit PEB
+                    // in the reply datagram
+                    //
+
+                    if (Dll_IsWow64) {
+
+                        //
+                        // 64-bit PEB offset 0x20 -> RTL_USER_PROCESS_PARAMETERS
+                        // RTL_USER_PROCESS_PARAMETERS offset 0xC0 is DesktopName
+                        //
+
+                        ULONG ProcessParms64 = *(ULONG*)(rpl->peb64 + 0x20);
+                        DesktopName64 =
+                            (UNICODE_STRING64*)(ProcessParms64 + 0xC0);
+
+                        memcpy(&SaveDesktopName64,
+                            DesktopName64, sizeof(UNICODE_STRING64));
+
+                        DesktopName64->Length = ProcessParms->DesktopName.Length;
+                        DesktopName64->MaximumLength =
+                            ProcessParms->DesktopName.MaximumLength;
+                        DesktopName64->Buffer =
+                            (ULONG)ProcessParms->DesktopName.Buffer;
+                    }
+#endif ! _WIN64
+
+                    //
+                    // note also that the default \Windows object directory
+                    // (where the WindowStations object directory is located)
+                    // grants access to Everyone, but this is not true for
+                    // the per-session object directories \Sessions\N.
+                    //
+                    // our process token does not include the change notify
+                    // privilege, so access to the window station object
+                    // would have to validate each object directory in the
+                    // path, and this would fail with our process token.
+                    //
+                    // to work around this, we issue a special request to
+                    // SbieDrv through NtSetInformationThread which causes
+                    // it to return with an impersonation token that includes
+                    // the change notify privilege but is otherwise restricted
+                    //
+                    // see also:  file core/drv/thread_token.c function
+                    // Thread_SetInformationThread_ChangeNotifyToken
+                    //
+
+                    rc = (ULONG_PTR)NtCurrentThread();
+
+                    // OriginalToken BEGIN
+                    if (Dll_CompartmentMode || SbieApi_QueryConfBool(NULL, L"OriginalToken", FALSE))
+                        rc = 0;
+                    else
+                        // OriginalToken END
+                        if (__sys_NtSetInformationThread)
+                        {
+                            rc = __sys_NtSetInformationThread(NtCurrentThread(),
                                 ThreadImpersonationToken, &rc, sizeof(rc));
-                }
+                        }
+                        else
+                        {
+                            rc = NtSetInformationThread(NtCurrentThread(),
+                                ThreadImpersonationToken, &rc, sizeof(rc));
+                        }
 
-                if (rc != 0)
-                    errlvl = 4;
+                    Gui_Dummy_WinSta = _GetProcessWindowStation();
 
-                //
-                // invoking SetProcessWindowStation will first connect
-                // to the default (dummy) window station as part of
-                // initial thread by PsConvertToGuiThread, then when
-                // control finally arrives in SetProcessWindowStation,
-                // the connection to the real window station is made
-                //
+                    if (rc != 0)
+                        errlvl = 4;
 
-                else if (! _SetProcessWindowStation(
-                                                (HWINSTA)rpl->hwinsta)) {
-                    errlvl = 5;
-                    rc = GetLastError();
+                    //
+                    // invoking SetProcessWindowStation will first connect
+                    // to the default (dummy) window station as part of
+                    // initial thread by PsConvertToGuiThread, then when
+                    // control finally arrives in SetProcessWindowStation,
+                    // the connection to the real window station is made
+                    //
 
-                } else
-                    _ProcessDesktop = (HDESK)rpl->hdesk;
+                    else if (!_SetProcessWindowStation(
+                        (HWINSTA)rpl->hwinsta)) {
+                        errlvl = 5;
+                        rc = GetLastError();
 
-                //
-                // restore the original contents of the DesktopName field
-                //
+                    }
+                    else
+                        _ProcessDesktop = (HDESK)rpl->hdesk;
 
-                memcpy(&ProcessParms->DesktopName, &SaveDesktopName,
-                       sizeof(UNICODE_STRING));
+                    //
+                    // restore the original contents of the DesktopName field
+                    //
+
+                    memcpy(&ProcessParms->DesktopName, &SaveDesktopName,
+                        sizeof(UNICODE_STRING));
 #ifndef _WIN64
-                if (Dll_IsWow64) {
-                    memcpy(DesktopName64, &SaveDesktopName64,
-                           sizeof(UNICODE_STRING64));
-                }
+                    if (Dll_IsWow64) {
+                        memcpy(DesktopName64, &SaveDesktopName64,
+                            sizeof(UNICODE_STRING64));
+                    }
 #endif ! _WIN64
+                }
             }
 
             Dll_Free(rpl);
@@ -1024,7 +1142,7 @@ _FX BOOLEAN Gui_ConnectToWindowStationAndDesktop(HMODULE User32)
 
 ConnectThread:
 
-    if (errlvl == 0) {
+    if (errlvl == 0 && _ProcessDesktop != (HDESK)-1) {
 
         if (! __sys_SetThreadDesktop(_ProcessDesktop)) {
             errlvl = 6;
@@ -1088,7 +1206,7 @@ _FX BOOLEAN Gui_IsSameBox(
 {
     ULONG idProcess, idThread;
     NTSTATUS status;
-    WCHAR boxname[48];
+    WCHAR boxname[BOXNAME_COUNT];
     ULONG session_id;
 
     idProcess = 0;
@@ -1229,36 +1347,57 @@ _FX HWND Gui_CreateWindowExW(
     HWND hwndResult;
 
     //
-    // under Sandboxie 4 the Chrome sandbox child process gets confused
+    // Under Sandboxie 4, the Chrome sandbox child process gets confused
     // (reason not known) and creates some top level windows, for which it
-    // does not process messages.  this causes DDE message broadcast to
-    // hang for several seconds.  to workaround this, we cause the windows
+    // does not process messages. This causes DDE message broadcast to
+    // hang for several seconds. To workaround this, we cause the windows
     // to be created as message-only windows
     //
     // note:  the desktop window was made accessible in early v4 builds
     // but this code is still here to handle any other parent windows
     //
-    /*//debug code
-    _asm {
-        nop
-        nop
-//HERE1:
-//      jmp HERE1
-        //int 3
-        nop
-        nop
-    }
-*/
-    if (Dll_ChromeSandbox) {
+    // note:  this code breaks Chrome hw acceleration, so it is no longer used
+    //
+
+    /*if (Dll_ChromeSandbox) { 
         dwStyle |= WS_CHILD;
         hWndParent = HWND_MESSAGE;
-    }
+    }*/
 
     //
     // replace title on windows that have no parent
     // replace class name
     // replace parent
     //
+
+	if (Gui_DontAllowCoverTaskbar) {
+
+		typedef BOOL(*P_SystemParametersInfoA)(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni);
+		static P_SystemParametersInfoA SystemParametersInfoA = NULL;
+		if (!SystemParametersInfoA) SystemParametersInfoA = Ldr_GetProcAddrNew(L"user32.dll", L"SystemParametersInfoA", "SystemParametersInfoA");
+
+		typedef int (*P_GetSystemMetrics)(int nIndex);
+		static P_GetSystemMetrics GetSystemMetrics = NULL;
+		if (!GetSystemMetrics) GetSystemMetrics = Ldr_GetProcAddrNew(L"user32.dll", L"GetSystemMetrics", "GetSystemMetrics");
+
+		if (SystemParametersInfoA && GetSystemMetrics) {
+
+			RECT rt;
+			SystemParametersInfoA(SPI_GETWORKAREA, 0, &rt, 0);
+			int y1 = GetSystemMetrics(SM_CYSCREEN) - rt.bottom;
+			int x1 = GetSystemMetrics(SM_CXSCREEN) - rt.right;
+			int y2 = GetSystemMetrics(SM_CYSCREEN) - rt.top;
+			int x2 = GetSystemMetrics(SM_CXSCREEN) - rt.left;
+			if (y + nHeight > y1)
+				nHeight = y1 - y - 2;
+			if (y < y2)
+				y = y2 + 2;
+			if (x + nWidth > x1)
+				nWidth = x1 - x;
+			if (x < x2)
+				x = x2 + 2;
+		}
+	}
 
     if ((! Gui_DisableTitle) &&
             lpWindowName && (dwStyle & WS_CAPTION) == WS_CAPTION &&
@@ -1267,7 +1406,10 @@ _FX HWND Gui_CreateWindowExW(
     else
         new_WindowName = lpWindowName;
 
-    clsnm = Gui_CreateClassNameW(lpClassName);
+    if (! Gui_RenameClasses)
+        clsnm = lpClassName;
+    else
+        clsnm = Gui_CreateClassNameW(lpClassName);
 
     if (hWndParent && (hWndParent != HWND_MESSAGE)
                             && (! __sys_IsWindow(hWndParent))) {
@@ -1276,7 +1418,13 @@ _FX HWND Gui_CreateWindowExW(
         else
             hWndParent = NULL;
     }
-
+	
+	if (Gui_BlockInterferenceControl){
+	
+		if (dwExStyle & WS_EX_TOPMOST)
+			dwExStyle = dwExStyle & ~WS_EX_TOPMOST;
+	}
+			
     //
     // create window
     //
@@ -1284,7 +1432,10 @@ _FX HWND Gui_CreateWindowExW(
     ++TlsData->gui_create_window;
     if (TlsData->gui_create_window == 1) {
 
-        Gui_ApplyWinHooks(0);
+        if (!TlsData->gui_hooks_installed) {
+            Gui_NotifyWinHooks();
+            TlsData->gui_hooks_installed = TRUE;
+        }
 
         Taskbar_SetProcessAppUserModelId();
     }
@@ -1307,11 +1458,14 @@ _FX HWND Gui_CreateWindowExW(
 
     --TlsData->gui_create_window;
 
+    if (hwndResult && !hWndParent && Gui_UseProtectScreen)
+        Gui_ProtectScreen(hwndResult);
+
     //
     // replace window procedure
     //
 
-    if (hwndResult) {
+    if (hwndResult && Gui_RenameClasses) {
 
         Gui_SetWindowProc(hwndResult, FALSE);
 
@@ -1369,7 +1523,16 @@ _FX HWND Gui_CreateWindowExA(
     else
         new_WindowName = lpWindowName;
 
-    clsnm = Gui_CreateClassNameA(lpClassName);
+    if (! Gui_RenameClasses)
+        clsnm = lpClassName;
+    else
+        clsnm = Gui_CreateClassNameA(lpClassName);
+
+	if (Gui_BlockInterferenceControl){
+	
+		if (dwExStyle & WS_EX_TOPMOST)
+			dwExStyle = dwExStyle & ~WS_EX_TOPMOST;
+	}
 
     if (hWndParent && (hWndParent != HWND_MESSAGE)
                             && (! __sys_IsWindow(hWndParent))) {
@@ -1385,8 +1548,11 @@ _FX HWND Gui_CreateWindowExA(
 
     ++TlsData->gui_create_window;
     if (TlsData->gui_create_window == 1) {
-
-        Gui_ApplyWinHooks(0);
+        
+        if (!TlsData->gui_hooks_installed) {
+            Gui_NotifyWinHooks();
+            TlsData->gui_hooks_installed = TRUE;
+        }
 
         Taskbar_SetProcessAppUserModelId();
     }
@@ -1409,11 +1575,14 @@ _FX HWND Gui_CreateWindowExA(
 
     --TlsData->gui_create_window;
 
+    if (hwndResult && !hWndParent && Gui_UseProtectScreen)
+        Gui_ProtectScreen(hwndResult);
+
     //
     // replace window procedure
     //
 
-    if (hwndResult) {
+    if (hwndResult && Gui_RenameClasses) {
 
         Gui_SetWindowProc(hwndResult, FALSE);
 
@@ -1440,16 +1609,10 @@ _FX HWND Gui_CreateWindowExA(
 
 
 _FX BOOLEAN Gui_CanForwardMsg(
-    HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+    HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam/*, LRESULT* plResult*/)
 {
-    if (uMsg == WM_NULL) {
-
-        if (wParam == tzuk) {
-            Gui_ApplyWinHooks(lParam);
-            return FALSE;
-        }
-
-    } else if (uMsg == WM_DROPFILES) {
+    //*plResult = 0;
+    if (uMsg == WM_DROPFILES) {
 
         if (Ole_DoDragDrop(hWnd, wParam, lParam))
             return FALSE;
@@ -1473,6 +1636,22 @@ _FX BOOLEAN Gui_CanForwardMsg(
 
 
 //---------------------------------------------------------------------------
+// Gui_ProtectScreen
+//---------------------------------------------------------------------------
+
+
+_FX VOID Gui_ProtectScreen(HWND hWnd)
+{
+    typedef BOOL(*LPSETWINDOWDISPLAYAFFINITY)(HWND, DWORD);
+    static LPSETWINDOWDISPLAYAFFINITY pSetWindowDisplayAffinity = NULL;
+    if(!pSetWindowDisplayAffinity)
+        pSetWindowDisplayAffinity = (LPSETWINDOWDISPLAYAFFINITY)Ldr_GetProcAddrNew(DllName_user32, L"SetWindowDisplayAffinity", "SetWindowDisplayAffinity");
+    if (pSetWindowDisplayAffinity)
+        pSetWindowDisplayAffinity(hWnd, 0x00000011);
+}
+
+
+//---------------------------------------------------------------------------
 // Gui_WindowProcW
 //---------------------------------------------------------------------------
 
@@ -1486,8 +1665,8 @@ _FX LRESULT Gui_WindowProcW(
     THREAD_DATA * TlsData = Dll_GetTlsData(NULL);
     BOOLEAN bIgnore = FALSE;
 
-    if (! Gui_CanForwardMsg(hWnd, uMsg, wParam, lParam))
-        return 0;
+    if (! Gui_CanForwardMsg(hWnd, uMsg, wParam, lParam/*, &lResult*/))
+        return 0; //lResult;
 
     if (uMsg == WM_DDE_INITIATE)
         wParam = Gui_DDE_INITIATE_Received(hWnd, wParam);
@@ -1497,8 +1676,15 @@ _FX LRESULT Gui_WindowProcW(
     else
         new_lParam = lParam;
 
+	if (uMsg == WM_QUERYENDSESSION)
+	{
+		if (SbieApi_QueryConfBool(NULL, L"BlockInterferePower", FALSE))
+			return TRUE;
+	}
+
     wndproc = __sys_GetPropW(hWnd, (LPCWSTR)Gui_WindowProcOldW_Atom);
     if (DLL_IMAGE_OFFICE_EXCEL == Dll_ImageType) {
+
         if (WM_RENDERFORMAT == uMsg)
         {
             TlsData = Dll_GetTlsData(NULL);
@@ -1513,7 +1699,6 @@ _FX LRESULT Gui_WindowProcW(
         if (!bIgnore)
         {
             lResult = __sys_CallWindowProcW(wndproc, hWnd, uMsg, wParam, new_lParam);
-
         }
         else
         {
@@ -1542,8 +1727,8 @@ _FX LRESULT Gui_WindowProcA(
     LRESULT lResult;
     LPARAM new_lParam;
 
-    if (! Gui_CanForwardMsg(hWnd, uMsg, wParam, lParam))
-        return 0;
+    if (! Gui_CanForwardMsg(hWnd, uMsg, wParam, lParam/*, &lResult*/))
+        return 0; //lResult;
 
     if (uMsg == WM_DDE_INITIATE)
         wParam = Gui_DDE_INITIATE_Received(hWnd, wParam);
@@ -1552,7 +1737,12 @@ _FX LRESULT Gui_WindowProcA(
         new_lParam = (LPARAM)Gui_CreateTitleA((UCHAR *)lParam);
     else
         new_lParam = lParam;
-
+		
+	if (uMsg == WM_QUERYENDSESSION)
+	{
+		if (SbieApi_QueryConfBool(NULL, L"BlockInterferePower", FALSE))
+			return TRUE;
+	}
     wndproc = __sys_GetPropW(hWnd, (LPCWSTR)Gui_WindowProcOldA_Atom);
     lResult = __sys_CallWindowProcA(wndproc, hWnd, uMsg, wParam, new_lParam);
 
@@ -1798,6 +1988,36 @@ _FX BOOL Gui_MoveWindow(
         SetLastError(ERROR_INVALID_WINDOW_HANDLE);
         return FALSE;
     }
+	
+    if (Gui_DontAllowCoverTaskbar) {
+
+        typedef BOOL (*P_SystemParametersInfoA)(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni);
+        static P_SystemParametersInfoA SystemParametersInfoA = NULL;
+        if (!SystemParametersInfoA) SystemParametersInfoA = Ldr_GetProcAddrNew(L"user32.dll", L"SystemParametersInfoA", "SystemParametersInfoA");
+
+        typedef int (*P_GetSystemMetrics)(int nIndex);
+        static P_GetSystemMetrics GetSystemMetrics = NULL;
+        if (!GetSystemMetrics) GetSystemMetrics = Ldr_GetProcAddrNew(L"user32.dll", L"GetSystemMetrics", "GetSystemMetrics");
+
+        if (SystemParametersInfoA && GetSystemMetrics) {
+
+            RECT rt;
+            SystemParametersInfoA(SPI_GETWORKAREA, 0, &rt, 0);
+			int y1 = GetSystemMetrics(SM_CYSCREEN) - rt.bottom;
+			int x1 = GetSystemMetrics(SM_CXSCREEN) - rt.right;
+			int y2 = GetSystemMetrics(SM_CYSCREEN) - rt.top;
+			int x2 = GetSystemMetrics(SM_CXSCREEN) - rt.left;
+			if (y + h > y1)
+				h = y1 - y - 2;
+			if (y < y2)
+				y = y2 + 2;
+			if (x + w > x1)
+				w = x1 - x;
+			if (x < x2)
+				x = x2 + 2;
+        }
+    }
+
     return __sys_MoveWindow(hWnd, x, y, w, h, bRepaint);
 }
 
@@ -1820,8 +2040,40 @@ _FX BOOL Gui_SetWindowPos(
     //
     // use SbieSvc GUI Proxy if hWnd is accessible but outside the sandbox
     //
+	
+    if (Gui_DontAllowCoverTaskbar) {
 
-    if (! Gui_IsSameBox(hWnd, NULL, NULL)) {
+        if (hWndInsertAfter == HWND_TOPMOST || hWndInsertAfter == HWND_TOP)
+            hWndInsertAfter = HWND_DESKTOP;
+
+        typedef BOOL (*P_SystemParametersInfoA)(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni);
+        static P_SystemParametersInfoA SystemParametersInfoA = NULL;
+        if (!SystemParametersInfoA) SystemParametersInfoA = Ldr_GetProcAddrNew(L"user32.dll", L"SystemParametersInfoA", "SystemParametersInfoA");
+
+        typedef int (*P_GetSystemMetrics)(int nIndex);
+        static P_GetSystemMetrics GetSystemMetrics = NULL;
+        if (!GetSystemMetrics) GetSystemMetrics = Ldr_GetProcAddrNew(L"user32.dll", L"GetSystemMetrics", "GetSystemMetrics");
+
+        if (SystemParametersInfoA && GetSystemMetrics) {
+
+            RECT rt;
+            SystemParametersInfoA(SPI_GETWORKAREA, 0, &rt, 0);
+			int y1 = GetSystemMetrics(SM_CYSCREEN) - rt.bottom;
+			int x1 = GetSystemMetrics(SM_CXSCREEN) - rt.right;
+			int y2 = GetSystemMetrics(SM_CYSCREEN) - rt.top;
+			int x2 = GetSystemMetrics(SM_CXSCREEN) - rt.left;
+			if (y + h > y1)
+				h = y1 - y - 2;
+			if (y < y2)
+				y = y2 + 2;
+			if (x + w > x1)
+				w = x1 - x;
+			if (x < x2)
+				x = x2 + 2;
+        }
+    }
+	
+    if (Gui_UseProxyService && !Gui_IsSameBox(hWnd, NULL, NULL)) {
 
         GUI_SET_WINDOW_POS_REQ req;
         GUI_SET_WINDOW_POS_RPL *rpl;
@@ -1960,7 +2212,7 @@ _FX BOOL Gui_ConsoleControl(ULONG ctlcode, ULONG *data, ULONG_PTR unknown)
         BOOLEAN ok = SbieDll_KillOne(*data);
         if (ok)
             return STATUS_SUCCESS;
-        SbieApi_Log(2205, L"ConsoleControl");
+        //SbieApi_Log(2205, L"ConsoleControl"); // don't log when the process was already killed
     }
     return __sys_ConsoleControl(ctlcode, data, unknown);
 }
@@ -2613,11 +2865,11 @@ _FX NTSTATUS ComDlg32_GetOpenFileNameW(LPVOID lpofn)
     return bRet;
 }
 
-_FX BOOLEAN ComDlg32_Init(HMODULE hModule)
+_FX BOOLEAN ComDlg32_Init(HMODULE module)
 {
     //if (_wcsicmp(Dll_ImageName, L"opera.exe") == 0)
     //{
-        void *GetOpenFileNameW = GetProcAddress(hModule, "GetOpenFileNameW");
+        void *GetOpenFileNameW = GetProcAddress(module, "GetOpenFileNameW");
         SBIEDLL_HOOK(ComDlg32_, GetOpenFileNameW);
     //}
 

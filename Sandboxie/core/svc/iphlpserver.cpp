@@ -187,6 +187,14 @@ MSG_HEADER *IpHlpServer::CreateHandler(MSG_HEADER *msg, HANDLE idProcess)
     if ((! p_IcmpCreateFile) || (! m_IcmpCloseHandle))
         return SHORT_REPLY(ERROR_NOT_SUPPORTED);
 
+    WCHAR boxname[BOXNAME_COUNT];
+    WCHAR exename[99];
+    if (!NT_SUCCESS(SbieApi_QueryProcess(idProcess, boxname, exename, NULL, NULL)))
+        return SHORT_REPLY(E_FAIL);
+
+    if (!SbieDll_GetSettingsForName_bool(boxname, exename, L"AllowNetworkAccess", TRUE))
+        return SHORT_REPLY(ERROR_ACCESS_DENIED);
+
     if (0 != SbieApi_CheckInternetAccess(
                                 idProcess, req->ip6 ? L"Ip6" : L"Ip", TRUE))
         return SHORT_REPLY(ERROR_ACCESS_DENIED);
@@ -356,7 +364,7 @@ MSG_HEADER *IpHlpServer::SendEchoHandler(MSG_HEADER *msg, HANDLE idProcess)
 
         if (num_replies == 0) {
             rpl->h.status = GetLastError();
-            reply_size = 0;
+            num_replies = 1; // even on error we need to return one valid result buffer
         } else
             rpl->h.status = ERROR_SUCCESS;
 

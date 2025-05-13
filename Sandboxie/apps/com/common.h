@@ -1,5 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
+ * Copyright 2021-2023 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -36,6 +37,7 @@ const WCHAR *_SandboxieRpcSs = SANDBOXIE L"RpcSs.exe";
 const WCHAR *_msiexec = L"msiexec.exe";
 
 static HMODULE KernelBase = NULL;
+static HMODULE SecHost = NULL;
 static BOOLEAN IsWindows81 = FALSE;
 
 //---------------------------------------------------------------------------
@@ -57,7 +59,26 @@ static BOOLEAN IsWindows81 = FALSE;
             SourceFunc = (void *)func;                              \
     }                                                               \
     __sys_##func =                                                  \
-        (ULONG_PTR)SbieDll_Hook(FuncName, SourceFunc, my_##func);   \
+        (ULONG_PTR)SbieDll_Hook(FuncName, SourceFunc, my_##func, KernelBase);   \
+    if (! __sys_##func)                                             \
+        hook_success = FALSE;                                       \
+    }
+
+//#define HOOK_WIN32_SCM(func) {                                      \
+//    const char *FuncName = #func;                                   \
+//    void *SourceFunc = (void *)func;                                \
+//    if (SecHost)                                                    \
+//        SourceFunc = GetProcAddress(SecHost, FuncName);             \
+//    if (! SourceFunc)                                               \
+//        SourceFunc = (void *)func;                                  \
+//    __sys_##func =                                                  \
+//        (ULONG_PTR)SbieDll_Hook(FuncName, SourceFunc, my_##func, SourceFunc);   \
+//    if (! __sys_##func)                                             \
+//        hook_success = FALSE;                                       \
+//    }
+
+#define HOOK_WIN32_SCM(func) {                                      \
+    __sys_##func = Scm_Hook##func(my_##func);                       \
     if (! __sys_##func)                                             \
         hook_success = FALSE;                                       \
     }
@@ -80,6 +101,7 @@ void Check_Windows_7(void)
         osvi.dwMajorVersion == 6 && osvi.dwMinorVersion >= 1) {
 
         KernelBase = LoadLibrary(L"KernelBase.dll");
+        SecHost = LoadLibrary(L"SecHost.dll");
 
         //
         // GetVersionEx in Windows 8.1 returns version 6.2, same as
@@ -89,44 +111,6 @@ void Check_Windows_7(void)
         if (GetProcAddress(GetModuleHandle(L"ntdll.dll"), "NtCreateTimer2"))
             IsWindows81 = TRUE;
     }
-}
-
-
-//---------------------------------------------------------------------------
-// CheckProcessLocalSystem
-//---------------------------------------------------------------------------
-
-
-_FX BOOL CheckProcessLocalSystem(HANDLE ProcessHandle)
-{
-    BOOL IsLocalSystem = FALSE;
-
-    HANDLE TokenHandle;
-    BOOL b = OpenProcessToken(ProcessHandle, TOKEN_QUERY, &TokenHandle);
-    if (b) {
-
-        union {
-            TOKEN_USER user;
-            UCHAR space[64];
-        } info;
-        ULONG len = sizeof(info);
-        WCHAR *sid;
-
-        b = GetTokenInformation(
-            TokenHandle, TokenUser, &info, len, &len);
-        if (b) {
-            b = ConvertSidToStringSid(info.user.User.Sid, &sid);
-            if (b) {
-                if (wcscmp(sid, L"S-1-5-18") == 0)
-                    IsLocalSystem = TRUE;
-                LocalFree(sid);
-            }
-        }
-
-        CloseHandle(TokenHandle);
-    }
-
-    return IsLocalSystem;
 }
 
 
@@ -148,11 +132,15 @@ _FX ULONG FindProcessId(
     process = (HANDLE)(ULONG_PTR)GetCurrentProcessId();
     SbieApi_QueryProcess(process, NULL, NULL, this_sid, NULL);
 
-    pids = HeapAlloc(
-        GetProcessHeap(), HEAP_GENERATE_EXCEPTIONS, sizeof(ULONG) * 512);
-    SbieApi_EnumProcess(NULL, pids);
+    ULONG pid_count = 0;
+    SbieApi_EnumProcessEx(NULL, FALSE, -1, NULL, &pid_count); // query count
+    pid_count += 128;
 
-    for (i = 1; i <= pids[0]; ++i) {
+    pids = HeapAlloc(
+        GetProcessHeap(), HEAP_GENERATE_EXCEPTIONS, sizeof(ULONG) * pid_count);
+    SbieApi_EnumProcessEx(NULL, FALSE, -1, pids, &pid_count); // query pids
+
+    for (i = 0; i < pid_count; ++i) {
 
         HANDLE pids_i = (HANDLE)(ULONG_PTR)pids[i];
         SbieApi_QueryProcess(pids_i, NULL, image, that_sid, NULL);
@@ -180,7 +168,7 @@ _FX ULONG FindProcessId(
             }
 
             if (process) {
-                if (CheckProcessLocalSystem(process))
+                if (SbieDll_CheckProcessLocalSystem(process))
                     found = TRUE;
                 CloseHandle(process);
             }
@@ -300,7 +288,7 @@ _FX BOOL my_SetServiceStatus(SERVICE_STATUS_HANDLE hServiceStatus, LPSERVICE_STA
                     else
                         myData[i].checkpoint = lpServiceStatus->dwCheckPoint;
                     ServiceStatus_CheckPoint = lpServiceStatus->dwCheckPoint;
-                    myData->initFlag = 1;
+                    myData[i].initFlag = 1;
                     myData[i].state = lpServiceStatus->dwCurrentState;
                     InitComplete(&myData[i]);
                 }
@@ -493,7 +481,41 @@ BOOL my_QueryServiceStatusEx(
             // expect the service to NOT be stopped or stop-pending.
             // without this, MSI server gets CO_E_WRONG_SERVER_IDENTITY.
 
-            buf->dwProcessId = FindProcessId(_msiexec, TRUE);
+            //buf->dwProcessId = FindProcessId(_msiexec, TRUE);
+
+            WCHAR keyname[128];
+            wcscpy(keyname, L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\");
+            wcscat(keyname, L"MSIServer");
+
+            UNICODE_STRING objname;
+            RtlInitUnicodeString(&objname, keyname);
+
+            HANDLE hkey;
+            OBJECT_ATTRIBUTES objattrs;
+            InitializeObjectAttributes(&objattrs, &objname, OBJ_CASE_INSENSITIVE, NULL, NULL);
+            if (NT_SUCCESS(NtOpenKey(&hkey, KEY_QUERY_VALUE, &objattrs))) {
+
+                NTSTATUS status;
+                ULONG len;
+                UNICODE_STRING uni;
+                union {
+                    KEY_VALUE_PARTIAL_INFORMATION info;
+                    WCHAR info_space[256];
+                } u;
+
+                RtlInitUnicodeString(&uni, SBIE L"_ProcessId");
+                status = NtQueryValueKey(hkey, &uni, KeyValuePartialInformation, &u.info, sizeof(u), &len);
+
+                if (NT_SUCCESS(status) && u.info.Type == REG_DWORD && u.info.DataLength == 4) {
+
+                    ULONG pid;
+                    pid = *(ULONG*)u.info.Data;
+
+                    buf->dwProcessId = pid;
+                }
+
+                NtClose(hkey);
+            }
 
         }
         else if (hService == SC_HANDLE_EVENTSYSTEM) {
@@ -555,14 +577,14 @@ BOOL my_QueryServiceStatus(
 
 
 //---------------------------------------------------------------------------
-// my_StartService
+// my_StartServiceW
 //---------------------------------------------------------------------------
 
 
-ULONG_PTR __sys_StartService = 0;
+ULONG_PTR __sys_StartServiceW = 0;
 
 
-BOOL my_StartService(
+BOOL my_StartServiceW(
     SC_HANDLE hService,
     DWORD NumArgs,
     void *ArgVector)
@@ -578,7 +600,7 @@ BOOL my_StartService(
 
         typedef BOOL(*P_StartService)(
             SC_HANDLE hService, DWORD NumArgs, void *ArgVector);
-        ok = ((P_StartService)__sys_StartService)(
+        ok = ((P_StartService)__sys_StartServiceW)(
             hService, NumArgs, ArgVector);
 
     }
@@ -652,21 +674,6 @@ HANDLE my_CreateEventW(
 }
 
 
-//---------------------------------------------------------------------------
-// my_CreateFileMappingW (forward reference)
-//---------------------------------------------------------------------------
-
-ULONG_PTR __sys_CreateFileMappingW = 0;
-
-HANDLE my_CreateFileMappingW(
-    HANDLE hFile,
-    LPSECURITY_ATTRIBUTES lpAttributes,
-    DWORD flProtect,
-    DWORD dwMaximumSizeHigh,
-    DWORD dwMaximumSizeLow,
-    LPCWSTR lpName);
-
-
 
 #if 0
 
@@ -717,16 +724,14 @@ ULONG my_PowerSettingRegisterNotification(
 BOOL Hook_Service_Control_Manager(void)
 {
     BOOL hook_success = TRUE;
-    HOOK_WIN32(SetServiceStatus);
-    HOOK_WIN32(StartServiceCtrlDispatcherW);
-    HOOK_WIN32(OpenServiceW);
-    HOOK_WIN32(CloseServiceHandle);
-    HOOK_WIN32(QueryServiceStatusEx);
-    HOOK_WIN32(QueryServiceStatus);
-    HOOK_WIN32(StartService);
-    HOOK_WIN32(ControlService);
-
-    HOOK_WIN32(CreateFileMappingW);
+    HOOK_WIN32_SCM(SetServiceStatus);
+    HOOK_WIN32_SCM(StartServiceCtrlDispatcherW);
+    HOOK_WIN32_SCM(OpenServiceW);
+    HOOK_WIN32_SCM(CloseServiceHandle);
+    HOOK_WIN32_SCM(QueryServiceStatusEx);
+    HOOK_WIN32_SCM(QueryServiceStatus);
+    HOOK_WIN32_SCM(StartServiceW);
+    HOOK_WIN32_SCM(ControlService);
 
 #if 0
     HOOK_WIN32(RtlSetLastWin32Error);
@@ -755,6 +760,8 @@ BOOL Hook_Service_Control_Manager(void)
 
 BOOL Service_Start_ServiceMain(WCHAR *SvcName, const WCHAR *SvcDllName, const UCHAR *SvcProcName, BOOL UseMyStartServiceCtrlDispatcher)
 {
+    static const WCHAR *ServiceName_EnvVar =
+        L"00000000_" SBIE L"_SERVICE_NAME";
     HMODULE dll;
     LPSERVICE_MAIN_FUNCTION ServiceMain;
     ULONG table_len;
@@ -785,7 +792,7 @@ BOOL Service_Start_ServiceMain(WCHAR *SvcName, const WCHAR *SvcDllName, const UC
     table[0].lpServiceName = SvcName;
     table[0].lpServiceProc = ServiceMain;
 
-
+    SetEnvironmentVariable(ServiceName_EnvVar, SvcName);
 
     if (UseMyStartServiceCtrlDispatcher) {
         PROCESS_DATA *myData;
@@ -803,71 +810,6 @@ BOOL Service_Start_ServiceMain(WCHAR *SvcName, const WCHAR *SvcDllName, const UC
     }
 
     return TRUE;
-}
-
-
-//---------------------------------------------------------------------------
-// VectoredExceptionHandler
-//---------------------------------------------------------------------------
-
-
-_FX LONG VectoredExceptionHandler(EXCEPTION_POINTERS *ExceptionInfo)
-{
-    static ULONG LastExcCode = -1;
-    WCHAR txt[256];
-
-    //
-    // SkyNetRootKit crashes SandboxieRpcSs with an exception address
-    // beyond user space, so indicate this special condition
-    //
-
-    if (LastExcCode != ExceptionInfo->ExceptionRecord->ExceptionCode) {
-
-        ULONG_PTR ExceptionAddress =
-            (ULONG_PTR)ExceptionInfo->ExceptionRecord->ExceptionAddress;
-
-        LastExcCode = ExceptionInfo->ExceptionRecord->ExceptionCode;
-
-        if ((ExceptionAddress & 0xF0000000) >= 0x80000000) {
-
-            swprintf(txt, L"%s (%08X)", ServiceTitle, LastExcCode);
-            SbieApi_Log(2204, txt);
-
-            wsprintf(txt,
-                L"SBIE2398 Service suffers exception %08X at address %08X."
-                L"  Last checkpoint was %d\n",
-                ExceptionInfo->ExceptionRecord->ExceptionCode,
-                ExceptionInfo->ExceptionRecord->ExceptionAddress,
-                ServiceStatus_CheckPoint);
-            ErrorMessageBox(txt);
-        }
-    }
-
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
-
-//---------------------------------------------------------------------------
-// Setup
-//---------------------------------------------------------------------------
-
-
-_FX void SetupExceptionHandler(void)
-{
-#ifndef _WIN64
-
-    typedef void *(*P_AddVectoredExceptionHandler)(
-        ULONG FirstHandler,
-        PVECTORED_EXCEPTION_HANDLER VectoredHandler);
-
-    HMODULE kernel32 = GetModuleHandle(L"kernel32.dll");
-    void *ptr = GetProcAddress(kernel32, "AddVectoredExceptionHandler");
-    if (!ptr)
-        return;
-
-    ((P_AddVectoredExceptionHandler)ptr)(1, VectoredExceptionHandler);
-
-#endif _WIN64
 }
 
 

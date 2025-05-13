@@ -1,5 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
+ * Copyright 2020-2023 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -87,6 +88,7 @@ static const WCHAR *_HideWindowNotify           = L"HideWindowNotify";
        const WCHAR *_ShortcutNotify             = L"ShortcutNotify";
        const WCHAR *_UpdateCheckNotify          = L"UpdateCheckNotify";
 static const WCHAR *_ShouldDeleteNotify         = L"ShouldDeleteNotify";
+static const WCHAR *_ResMonNotify               = L"ResMonNotify";
 
 	   const WCHAR *_NextUpdateCheck            = L"NextUpdateCheck";
 
@@ -138,11 +140,17 @@ BEGIN_MESSAGE_MAP(CMyFrame, CFrameWnd)
     ON_COMMAND(ID_CONF_EDIT,                    OnCmdConfEdit)
     ON_COMMAND(ID_CONF_RELOAD,                  OnCmdConfReload)
 
-	ON_COMMAND(ID_HELP_SUPPORT,                 OnCmdHelpSupport)
+    ON_COMMAND(ID_HELP_SUPPORT,                 OnCmdHelpSupport)
+    ON_COMMAND(ID_HELP_CONTRIBUTION,            OnCmdHelpContribution)
     ON_COMMAND(ID_HELP_TOPICS,                  OnCmdHelpTopics)
     ON_COMMAND(ID_HELP_TUTORIAL,                OnCmdHelpTutorial)
     ON_COMMAND(ID_HELP_FORUM,                   OnCmdHelpForum)
-	ON_COMMAND(ID_HELP_UPDATE,                  OnCmdHelpUpdate)
+    ON_COMMAND(ID_HELP_UPDATE,                  OnCmdHelpUpdate)
+    ON_COMMAND(ID_HELP_UPGRADE,                 OnCmdHelpUpgrade)
+    ON_COMMAND(ID_HELP_WHATSNEW,                OnCmdHelpWhatsNew)
+    ON_COMMAND(ID_HELP_MIGRATION,               OnCmdHelpMigrate)
+    ON_COMMAND(ID_HELP_GET_CERT,                OnCmdHelpGetCert)
+    ON_COMMAND(ID_HELP_SET_CERT,                OnCmdHelpSetCert)
     ON_COMMAND(ID_HELP_ABOUT,                   OnCmdHelpAbout)
 
 	//ON_MESSAGE(WM_UPDATERESULT,					OnUpdateResult)
@@ -189,7 +197,7 @@ IMPLEMENT_MENUXP(CMyFrame, CFrameWnd)
 //---------------------------------------------------------------------------
 
 
-CMyFrame::CMyFrame(BOOL ForceVisible, BOOL ForceSync)
+CMyFrame::CMyFrame(BOOL ForceVisible, BOOL ForceSync, BOOL PostSetup)
 {
     m_mondlg = NULL;
     m_msgdlg = NULL;
@@ -197,6 +205,7 @@ CMyFrame::CMyFrame(BOOL ForceVisible, BOOL ForceSync)
     m_view = m_view_old = 0;
     m_hidden = FALSE;
 
+    m_ShowWhatsNew = PostSetup;
     //CUserSettings::GetInstance().GetBool(_ShowWelcome, m_ShowWelcome, TRUE);
     CUserSettings::GetInstance().GetBool(_AlwaysOnTop, m_AlwaysOnTop, FALSE);
 
@@ -230,7 +239,7 @@ CMyFrame::CMyFrame(BOOL ForceVisible, BOOL ForceSync)
     AdjustSizePosition(left, top, width, height);
 
     ULONG exStyle = (CMyApp::m_LayoutRTL) ? WS_EX_LAYOUTRTL : 0;
-	CString strTitle = CMyApp::m_appTitle + " - " MY_COMPANY_NAME_STRING;
+	CString strTitle = CMyApp::m_appTitle + " v" MY_VERSION_STRING " - " MY_COMPANY_NAME_STRING;
     CreateEx(   exStyle, (LPCTSTR)CMyApp::m_atom, strTitle,
                 WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_SYSMENU,
                 left, top, width, height,
@@ -414,6 +423,18 @@ void CMyFrame::InitMenus(void)
 
     CMenu *pMenu = CMyApp::MyLoadMenu(L"TOP_MENU");
 
+    const int menuIndex = 5;
+    MENUITEMINFO mii;
+    WCHAR text[128];
+    memzero(&mii, sizeof(MENUITEMINFO));
+    mii.cbSize = sizeof(MENUITEMINFO);
+    mii.fMask = MIIM_ID | MIIM_STRING;
+    mii.dwTypeData = text;
+    mii.cch = 120;
+    ::GetMenuItemInfo(*pMenu, menuIndex, TRUE, &mii);
+    mii.fMask = MIIM_TYPE;
+    mii.fType |= MFT_RIGHTJUSTIFY;
+    ::SetMenuItemInfo(*pMenu, menuIndex, TRUE, &mii);
 
     //
     // activate main menu
@@ -920,7 +941,7 @@ UINT AFX_CDECL CMyFrame::OnCmdConfEditThread(LPVOID parm)
 
 void CMyFrame::OnCmdConfReload()
 {
-    if (SbieApi_ReloadConf(-1) == 0) {
+    if (SbieApi_ReloadConf(-1, 0) == 0) {
 
         CBoxes::GetInstance().ReloadBoxes();
         CBoxes::GetInstance().RefreshProcesses();
@@ -981,6 +1002,17 @@ void CMyFrame::OnCmdHelpSupport()
 
 
 //---------------------------------------------------------------------------
+// OnCmdHelpContribution
+//---------------------------------------------------------------------------
+
+
+void CMyFrame::OnCmdHelpContribution()
+{
+	CRunBrowser x(this, L"https://sandboxie-plus.com/go.php?to=sbie-contribute");
+}
+
+
+//---------------------------------------------------------------------------
 // OnCmdHelpTopics
 //---------------------------------------------------------------------------
 
@@ -1012,7 +1044,7 @@ void CMyFrame::OnCmdHelpTutorial()
 
 void CMyFrame::OnCmdHelpForum()
 {
-    CRunBrowser::OpenForum(this);
+    CRunBrowser x(this, L"https://sandboxie-plus.com/go.php?to=sbie-forum");
 }
 
 //---------------------------------------------------------------------------
@@ -1025,6 +1057,90 @@ void CMyFrame::OnCmdHelpUpdate()
 	CUpdateDialog dlg(this);
 	dlg.DoModal();
 }
+
+//---------------------------------------------------------------------------
+// OnCmdHelpUpgrade
+//---------------------------------------------------------------------------
+
+
+void CMyFrame::OnCmdHelpUpgrade()
+{
+	CRunBrowser x(this, L"https://sandboxie-plus.com/go.php?to=sbie-plus&tip=upgrade");
+}
+
+
+//---------------------------------------------------------------------------
+// OnCmdHelpWhatsNew
+//---------------------------------------------------------------------------
+
+extern "C" void OpenWebView(const WCHAR * url, const WCHAR * title);
+
+void CMyFrame::OnCmdHelpWhatsNew()
+{
+    CString url;
+    url.Format(L"https://sandboxie-plus.com/go.php?to=sbie-whatsnew&language=%d&version=%S", SbieDll_GetLanguage(NULL), MY_VERSION_STRING);
+
+    WCHAR path[MAX_PATH];
+    GetModuleFileName(NULL, path, sizeof(path) / sizeof(WCHAR) - 4);
+    WCHAR* ptr = wcsrchr(path, L'\\');
+    if (ptr) ptr[1] = L'\0';
+    CString file = CString(path) + L"whatsnew.html";
+    if (PathFileExists(file)) {
+        file.Replace(L"\\", L"/");
+        url = L"file:///" + file;
+    }
+
+    CMyMsg text(MSG_3469);
+    OpenWebView(url, text);
+}
+
+
+//---------------------------------------------------------------------------
+// OnCmdHelpMigrate
+//---------------------------------------------------------------------------
+
+extern "C" void OpenWebView(const WCHAR * url, const WCHAR * title);
+
+void CMyFrame::OnCmdHelpMigrate()
+{
+    CString url;
+    url.Format(L"https://sandboxie-plus.com/go.php?to=sbie-migration&language=%d", SbieDll_GetLanguage(NULL));
+
+    /*WCHAR path[MAX_PATH];
+    GetModuleFileName(NULL, path, sizeof(path) / sizeof(WCHAR) - 4);
+    WCHAR* ptr = wcsrchr(path, L'\\');
+    if (ptr) ptr[1] = L'\0';
+    CString url = L"file:///" + CString(path);
+    url.Replace(L"\\", L"/");
+    url.Append(L"static/plus-migration.html");*/
+
+    CMyMsg text(MSG_3468);
+    OpenWebView(url, text);
+}
+
+
+//---------------------------------------------------------------------------
+// OnCmdHelpGetCert
+//---------------------------------------------------------------------------
+
+
+void CMyFrame::OnCmdHelpGetCert()
+{
+    CRunBrowser x(this, L"https://sandboxie-plus.com/go.php?to=sbie-get-cert");
+}
+
+
+//---------------------------------------------------------------------------
+// OnCmdHelpSetCert
+//---------------------------------------------------------------------------
+
+void ApplyCertificate();
+
+void CMyFrame::OnCmdHelpSetCert()
+{
+    ApplyCertificate();
+}
+
 
 //---------------------------------------------------------------------------
 // OnCmdHelpAbout
@@ -1090,6 +1206,22 @@ void CMyFrame::OnCmdResourceMonitor()
 {
     if (m_mondlg)
         return;
+
+    CUserSettings &settings = CUserSettings::GetInstance();
+    BOOL tip;
+    settings.GetBool(_ResMonNotify, tip, TRUE);
+    if (tip) {
+        int rv = CMyApp::MsgCheckBox(this, MSG_6001, 0, MB_YESNO);
+        if (rv < 0) {
+            rv = -rv;
+            settings.SetBool(_ResMonNotify, FALSE);
+        }
+        if (rv == IDYES) {
+            CRunBrowser x(this, L"https://sandboxie-plus.com/go.php?to=sbie-plus&tip=res_mon");
+            return;
+        }
+    }
+
     m_mondlg = new CMonitorDialog(this);
 
     m_mondlg->DoModal();
@@ -1645,7 +1777,7 @@ void CMyFrame::InitSandboxMenu2(CMenu *model, CMenu *child, UINT BaseId)
 
         } else if (id == 0) {
 
-            child->AppendMenu(MF_SEPARATOR, 0, title);
+            child->AppendMenu(MF_SEPARATOR, 0, (LPCTSTR)nullptr);
 
         } else {
 
@@ -2013,6 +2145,18 @@ void CMyFrame::OnTimer(UINT_PTR nIDEvent)
             CGettingStartedWizard wizard(this);
             return;
         }*/
+
+        //
+        // show what's new
+        //
+
+        if (m_ShowWhatsNew && (! inModalState)) {
+
+            m_ShowWhatsNew = FALSE;
+
+            OnCmdHelpWhatsNew();
+            return;
+        }
 
         //
         // resync shortcuts?  usually Sandboxie Control does not resync

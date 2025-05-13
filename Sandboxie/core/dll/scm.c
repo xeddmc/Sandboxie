@@ -1,6 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
- * Copyright 2020-2021 David Xanatos, xanasoft.com
+ * Copyright 2020-2024 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -48,7 +48,7 @@
 //---------------------------------------------------------------------------
 
 
-static BOOLEAN Scm_HookRegisterServiceCtrlHandler(void);
+static BOOLEAN Scm_HookRegisterServiceCtrlHandler(HMODULE module);
 
 //---------------------------------------------------------------------------
 
@@ -67,13 +67,27 @@ static SC_HANDLE Scm_OpenServiceA(
     const UCHAR *lpServiceName,
     DWORD dwDesiredAccess);
 
+static SC_HANDLE Scm_OpenServiceWImpl(
+    SC_HANDLE hSCManager,
+    const WCHAR *lpServiceName,
+    DWORD dwDesiredAccess);
+
 static SC_HANDLE Scm_OpenServiceW(
     SC_HANDLE hSCManager,
     const WCHAR *lpServiceName,
     DWORD dwDesiredAccess);
 
+static BOOL Scm_CloseServiceHandleImpl(SC_HANDLE hSCObject);
+
 static BOOL Scm_CloseServiceHandle(SC_HANDLE hSCObject);
 
+
+//---------------------------------------------------------------------------
+
+static ULONG_PTR Scm_SubscribeServiceChangeNotifications(
+    ULONG_PTR Unknown1, ULONG_PTR Unknown2, ULONG_PTR Unknown3,
+    ULONG_PTR Unknown4, ULONG_PTR Unknown5);
+	
 
 //---------------------------------------------------------------------------
 
@@ -97,10 +111,10 @@ static BOOLEAN Scm_DllHack(HMODULE module, const WCHAR *svcname);
 
 
 typedef SC_HANDLE (*P_OpenSCManager)(
-    void *lpMachineName, void *lpDatabaseName, DWORD dwDesiredAccess);
+    void *lpMachineName, const void *lpDatabaseName, DWORD dwDesiredAccess);
 
 typedef SC_HANDLE (*P_OpenService)(
-    SC_HANDLE hSCManager, void *lpServiceName, DWORD dwDesiredAccess);
+    SC_HANDLE hSCManager, const void *lpServiceName, DWORD dwDesiredAccess);
 
 typedef BOOL (*P_CloseServiceHandle)(
     SC_HANDLE hSCObject);
@@ -158,6 +172,13 @@ typedef BOOL (*P_SetServiceObjectSecurity)(
     SC_HANDLE hService,
     SECURITY_INFORMATION dwSecurityInformation,
     PSECURITY_DESCRIPTOR lpSecurityDescriptor);
+
+
+//---------------------------------------------------------------------------
+
+typedef ULONG_PTR (*P_SubscribeServiceChangeNotifications)(
+    ULONG_PTR Unknown1, ULONG_PTR Unknown2, ULONG_PTR Unknown3,
+    ULONG_PTR Unknown4, ULONG_PTR Unknown5); // ret 14h
 
 
 //---------------------------------------------------------------------------
@@ -232,13 +253,17 @@ static P_OpenSCManager          __sys_OpenSCManagerW            = NULL;
 static P_OpenSCManager          __sys_OpenSCManagerA            = NULL;
 
 static P_OpenService            __sys_OpenServiceW              = NULL;
+static P_OpenService            __my_OpenServiceW               = NULL;
 static P_OpenService            __sys_OpenServiceA              = NULL;
 
 static P_CloseServiceHandle     __sys_CloseServiceHandle        = NULL;
+static P_CloseServiceHandle     __my_CloseServiceHandle			= NULL;
 
 static P_QueryServiceStatus     __sys_QueryServiceStatus        = NULL;
+static P_QueryServiceStatus     __my_QueryServiceStatus         = NULL;
 
 static P_QueryServiceStatusEx   __sys_QueryServiceStatusEx      = NULL;
+static P_QueryServiceStatusEx   __my_QueryServiceStatusEx       = NULL;
 
 static P_QueryServiceConfig     __sys_QueryServiceConfigW       = NULL;
 static P_QueryServiceConfig     __sys_QueryServiceConfigA       = NULL;
@@ -274,6 +299,12 @@ static P_SetServiceObjectSecurity
 //---------------------------------------------------------------------------
 
 
+static P_SubscribeServiceChangeNotifications
+                            __sys_SubscribeServiceChangeNotifications = NULL;
+
+//---------------------------------------------------------------------------
+
+
 static P_LockServiceDatabase    __sys_LockServiceDatabase       = NULL;
 
 static P_UnlockServiceDatabase  __sys_UnlockServiceDatabase     = NULL;
@@ -290,10 +321,13 @@ static P_ChangeServiceConfig2   __sys_ChangeServiceConfig2A     = NULL;
 static P_DeleteService          __sys_DeleteService             = NULL;
 
 static P_StartService           __sys_StartServiceW             = NULL;
+static P_StartService           __my_StartServiceW              = NULL;
 static P_StartService           __sys_StartServiceA             = NULL;
 
 static P_StartServiceCtrlDispatcher
                               __sys_StartServiceCtrlDispatcherW = NULL;
+static P_StartServiceCtrlDispatcher
+							  __my_StartServiceCtrlDispatcherW	= NULL;
 static P_StartServiceCtrlDispatcher
                               __sys_StartServiceCtrlDispatcherA = NULL;
 
@@ -308,8 +342,10 @@ static P_RegisterServiceCtrlHandlerEx
                             __sys_RegisterServiceCtrlHandlerExA = NULL;
 
 static P_SetServiceStatus       __sys_SetServiceStatus          = NULL;
+static P_SetServiceStatus       __my_SetServiceStatus           = NULL;
 
 static P_ControlService         __sys_ControlService            = NULL;
+static P_ControlService         __my_ControlService             = NULL;
 
 static P_ControlServiceEx       __sys_ControlServiceExW         = NULL;
 static P_ControlServiceEx       __sys_ControlServiceExA         = NULL;
@@ -336,9 +372,6 @@ static P_CloseEventLog          __sys_CloseEventLog             = NULL;
 static const WCHAR *Scm_ServicesKeyPath =
     L"\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\";
 
-static const WCHAR *_MsiServerInUseEventName =
-    SBIE L"_WindowsInstallerInUse";
-
 static const WCHAR *Scm_MsiServer     = L"MSIServer";
        const WCHAR *Scm_CryptSvc      = L"cryptsvc";
 
@@ -357,15 +390,14 @@ static const WCHAR *_TrustedInstaller = L"TrustedInstaller";
 
 
 #define SCM_IMPORT_XX(base,suffix) {                                    \
-    const UCHAR *ProcName = #base#suffix;                               \
     __sys_##base##suffix =                                              \
-    (P_##base)Ldr_GetProcAddrNew(DllName_advapi32, L#base L#suffix,#base #suffix);   \
+    (P_##base)Ldr_GetProcAddrNew(DllName_advapi32, L#base L#suffix,#base #suffix); \
     }
 
-#define SCM_IMPORT_(m,base,suffix) {                                      \
+#define SCM_IMPORT_(m,base,suffix) {                                    \
     const UCHAR *ProcName = #base#suffix;                               \
     __sys_##base##suffix =                                              \
-    (P_##base)Ldr_GetProcAddrNew(m, L#base L#suffix,#base #suffix);   \
+    (P_##base)Ldr_GetProcAddrNew(m, L#base L#suffix,#base #suffix);     \
     if (! __sys_##base##suffix) {                                       \
         SbieApi_Log(2303, L"%s (ADV)", ProcName);                       \
         return FALSE;                                                   \
@@ -382,11 +414,21 @@ static const WCHAR *_TrustedInstaller = L"TrustedInstaller";
 //---------------------------------------------------------------------------
 
 
-#define SBIEDLL_HOOK_SCM(proc)                              \
-    *(ULONG_PTR *)&__sys_##proc = (ULONG_PTR)               \
-        SbieDll_Hook(#proc, __sys_##proc, Scm_##proc);      \
+#define SBIEDLL_HOOK_SCM(proc)                                      \
+    *(ULONG_PTR *)&__sys_##proc = (ULONG_PTR)                       \
+        SbieDll_Hook(#proc, __sys_##proc, Scm_##proc, module);      \
     if (! __sys_##proc) return FALSE;
 
+#define SBIEDLL_HOOK_SCM_EX(base,suffix)                            \
+    if (__sys_##base##suffix == NULL) {                             \
+        __sys_##base##suffix =                                      \
+            (P_##base)GetProcAddress(module, #base #suffix);        \
+        if (__sys_##base##suffix) {                                 \
+            *(ULONG_PTR *)&__sys_##base##suffix = (ULONG_PTR)       \
+                SbieDll_Hook(#base #suffix, __sys_##base##suffix, Scm_##base##suffix, module); \
+            if (! __sys_##base##suffix) return FALSE;               \
+        }                                                           \
+    }
 
 //---------------------------------------------------------------------------
 // Scm (other modules)
@@ -394,6 +436,7 @@ static const WCHAR *_TrustedInstaller = L"TrustedInstaller";
 
 
 #include "scm_query.c"
+#include "scm_msi.c"
 #include "scm_create.c"
 #include "scm_event.c"
 #include "scm_notify.c"
@@ -483,6 +526,122 @@ static const WCHAR *_TrustedInstaller = L"TrustedInstaller";
 
 
 //---------------------------------------------------------------------------
+// Scm_Init
+//---------------------------------------------------------------------------
+
+
+_FX BOOLEAN Scm_Init(HMODULE module)
+{
+    //
+    // As Windows got older, a lot of service-related functions have been subsequently moved
+    // from advapi32.dll to the sechost.dll. This happened continuously over many releases.
+    // To solve this more elegantly, we invoke the below code twice once when the sechost.dll
+    // is loaded and once when advapi32.dll is loaded. The SBIEDLL_HOOK_SCM_EX template was
+    // designed such that it will only hook the first encounter of any given function.
+    // 
+    // To work properly this mechanism necessitates the sechost.dll handler being called before
+    // the one for advapi32.dll
+    //
+
+    SBIEDLL_HOOK_SCM_EX(OpenSCManager,A);
+    SBIEDLL_HOOK_SCM_EX(OpenSCManager,W);
+
+    SBIEDLL_HOOK_SCM_EX(OpenService,A);
+    SBIEDLL_HOOK_SCM_EX(OpenService,W);
+
+    SBIEDLL_HOOK_SCM_EX(CloseServiceHandle,);
+
+    SBIEDLL_HOOK_SCM_EX(QueryServiceStatus,);
+    SBIEDLL_HOOK_SCM_EX(QueryServiceStatusEx,);
+
+    SBIEDLL_HOOK_SCM_EX(QueryServiceConfig,A);
+    SBIEDLL_HOOK_SCM_EX(QueryServiceConfig,W);
+    SBIEDLL_HOOK_SCM_EX(QueryServiceConfig2,A);
+    SBIEDLL_HOOK_SCM_EX(QueryServiceConfig2,W);
+
+    SBIEDLL_HOOK_SCM_EX(EnumServicesStatus,A);
+    SBIEDLL_HOOK_SCM_EX(EnumServicesStatus,W);
+    SBIEDLL_HOOK_SCM_EX(EnumServicesStatusEx,A);
+    SBIEDLL_HOOK_SCM_EX(EnumServicesStatusEx,W);
+
+    SBIEDLL_HOOK_SCM_EX(QueryServiceLockStatus,A);
+    SBIEDLL_HOOK_SCM_EX(QueryServiceLockStatus,W);
+
+    SBIEDLL_HOOK_SCM_EX(GetServiceDisplayName,A);
+    SBIEDLL_HOOK_SCM_EX(GetServiceDisplayName,W);
+
+    SBIEDLL_HOOK_SCM_EX(GetServiceKeyName,A);
+    SBIEDLL_HOOK_SCM_EX(GetServiceKeyName,W);
+
+    SBIEDLL_HOOK_SCM_EX(EnumDependentServices,A);
+    SBIEDLL_HOOK_SCM_EX(EnumDependentServices,W);
+
+    SBIEDLL_HOOK_SCM_EX(QueryServiceObjectSecurity,);
+    SBIEDLL_HOOK_SCM_EX(SetServiceObjectSecurity,);
+
+    SBIEDLL_HOOK_SCM_EX(LockServiceDatabase,);
+    SBIEDLL_HOOK_SCM_EX(UnlockServiceDatabase,);
+
+    SBIEDLL_HOOK_SCM_EX(CreateService,A);
+    SBIEDLL_HOOK_SCM_EX(CreateService,W);
+
+    SBIEDLL_HOOK_SCM_EX(ChangeServiceConfig,A);
+    SBIEDLL_HOOK_SCM_EX(ChangeServiceConfig,W);
+
+    SBIEDLL_HOOK_SCM_EX(ChangeServiceConfig2,A);
+    SBIEDLL_HOOK_SCM_EX(ChangeServiceConfig2,W);
+
+    SBIEDLL_HOOK_SCM_EX(DeleteService,);
+
+    SBIEDLL_HOOK_SCM_EX(StartService,A);
+    SBIEDLL_HOOK_SCM_EX(StartService,W);
+
+    SBIEDLL_HOOK_SCM_EX(StartServiceCtrlDispatcher,A);
+    SBIEDLL_HOOK_SCM_EX(StartServiceCtrlDispatcher,W);
+
+    if (__sys_RegisterServiceCtrlHandlerW == NULL) {
+        __sys_RegisterServiceCtrlHandlerA = (P_RegisterServiceCtrlHandler)GetProcAddress(module, "RegisterServiceCtrlHandlerA");
+        __sys_RegisterServiceCtrlHandlerW = (P_RegisterServiceCtrlHandler)GetProcAddress(module, "RegisterServiceCtrlHandlerW");
+        __sys_RegisterServiceCtrlHandlerExA = (P_RegisterServiceCtrlHandlerEx)GetProcAddress(module, "RegisterServiceCtrlHandlerExA");
+        __sys_RegisterServiceCtrlHandlerExW = (P_RegisterServiceCtrlHandlerEx)GetProcAddress(module, "RegisterServiceCtrlHandlerExW");
+        if (!Scm_HookRegisterServiceCtrlHandler(module))
+            return FALSE;
+    }
+
+    SBIEDLL_HOOK_SCM_EX(SetServiceStatus,);
+
+    SBIEDLL_HOOK_SCM_EX(ControlService,);
+    SBIEDLL_HOOK_SCM_EX(ControlServiceEx,A);
+    SBIEDLL_HOOK_SCM_EX(ControlServiceEx,W);
+
+    //
+    // NotifyServiceStatusChange is available on Windows Vista and later
+    //
+
+    if (Dll_OsBuild < 6000)
+        return TRUE;
+
+    //
+    // initialize critical section
+    //
+
+    if (Scm_Notify_CritSec == NULL) {
+        Scm_Notify_CritSec = Dll_Alloc(sizeof(CRITICAL_SECTION));
+        InitializeCriticalSectionAndSpinCount(Scm_Notify_CritSec, 1000);
+    }
+
+    //
+    // hook the API
+    //
+
+    SBIEDLL_HOOK_SCM_EX(NotifyServiceStatusChange,A);
+    SBIEDLL_HOOK_SCM_EX(NotifyServiceStatusChange,W);
+
+    return TRUE;
+}
+
+
+//---------------------------------------------------------------------------
 // Scm_Init_AdvApi
 //---------------------------------------------------------------------------
 
@@ -490,128 +649,71 @@ static const WCHAR *_TrustedInstaller = L"TrustedInstaller";
 _FX BOOLEAN Scm_Init_AdvApi(HMODULE module)
 {
     //
-    // import functions
-    //
-
-    SCM_IMPORT_AW(OpenSCManager);
-    SCM_IMPORT_AW(OpenService);
-    SCM_IMPORT___(CloseServiceHandle);
-
-    SCM_IMPORT___(QueryServiceStatus);
-    SCM_IMPORT___(QueryServiceStatusEx);
-    SCM_IMPORT_AW(QueryServiceConfig);
-    SCM_IMPORT_AW(QueryServiceConfig2);
-    SCM_IMPORT_AW(EnumServicesStatus);
-    SCM_IMPORT_AW(EnumServicesStatusEx);
-    SCM_IMPORT_AW(QueryServiceLockStatus);
-    SCM_IMPORT_AW(GetServiceDisplayName);
-    SCM_IMPORT_AW(GetServiceKeyName);
-    SCM_IMPORT_AW(EnumDependentServices);
-    SCM_IMPORT___(QueryServiceObjectSecurity);
-    SCM_IMPORT___(SetServiceObjectSecurity);
-
-    SCM_IMPORT___(LockServiceDatabase);
-    SCM_IMPORT___(UnlockServiceDatabase);
-    SCM_IMPORT_AW(CreateService);
-    SCM_IMPORT_AW(ChangeServiceConfig);
-    SCM_IMPORT_AW(ChangeServiceConfig2);
-    SCM_IMPORT___(DeleteService);
-    SCM_IMPORT_AW(StartService);
-    SCM_IMPORT_AW(StartServiceCtrlDispatcher);
-    SCM_IMPORT_AW(RegisterServiceCtrlHandler);
-    SCM_IMPORT_AW(RegisterServiceCtrlHandlerEx);
-    SCM_IMPORT___(SetServiceStatus);
-    SCM_IMPORT___(ControlService);
-
-    SCM_IMPORT_XX(ControlServiceEx,W);
-    SCM_IMPORT_XX(ControlServiceEx,A);
-
-    SCM_IMPORT_AW(RegisterEventSource);
-    SCM_IMPORT___(DeregisterEventSource);
-    SCM_IMPORT_AW(ReportEvent);
-    SCM_IMPORT___(CloseEventLog);
-
-    //
     // hook event log functions
     //
 
+    SCM_IMPORT_AW(RegisterEventSource);
     SBIEDLL_HOOK_SCM(RegisterEventSourceA);
     SBIEDLL_HOOK_SCM(RegisterEventSourceW);
 
+    SCM_IMPORT___(DeregisterEventSource);
     SBIEDLL_HOOK_SCM(DeregisterEventSource);
 
+    SCM_IMPORT_AW(ReportEvent);
     SBIEDLL_HOOK_SCM(ReportEventA);
     SBIEDLL_HOOK_SCM(ReportEventW);
 
+    SCM_IMPORT___(CloseEventLog);
     SBIEDLL_HOOK_SCM(CloseEventLog);
 
     //
     // hook SCM functions
     //
 
-    SBIEDLL_HOOK_SCM(OpenSCManagerA);
-    SBIEDLL_HOOK_SCM(OpenSCManagerW);
+    // ensure we first try to hook the sechost.dll
+    HMODULE sechost = GetModuleHandle(DllName_sechost);
+    if (sechost && !Scm_Init(sechost))
+        return FALSE;
 
-    SBIEDLL_HOOK_SCM(OpenServiceA);
-    SBIEDLL_HOOK_SCM(OpenServiceW);
+    if (!Scm_Init(module))
+        return FALSE;
 
-    SBIEDLL_HOOK_SCM(CloseServiceHandle);
+    return TRUE;
+}
 
-    SBIEDLL_HOOK_SCM(QueryServiceStatus);
-    SBIEDLL_HOOK_SCM(QueryServiceStatusEx);
 
-    SBIEDLL_HOOK_SCM(QueryServiceConfigA);
-    SBIEDLL_HOOK_SCM(QueryServiceConfigW);
-    SBIEDLL_HOOK_SCM(QueryServiceConfig2A);
-    SBIEDLL_HOOK_SCM(QueryServiceConfig2W);
+//---------------------------------------------------------------------------
+// SecHost_Init
+//---------------------------------------------------------------------------
 
-    SBIEDLL_HOOK_SCM(EnumServicesStatusA);
-    SBIEDLL_HOOK_SCM(EnumServicesStatusW);
-    SBIEDLL_HOOK_SCM(EnumServicesStatusExA);
-    SBIEDLL_HOOK_SCM(EnumServicesStatusExW);
 
-    SBIEDLL_HOOK_SCM(QueryServiceLockStatusA);
-    SBIEDLL_HOOK_SCM(QueryServiceLockStatusW);
+BOOLEAN SecHost_Init(HMODULE module)
+{
+    //
+    // hook SCM functions
+    //
 
-    SBIEDLL_HOOK_SCM(GetServiceDisplayNameA);
-    SBIEDLL_HOOK_SCM(GetServiceDisplayNameW);
+    if (!Scm_Init(module))
+        return FALSE;
 
-    SBIEDLL_HOOK_SCM(GetServiceKeyNameA);
-    SBIEDLL_HOOK_SCM(GetServiceKeyNameW);
+    if (Dll_OsBuild >= 8400) {
 
-    SBIEDLL_HOOK_SCM(EnumDependentServicesA);
-    SBIEDLL_HOOK_SCM(EnumDependentServicesW);
+        //
+        // on Windows 8, hook sechost!SubscribeServiceChangeNotifications
+        //
 
-    SBIEDLL_HOOK_SCM(QueryServiceObjectSecurity);
-    SBIEDLL_HOOK_SCM(SetServiceObjectSecurity);
+        SCM_IMPORT_W8___(SubscribeServiceChangeNotifications);
+        SBIEDLL_HOOK_SCM(SubscribeServiceChangeNotifications);
 
-    SBIEDLL_HOOK_SCM(LockServiceDatabase);
-    SBIEDLL_HOOK_SCM(UnlockServiceDatabase);
+        //
+        // on Windows 8, the cred functions have been moved from advapi32.dll to sechost.dll
+        //
 
-    SBIEDLL_HOOK_SCM(CreateServiceA);
-    SBIEDLL_HOOK_SCM(CreateServiceW);
+        if (!Cred_Init(module))
+            return FALSE;
+    }
 
-    SBIEDLL_HOOK_SCM(ChangeServiceConfigA);
-    SBIEDLL_HOOK_SCM(ChangeServiceConfigW);
-
-    SBIEDLL_HOOK_SCM(ChangeServiceConfig2A);
-    SBIEDLL_HOOK_SCM(ChangeServiceConfig2W);
-
-    SBIEDLL_HOOK_SCM(DeleteService);
-
-    SBIEDLL_HOOK_SCM(StartServiceA);
-    SBIEDLL_HOOK_SCM(StartServiceW);
-
-    SBIEDLL_HOOK_SCM(StartServiceCtrlDispatcherA);
-    SBIEDLL_HOOK_SCM(StartServiceCtrlDispatcherW);
-
-    SBIEDLL_HOOK_SCM(SetServiceStatus);
-
-    SBIEDLL_HOOK_SCM(ControlService);
-
-    Scm_Notify_Init(module);
-
-    return Scm_HookRegisterServiceCtrlHandler();
+    return TRUE;
 }
 
 
@@ -620,8 +722,13 @@ _FX BOOLEAN Scm_Init_AdvApi(HMODULE module)
 //---------------------------------------------------------------------------
 
 
-BOOLEAN Scm_HookRegisterServiceCtrlHandler(void)
+BOOLEAN Scm_HookRegisterServiceCtrlHandler(HMODULE module)
 {
+
+#ifndef _M_ARM64
+    // Note: with the last SCM rework, the below comment is no longer true !!!
+    // $HookHack$ - Custom, not automated, Hook no longer applies to later Windows 10 builds
+#ifdef _WIN64
     static const UCHAR PrologW[] = {
         0x45, 0x33, 0xC9,                       // xor r9d,r9d
         0x45, 0x33, 0xC0,                       // xor r8d,r8d
@@ -632,8 +739,6 @@ BOOLEAN Scm_HookRegisterServiceCtrlHandler(void)
         0xE9                                    // jmp ...
     };
     BOOLEAN HookedRegisterServiceCtrlHandler = FALSE;
-
-#ifdef _WIN64
 
     //
     // on 64-bit Windows, ADVAPI32!RegisterServiceCtrlHandlerW is an 11-byte
@@ -664,19 +769,19 @@ BOOLEAN Scm_HookRegisterServiceCtrlHandler(void)
         }
     }
 
+    if (HookedRegisterServiceCtrlHandler)
+        return TRUE;
 #endif _WIN64
+#endif
 
     //
     // otherwise hook the four functions normally
     //
 
-    if (! HookedRegisterServiceCtrlHandler) {
-
-        SBIEDLL_HOOK_SCM(RegisterServiceCtrlHandlerA);
-        SBIEDLL_HOOK_SCM(RegisterServiceCtrlHandlerW);
-        SBIEDLL_HOOK_SCM(RegisterServiceCtrlHandlerExA);
-        SBIEDLL_HOOK_SCM(RegisterServiceCtrlHandlerExW);
-    }
+    SBIEDLL_HOOK_SCM(RegisterServiceCtrlHandlerA);
+    SBIEDLL_HOOK_SCM(RegisterServiceCtrlHandlerW);
+    SBIEDLL_HOOK_SCM(RegisterServiceCtrlHandlerExA);
+    SBIEDLL_HOOK_SCM(RegisterServiceCtrlHandlerExW);
 
     return TRUE;
 }
@@ -716,11 +821,11 @@ _FX SC_HANDLE Scm_OpenSCManagerA(
 
 
 //---------------------------------------------------------------------------
-// Scm_OpenServiceW
+// Scm_OpenServiceWImpl
 //---------------------------------------------------------------------------
 
 
-_FX SC_HANDLE Scm_OpenServiceW(
+_FX SC_HANDLE Scm_OpenServiceWImpl(
     SC_HANDLE hSCManager,
     const WCHAR *lpServiceName,
     DWORD dwDesiredAccess)
@@ -785,6 +890,34 @@ _FX SC_HANDLE Scm_OpenServiceW(
 
 
 //---------------------------------------------------------------------------
+// Scm_HookOpenServiceW
+//---------------------------------------------------------------------------
+
+
+_FX ULONG_PTR Scm_HookOpenServiceW(VOID* hook)
+{
+	__my_OpenServiceW = hook;
+	return (ULONG_PTR)Scm_OpenServiceWImpl;
+}
+
+
+//---------------------------------------------------------------------------
+// Scm_OpenServiceW
+//---------------------------------------------------------------------------
+
+
+_FX SC_HANDLE Scm_OpenServiceW(
+    SC_HANDLE hSCManager,
+    const WCHAR *lpServiceName,
+    DWORD dwDesiredAccess)
+{
+	if (__my_OpenServiceW)
+		return __my_OpenServiceW(hSCManager, lpServiceName, dwDesiredAccess);
+	return Scm_OpenServiceWImpl(hSCManager, lpServiceName, dwDesiredAccess);
+}
+
+
+//---------------------------------------------------------------------------
 // Scm_OpenServiceA
 //---------------------------------------------------------------------------
 
@@ -805,7 +938,7 @@ _FX SC_HANDLE Scm_OpenServiceA(
         RtlAnsiStringToUnicodeString(&uni, &ansi, TRUE);
     }
 
-    h = Scm_OpenServiceW(hSCManager, uni.Buffer, dwDesiredAccess);
+    h = Scm_OpenServiceWImpl(hSCManager, uni.Buffer, dwDesiredAccess);
     err = GetLastError();
 
     if (uni.Buffer)
@@ -817,11 +950,11 @@ _FX SC_HANDLE Scm_OpenServiceA(
 
 
 //---------------------------------------------------------------------------
-// Scm_CloseServiceHandle
+// Scm_CloseServiceHandleImpl
 //---------------------------------------------------------------------------
 
 
-_FX BOOL Scm_CloseServiceHandle(SC_HANDLE hSCObject)
+_FX BOOL Scm_CloseServiceHandleImpl(SC_HANDLE hSCObject)
 {
     BOOL ok = FALSE;
 
@@ -838,6 +971,49 @@ _FX BOOL Scm_CloseServiceHandle(SC_HANDLE hSCObject)
     else
         SetLastError(ERROR_INVALID_HANDLE);
     return ok;
+}
+
+
+//---------------------------------------------------------------------------
+// Scm_HookCloseServiceHandle
+//---------------------------------------------------------------------------
+
+
+_FX ULONG_PTR Scm_HookCloseServiceHandle(VOID* hook)
+{
+	__my_CloseServiceHandle = hook;
+	return (ULONG_PTR)Scm_CloseServiceHandleImpl;
+}
+
+
+//---------------------------------------------------------------------------
+// Scm_CloseServiceHandle
+//---------------------------------------------------------------------------
+
+
+_FX BOOL Scm_CloseServiceHandle(SC_HANDLE hSCObject)
+{
+	if (__my_CloseServiceHandle)
+		return __my_CloseServiceHandle(hSCObject);
+	return Scm_CloseServiceHandleImpl(hSCObject);
+}
+
+
+//---------------------------------------------------------------------------
+// Scm_SubscribeServiceChangeNotifications
+//---------------------------------------------------------------------------
+
+
+_FX ULONG_PTR Scm_SubscribeServiceChangeNotifications(
+    ULONG_PTR Unknown1, ULONG_PTR Unknown2, ULONG_PTR Unknown3,
+    ULONG_PTR Unknown4, ULONG_PTR Unknown5)
+{
+    //
+    // fake success for new unknown function in Windows 8,
+    // SubscribeServiceChangeNotifications
+    //
+
+    return 0;
 }
 
 
@@ -1158,36 +1334,6 @@ _FX HANDLE Scm_OpenKeyForService(const WCHAR *ServiceName, BOOLEAN ForWrite)
     return handle;
 }
 
-_FX int Scm_Start_Sppsvc()
-{
-    SC_HANDLE handle1 = Scm_OpenSCManagerW(NULL, NULL, GENERIC_READ);
-    SC_HANDLE handle2 = NULL;
-    int rc = 0;
-
-    if (handle1) {
-        SC_HANDLE handle2 = Scm_OpenServiceW(handle1, L"sppsvc", SERVICE_START);
-        if (handle2) {
-            SERVICE_STATUS lpServiceStatus;
-            int count = 0;
-            lpServiceStatus.dwCurrentState = 0;
-            Scm_StartServiceW(handle2, 0, NULL);
-
-            while (lpServiceStatus.dwCurrentState != SERVICE_RUNNING && count++ < 10) {
-                Sleep(50);
-                Scm_QueryServiceStatus(handle2, &lpServiceStatus);
-                if (lpServiceStatus.dwCurrentState == 4) {
-                    rc = 1;
-                }
-            }
-        }
-    }
-
-    if (handle1)
-        Scm_CloseServiceHandle(handle1);
-    if (handle2)
-        Scm_CloseServiceHandle(handle2);
-    return rc;
-}
 
 //---------------------------------------------------------------------------
 // SbieDll_IsBoxedService
@@ -1215,4 +1361,26 @@ _FX void Scm_DiscardKeyCache(const WCHAR *ServiceName)
     wcscat(keyname, ServiceName);
     Key_DiscardMergeByPath(keyname, TRUE);
     Dll_Free(keyname);
+}
+
+
+//---------------------------------------------------------------------------
+// SbieDll_CheckProcessLocalSystem
+//---------------------------------------------------------------------------
+
+
+_FX BOOL SbieDll_CheckProcessLocalSystem(HANDLE ProcessHandle)
+{
+    BOOL IsLocalSystem = FALSE;
+
+    HANDLE TokenHandle;
+    if (NtOpenProcessToken(ProcessHandle, TOKEN_QUERY, &TokenHandle)) {
+
+        extern BOOL Secure_IsTokenLocalSystem(HANDLE hToken);
+        IsLocalSystem = Secure_IsTokenLocalSystem(TokenHandle);
+
+        NtClose(TokenHandle);
+    }
+
+    return IsLocalSystem;
 }

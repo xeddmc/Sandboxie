@@ -120,6 +120,9 @@ extern "C" _FX BOOLEAN Ole_Init(HMODULE module)
     void *RegisterDragDrop;
     void *RevokeDragDrop;
 
+    // DisableComProxy BEGIN
+    if (!SbieApi_QueryConfBool(NULL, L"DisableComProxy", FALSE))
+    // DisableComProxy END
     if (! SbieDll_IsOpenCOM()) {
 
         Com_Init_Ole32(module);
@@ -127,7 +130,7 @@ extern "C" _FX BOOLEAN Ole_Init(HMODULE module)
         RegisterDragDrop = GetProcAddress(module, "RegisterDragDrop");
         RevokeDragDrop   = GetProcAddress(module, "RevokeDragDrop");
 
-        if (Gui_RenameClasses) {
+        if (!Gui_OpenAllWinClasses && Config_GetSettingsForImageName_bool(L"UseDragDropHack", TRUE)) {
 
             //
             // don't hook drag and drop if using OpenWinClass=*
@@ -1063,7 +1066,7 @@ _FX HGLOBAL XDataObject::InitFormatIdList(HGLOBAL hData)
     if (! pIdList)
         return NULL;
 
-    HRESULT hr;
+    BOOL ok;
     HANDLE hFile;
     WCHAR *path = (WCHAR *)Dll_AllocTemp(8192);
 
@@ -1080,8 +1083,8 @@ _FX HGLOBAL XDataObject::InitFormatIdList(HGLOBAL hData)
         LPCITEMIDLIST pidl = pILCombine(GetPidl(0), GetPidl(count));
         if (pidl) {
 
-            hr = pSHGetPathFromIDList(pidl, path);
-            if (SUCCEEDED(hr)) {
+            ok = pSHGetPathFromIDList(pidl, path);
+            if (ok) {
 
                 hFile = CreateFileW(path,
                     GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
@@ -1125,8 +1128,8 @@ _FX HGLOBAL XDataObject::InitFormatIdList(HGLOBAL hData)
     // get the pidl for the parent folder in the sandbox
     //
 
-    hr = pSHGetPathFromIDList(GetPidl(0), path);
-    if (! SUCCEEDED(hr))
+    ok = pSHGetPathFromIDList(GetPidl(0), path);
+    if (!ok)
         goto finish;
 
     hFile = CreateFileW(path,
@@ -1150,8 +1153,8 @@ _FX HGLOBAL XDataObject::InitFormatIdList(HGLOBAL hData)
         LPCITEMIDLIST pidl = pILCombine(GetPidl(0), GetPidl(1));
         if (pidl) {
 
-            hr = pSHGetPathFromIDList(pidl, path);
-            if (SUCCEEDED(hr)) {
+            ok = pSHGetPathFromIDList(pidl, path);
+            if (ok) {
 
                 hFile = CreateFileW(path,
                     GENERIC_WRITE, FILE_SHARE_VALID_FLAGS, NULL,
@@ -1185,6 +1188,7 @@ _FX HGLOBAL XDataObject::InitFormatIdList(HGLOBAL hData)
 
     SbieDll_TranslateNtToDosPath(path);
 
+	HRESULT hr;
     LPITEMIDLIST pidl;
     ULONG flags = 0;
     hr = pSHILCreateFromPath(path, &pidl, &flags);
@@ -1663,7 +1667,7 @@ _FX HRESULT Ole_RevokeDragDrop(HWND hwnd)
 extern "C" _FX BOOLEAN Ole_DoDragDrop(
     HWND hWnd, WPARAM wParam, LPARAM lParam)
 {
-    if (! Gui_RenameClasses)
+    if (Gui_OpenAllWinClasses)
         return FALSE;
 
     if (wParam == tzuk) {

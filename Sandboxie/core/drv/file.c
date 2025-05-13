@@ -28,6 +28,7 @@
 #include "util.h"
 #include "session.h"
 #include "syscall.h"
+#include "wfp.h"
 #include "common/pattern.h"
 #include "common/my_version.h"
 
@@ -72,6 +73,7 @@ typedef struct _BLOCKED_DLL {
 } BLOCKED_DLL;
 
 
+
 //---------------------------------------------------------------------------
 // Functions
 //---------------------------------------------------------------------------
@@ -84,13 +86,11 @@ static void File_CreateBoxPath_2(HANDLE FileHandle);
 static void File_AdjustBoxFilePath(PROCESS *proc, HANDLE handle);
 
 static BOOLEAN File_InitPaths(PROCESS *proc,
+#ifdef USE_MATCH_PATH_EX
+    LIST *normal_file_paths,
+#endif
     LIST *open_file_paths, LIST *closed_file_paths,
     LIST *read_file_paths, LIST *write_file_paths);
-
-static BOOLEAN File_BlockInternetAccess(PROCESS *proc);
-
-static BOOLEAN File_BlockInternetAccess2(
-    PROCESS *proc, const WCHAR *name, int modifier);
 
 static NTSTATUS File_Generic_MyParseProc(
     PROCESS *proc, PVOID ParseObject, ULONG device_type,
@@ -138,19 +138,12 @@ static NTSTATUS File_Api_SetShortName2(
        const WCHAR *File_Mup = L"\\Device\\Mup";
        const ULONG  File_MupLen = 11;
 
+       const WCHAR *File_Device = L"\\Device\\";
+
        const WCHAR *File_NamedPipe = L"\\Device\\NamedPipe";
        const ULONG  File_NamedPipeLen = 17;
 
 static char *File_DesktopIniText = NULL;
-
-
-static const WCHAR *File_RawIp = L"rawip6";
-static const WCHAR *File_Http  = L"http\\";
-static const WCHAR *File_Tcp   = L"tcp6";
-static const WCHAR *File_Udp   = L"udp6";
-static const WCHAR *File_Ip    = L"ip6";
-static const WCHAR *File_Afd   = L"afd";
-static const WCHAR *File_Nsi   = L"nsi";
 
 
 //---------------------------------------------------------------------------
@@ -166,9 +159,11 @@ static const WCHAR *File_Nsi   = L"nsi";
 //---------------------------------------------------------------------------
 
 
+#ifdef XP_SUPPORT
 #ifndef _WIN64
 #include "file_xp.c"
 #endif _WIN64
+#endif
 
 
 //---------------------------------------------------------------------------
@@ -187,6 +182,7 @@ _FX BOOLEAN File_Init(void)
 
     P_File_Init_2 p_File_Init_2 = File_Init_Filter;
 
+#ifdef XP_SUPPORT
 #ifndef _WIN64
 
     if (Driver_OsVersion < DRIVER_WINDOWS_VISTA) {
@@ -195,6 +191,7 @@ _FX BOOLEAN File_Init(void)
     }
 
 #endif ! _WIN64
+#endif
 
     if (! p_File_Init_2())
         return FALSE;
@@ -243,6 +240,7 @@ _FX void File_Unload(void)
 
     P_File_Unload_2 p_File_Unload_2 = File_Unload_Filter;
 
+#ifdef XP_SUPPORT
 #ifndef _WIN64
 
     if (Driver_OsVersion < DRIVER_WINDOWS_VISTA) {
@@ -251,6 +249,7 @@ _FX void File_Unload(void)
     }
 
 #endif ! _WIn64
+#endif 
 
     p_File_Unload_2();
 
@@ -403,7 +402,7 @@ _FX void File_CreateBoxPath_2(HANDLE FileHandle)
         File_DesktopIniText = Mem_Alloc(Driver_Pool, 768);
         if (File_DesktopIniText) {
 
-            sprintf(File_DesktopIniText,
+            RtlStringCbPrintfA(File_DesktopIniText, 768, 
                         "[.ShellClassInfo]\r\n"
                         "IconFile=%S\\%S\r\n"
                         "IconIndex=9\r\n"
@@ -534,6 +533,11 @@ _FX void File_AdjustBoxFilePath(PROCESS *proc, HANDLE handle)
 
                 path_len = (path_len + 1) * sizeof(WCHAR);
 
+                if (!box->file_raw_path) {
+                    InterlockedExchangePointer(&box->file_raw_path, box->file_path);
+                    InterlockedExchange(&box->file_raw_path_len, box->file_path_len);
+                }
+
                 InterlockedExchange(&box->file_path_len, 0);
                 InterlockedExchangePointer(&box->file_path, path);
                 InterlockedExchange(&box->file_path_len, path_len);
@@ -551,42 +555,34 @@ _FX void File_AdjustBoxFilePath(PROCESS *proc, HANDLE handle)
 
 
 _FX BOOLEAN File_InitPaths(PROCESS *proc,
+#ifdef USE_MATCH_PATH_EX
+    LIST *normal_file_paths,
+#endif
     LIST *open_file_paths, LIST *closed_file_paths,
     LIST *read_file_paths, LIST *write_file_paths)
 {
-    static const WCHAR *_PstPipe = L"\\Device\\NamedPipe\\protected_storage";
+#ifdef USE_MATCH_PATH_EX
+    static const WCHAR *_NormalPath = L"NormalFilePath";
+#endif
     static const WCHAR *_OpenFile = L"OpenFilePath";
     static const WCHAR *_OpenPipe = L"OpenPipePath";
     static const WCHAR *_ClosedPath = L"ClosedFilePath";
     static const WCHAR *_ReadPath = L"ReadFilePath";
     static const WCHAR *_WritePath = L"WriteFilePath";
+
+#ifndef USE_TEMPLATE_PATHS
+#ifdef USE_MATCH_PATH_EX
+    static const WCHAR *normalpaths[] = {
+        L"%SystemRoot%\\*",
+        L"%SbieHome%\\*",
+        L"%ProgramFiles%\\*",
+        L"%ProgramFiles% (x86)\\*",
+        NULL
+    };
+#endif
     static const WCHAR *openpipes[] = {
         L"\\Device\\NamedPipe\\",               // named pipe root
         L"\\Device\\MailSlot\\",                // mail slot root
-        //
-        // network
-        //
-        L"\\Device\\NamedPipe\\ROUTER",
-        L"\\Device\\NamedPipe\\ShimViewer",
-        L"\\Device\\Afd",
-        L"\\Device\\Afd\\Endpoint",
-        L"\\Device\\Afd\\AsyncConnectHlp",
-        L"\\Device\\Afd\\AsyncSelectHlp",
-        L"\\Device\\Afd\\ROUTER",
-        L"\\Device\\WS2IFSL",
-        L"\\Device\\WS2IFSL\\NifsPvd",
-        L"\\Device\\WS2IFSL\\NifsSct",
-        L"\\Device\\Tcp",
-        L"\\Device\\Tcp6",
-        L"\\Device\\Ip",
-        L"\\Device\\Ip6",
-        L"\\Device\\Udp",
-        L"\\Device\\Udp6",
-        L"\\Device\\RawIp",
-        L"\\Device\\RawIp6",
-        L"\\Device\\NetBT_Tcpip_*",
-        L"\\Device\\Http\\*",
-        L"\\Device\\Nsi",                           // Windows 7
         //
         // Windows 7 fault-tolerant heap
         //
@@ -610,7 +606,46 @@ _FX BOOLEAN File_InitPaths(PROCESS *proc,
         L"\\Device\\NamedPipe\\XTIERRPCPIPE",       // Novell NetIdentity
         NULL
     };
-    static const WCHAR *strClosedFiles[] = {
+    static const WCHAR* openNetPipes[] = {
+        L"\\Device\\NamedPipe\\ROUTER",
+        L"\\Device\\NamedPipe\\ShimViewer",
+        L"\\Device\\Afd",
+        L"\\Device\\Afd\\Endpoint",
+        L"\\Device\\Afd\\AsyncConnectHlp",
+        L"\\Device\\Afd\\AsyncSelectHlp",
+        L"\\Device\\Afd\\ROUTER",
+        L"\\Device\\Afd\\Mio",
+        L"\\Device\\WS2IFSL",
+        L"\\Device\\WS2IFSL\\NifsPvd",
+        L"\\Device\\WS2IFSL\\NifsSct",
+        L"\\Device\\Tcp",
+        L"\\Device\\Tcp6",
+        L"\\Device\\Ip",
+        L"\\Device\\Ip6",
+        L"\\Device\\Udp",
+        L"\\Device\\Udp6",
+        L"\\Device\\RawIp",
+        L"\\Device\\RawIp6",
+        L"\\Device\\NetBT_Tcpip_*",
+        L"\\Device\\Http\\*",
+        L"\\Device\\Nsi",                           // Windows 7
+        NULL
+    };
+    static const WCHAR* closedNetPipes[] = {
+        L"\\Device\\afd*",
+        L"\\Device\\ip",
+        L"\\Device\\ip6",
+        L"\\Device\\udp",
+        L"\\Device\\udp6",
+        L"\\Device\\tcp",
+        L"\\Device\\tcp6",
+        L"\\Device\\http\\*",
+        L"\\Device\\rawip",
+        L"\\Device\\rawip6",
+        L"\\Device\\nsi",                           // Windows 7
+        NULL
+    };
+    static const WCHAR *strWinRMFiles[] = {
         // Windows Remote Management (WinRM) is a large security hole.  A sandboxed app running in an elevated cmd shell can send any admin command to the host.
         // Block the WinRS.exe and the automation dlls to make it very difficult for someone to use.
         // See ICD-10136 "Sandboxie security hole allows guest to run any command in host as admin"
@@ -618,25 +653,87 @@ _FX BOOLEAN File_InitPaths(PROCESS *proc,
         L"%SystemRoot%\\System32\\wsmsvc.dll",
         L"%SystemRoot%\\System32\\wsmauto.dll",
         L"%SystemRoot%\\System32\\winrs.exe",
+        // Don't forget the WoW64 files
+        L"%SystemRoot%\\SysWoW64\\wsmsvc.dll",
+        L"%SystemRoot%\\SysWoW64\\wsmauto.dll",
+        L"%SystemRoot%\\SysWoW64\\winrs.exe",
+        // Note: This is not a proper fix, just a cheap mitigation!!!
+        NULL
+    };
+    static const WCHAR* openPipesCM[] = {
+        // open those in compartment mode as do not use the de-administrator-ize proxy in File_NtCreateFilePipe
+        //
+        L"\\device\\*pipe\\lsarpc",
+        L"\\device\\*pipe\\srvsvc",
+        L"\\device\\*pipe\\wkssvc",
+        L"\\device\\*pipe\\samr",
+        L"\\device\\*pipe\\netlogon",
+        NULL
+    };
+    static const WCHAR* approved_devices[] = {
+        L"\\Device\\NamedPipe\\*",
+        L"\\Device\\CNG",
+        L"\\Device\\ConDrv\\*",
+        L"\\Device\\DeviceApi*",
+        L"\\Device\\DfsClient",
+        L"\\Device\\KsecDD",
+        L"\\Device\\MountPointManager",
+        L"\\Device\\Ndis",
+        L"\\Device\\PcwDrv",
+        L"\\Device\\SrpDevice", // Smart App Control
+        NULL
+    };
+#endif
+    static const WCHAR* drive_devices[] = {
+        L"\\Device\\Floppy*\\*",
+        L"\\Device\\CdRom*\\*",
+        L"\\Device\\HarddiskVolume*\\*",
+        L"\\Device\\Harddisk*\\*",
         NULL
     };
 
     BOOLEAN ok;
     ULONG i;
 
+#ifdef USE_MATCH_PATH_EX
+
+    //
+    // normal paths
+    //
+
+    ok = Process_GetPaths(proc, normal_file_paths, proc->box->name, _NormalPath, TRUE);
+
+#ifdef USE_TEMPLATE_PATHS
+    if (ok)
+        ok = Process_GetTemplatePaths(proc, normal_file_paths, _NormalPath);
+#else
+    if (ok && proc->use_privacy_mode) {
+        for (i = 0; normalpaths[i] && ok; ++i) {
+            ok = Process_AddPath(
+                proc, normal_file_paths, NULL, TRUE, normalpaths[i], FALSE);
+        }
+    }
+#endif
+
+    if (! ok) {
+        Log_MsgP1(MSG_INIT_PATHS, _NormalPath, proc->pid);
+        return FALSE;
+    }
+#endif
+
     //
     // open paths
     //
 
-    ok = Process_GetPaths(proc, open_file_paths, _OpenPipe, TRUE);
+    ok = Process_GetPaths(proc, open_file_paths, proc->box->name, _OpenPipe, TRUE);
     if (! ok) {
         Log_MsgP1(MSG_INIT_PATHS, _OpenPipe, proc->pid);
         return FALSE;
     }
 
-    if (! proc->image_from_box) {
+    if (! proc->dont_open_for_boxed || ! proc->image_from_box) {
 
-        ok = Process_GetPaths(proc, open_file_paths, _OpenFile, TRUE);
+        ok = Process_GetPaths(proc, open_file_paths, proc->box->name, _OpenFile, TRUE);
 
         if (! ok) {
             Log_MsgP1(MSG_INIT_PATHS, _OpenFile, proc->pid);
@@ -644,16 +741,37 @@ _FX BOOLEAN File_InitPaths(PROCESS *proc,
         }
     }
 
-    if (ok && Conf_Get_Boolean(
-                proc->box->name, Driver_OpenProtectedStorage, 0, FALSE)) {
-        ok = Process_AddPath(
-                proc, open_file_paths, NULL, TRUE, _PstPipe, FALSE);
-    }
+    //if (ok && Conf_Get_Boolean(
+    //            proc->box->name, Driver_OpenProtectedStorage, 0, FALSE)) {
+	//			
+    //    static const WCHAR *_PstPipe = 
+    //        L"\\Device\\NamedPipe\\protected_storage";
+	//			
+    //    ok = Process_AddPath(
+    //            proc, open_file_paths, NULL, TRUE, _PstPipe, FALSE);
+    //}
 
+#ifdef USE_TEMPLATE_PATHS
+    if (ok) {
+        ok = Process_GetTemplatePaths(proc, open_file_paths, _OpenFile);
+        if (! ok) {
+            Log_MsgP1(MSG_INIT_PATHS, _OpenFile, proc->pid);
+            return FALSE;
+        }
+    }
+#else
     for (i = 0; openpipes[i] && ok; ++i) {
         ok = Process_AddPath(
             proc, open_file_paths, NULL, TRUE, openpipes[i], FALSE);
     }
+
+    if (ok && proc->bAppCompartment) {
+        for (i = 0; openPipesCM[i] && ok; ++i) {
+            ok = Process_AddPath(
+                proc, open_file_paths, NULL, TRUE, openPipesCM[i], FALSE);
+        }
+    }
+#endif
 
     if (! ok) {
         Log_MsgP1(MSG_INIT_PATHS, _OpenPipe, proc->pid);
@@ -664,7 +782,12 @@ _FX BOOLEAN File_InitPaths(PROCESS *proc,
     // closed paths
     //
 
-    ok = Process_GetPaths(proc, closed_file_paths, _ClosedPath, TRUE);
+    ok = Process_GetPaths(proc, closed_file_paths, proc->box->name, _ClosedPath, TRUE);
+#ifdef USE_TEMPLATE_PATHS
+    if (ok)
+        ok = Process_GetTemplatePaths(proc, closed_file_paths, _ClosedPath);
+#else
+    
     if (ok) {
         // the LanmanRedirector/Mup devices (when accessed without extra paths)
         // is a security attack, and must be closed
@@ -676,9 +799,11 @@ _FX BOOLEAN File_InitPaths(PROCESS *proc,
         }
     }
 
-    for (i = 0; strClosedFiles[i] && ok; ++i) {
-        ok = Process_AddPath(proc, closed_file_paths, _ClosedPath, TRUE, strClosedFiles[i], FALSE);
+    if(Conf_Get_Boolean(proc->box->name, L"BlockWinRM", 0, TRUE))
+    for (i = 0; strWinRMFiles[i] && ok; ++i) {
+        ok = Process_AddPath(proc, closed_file_paths, _ClosedPath, TRUE, strWinRMFiles[i], FALSE);
     }
+#endif
 
     if (! ok) {
         Log_MsgP1(MSG_INIT_PATHS, _ClosedPath, proc->pid);
@@ -689,9 +814,17 @@ _FX BOOLEAN File_InitPaths(PROCESS *proc,
     // read-only paths (stored also as open paths)
     //
 
-    ok = Process_GetPaths(proc, open_file_paths, _ReadPath, TRUE);
+#ifndef USE_MATCH_PATH_EX
+    ok = Process_GetPaths(proc, open_file_paths, proc->box->name, _ReadPath, TRUE);
     if (ok)
-        ok = Process_GetPaths(proc, read_file_paths, _ReadPath, TRUE);
+#endif
+        ok = Process_GetPaths(proc, read_file_paths, proc->box->name, _ReadPath, TRUE);
+
+#ifdef USE_TEMPLATE_PATHS
+    if (ok)
+        ok = Process_GetTemplatePaths(proc, read_file_paths, _ReadPath);
+#endif
+
     if (! ok) {
         Log_MsgP1(MSG_INIT_PATHS, _ReadPath, proc->pid);
         return FALSE;
@@ -701,15 +834,126 @@ _FX BOOLEAN File_InitPaths(PROCESS *proc,
     // write-only paths (stored also as closed paths)
     //
 
+#ifdef USE_MATCH_PATH_EX
+    ok = Process_GetPaths(proc, write_file_paths, proc->box->name, _WritePath, TRUE);
+
+#ifdef USE_TEMPLATE_PATHS
+    if (ok)
+        ok = Process_GetTemplatePaths(proc, write_file_paths, _WritePath);
+#endif
+
+    if (ok && proc->use_privacy_mode) { // in privacy mode all drive paths are set to "write"
+        for (i = 0; drive_devices[i] && ok; ++i) {
+            ok = Process_AddPath(proc, write_file_paths, NULL, 
+                                    TRUE, drive_devices[i], FALSE);
+        }
+    }
+#else
     ok = Process_GetPaths2(
             proc, write_file_paths, closed_file_paths,
             _WritePath, TRUE);
     if (ok) {
         ok = Process_GetPaths(
-                proc, closed_file_paths, _WritePath, TRUE);
+                proc, closed_file_paths, proc->box->name, _WritePath, TRUE);
     }
+#endif
     if (! ok) {
         Log_MsgP1(MSG_INIT_PATHS, _WritePath, proc->pid);
+        return FALSE;
+    }
+
+    //
+    // setup network device access
+    //
+
+    if (ok) {
+
+        BOOLEAN is_open, is_closed;
+
+        //
+        // block Internet devices if ClosedFilePath=InternetAccessDevices
+        // unless this process is exempted from the blockade
+        //
+
+        Process_MatchPath(
+            proc->pool, L"InternetAccessDevices", 21,
+            NULL, closed_file_paths,
+            &is_open, &is_closed);
+
+        if (is_closed && !proc->AllowInternetAccess) {
+#ifdef USE_TEMPLATE_PATHS
+            ok = Process_GetPaths(proc, closed_file_paths, L"TemplateNetworkPaths", _ClosedPath, FALSE);
+            if (! ok) {
+                Log_MsgP1(MSG_INIT_PATHS, _ClosedPath, proc->pid);
+                return FALSE;
+            }
+#else
+            for (i = 0; closedNetPipes[i] && ok; ++i) {
+                ok = Process_AddPath(
+                    proc, closed_file_paths, NULL, TRUE, closedNetPipes[i], FALSE);
+            }
+#endif
+        }
+        else {
+#ifdef USE_TEMPLATE_PATHS
+            ok = Process_GetPaths(proc, open_file_paths, L"TemplateNetworkPaths", _OpenFile, FALSE);
+            if (! ok) {
+                Log_MsgP1(MSG_INIT_PATHS, _OpenFile, proc->pid);
+                return FALSE;
+            }
+#else
+            for (i = 0; openNetPipes[i] && ok; ++i) {
+                ok = Process_AddPath(
+                    proc, open_file_paths, NULL, TRUE, openNetPipes[i], FALSE);
+            }
+#endif
+        }
+    }
+
+#ifdef USE_MATCH_PATH_EX
+
+    //
+    // setup access restrictions to \Device\
+    //
+
+    if (ok && proc->restrict_devices) {
+
+        //
+        // many 3rd party drivers are a great attack vector to gain execution in the kernel, 
+        // so we close all typical endpoints except a selected few.
+        //
+
+#ifndef USE_TEMPLATE_PATHS
+        ok = Process_AddPath(proc, closed_file_paths, NULL, FALSE, File_Device, TRUE);
+
+        if (ok) {
+            for (i = 0; approved_devices[i] && ok; ++i) {
+                ok = Process_AddPath(
+                    proc, normal_file_paths, NULL, FALSE, approved_devices[i], FALSE);
+            }
+        }
+#endif
+
+        if (ok && !proc->use_privacy_mode) { // when not in privacy mode we need to set drive paths to "normal"
+            for (i = 0; drive_devices[i] && ok; ++i) {
+                ok = Process_AddPath(
+                    proc, normal_file_paths, NULL, FALSE, drive_devices[i], FALSE);
+            }
+        }
+
+        if (ok && !proc->file_block_network_files) {
+            ok = Process_AddPath(
+                proc, normal_file_paths, NULL, FALSE, File_Redirector, TRUE);
+            if (ok) {
+                ok = Process_AddPath(
+                    proc, normal_file_paths, NULL, FALSE, File_Mup, TRUE);
+            }
+        }
+    }
+#endif
+
+    if (! ok) {
+        Log_MsgP1(MSG_INIT_PATHS, Driver_Empty, proc->pid);
         return FALSE;
     }
 
@@ -718,7 +962,7 @@ _FX BOOLEAN File_InitPaths(PROCESS *proc,
     // the Windows compatibility (shim) DLLs to be loaded
     //
 
-    if (proc->image_sbie) {
+    if (proc->image_sbie && !proc->is_start_exe) {
 
         static const WCHAR *_ShimEng =
                                 L"%SystemRoot%\\System32\\shimeng.dll";
@@ -742,21 +986,31 @@ _FX BOOLEAN File_InitPaths(PROCESS *proc,
 
 
 //---------------------------------------------------------------------------
-// File_BlockInternetAccess
+// File_InitProcess
 //---------------------------------------------------------------------------
 
 
-_FX BOOLEAN File_BlockInternetAccess(PROCESS *proc)
+_FX BOOLEAN File_InitProcess(PROCESS *proc)
 {
-    BOOLEAN is_open, is_closed;
     BOOLEAN ok;
 
-    //
-    // is this process excempted from the blocade
-    //
+    proc->file_block_network_files = Conf_Get_Boolean(proc->box->name, L"BlockNetworkFiles", 0, FALSE);
+    
+    proc->file_warn_direct_access = Conf_Get_Boolean(proc->box->name, L"NotifyDirectDiskAccess", 0, FALSE);
 
-	if (proc->AllowInternetAccess)
-		return TRUE;
+    proc->file_open_devapi_cmapi = Conf_Get_Boolean(proc->box->name, L"OpenDevCMApi", 0, FALSE);
+
+    ok = File_InitPaths(proc,
+#ifdef USE_MATCH_PATH_EX
+                                        &proc->normal_file_paths,
+#endif
+                                        &proc->open_file_paths,
+                                        &proc->closed_file_paths,
+                                        &proc->read_file_paths,
+                                        &proc->write_file_paths);
+
+    if (ok)
+        ok = WFP_UpdateProcess(proc);
 
     //
     // should we warn on access to internet resources
@@ -769,124 +1023,20 @@ _FX BOOLEAN File_BlockInternetAccess(PROCESS *proc)
         proc->file_warn_internet = FALSE;
 
     //
-    // add Internet devices if ClosedFilePath=InternetAccessDevices
+    // make sure the image path does not match a ClosedFilePath setting
     //
 
-    Process_MatchPath(
-        proc->pool, L"InternetAccessDevices", 21,
-        NULL, &proc->closed_file_paths,
-        &is_open, &is_closed);
+    if (ok && proc->image_path && (! proc->image_sbie) 
+        && _wcsnicmp(proc->image_path, proc->box->file_path, (proc->box->file_path_len / sizeof(WCHAR)) - 1) != 0) {
 
-    ok = TRUE;
+#ifdef USE_MATCH_PATH_EX
+        ULONG mp_flags = Process_MatchPathEx(proc, proc->image_path, wcslen(proc->image_path), L'f', 
+            &proc->normal_file_paths, &proc->open_file_paths, &proc->closed_file_paths,
+            &proc->read_file_paths, &proc->write_file_paths, NULL);
 
-    if (is_closed) {
-
-        //
-        // if the configuration specifies to block the pseudo Internet
-        // device, add real Internet devices.  keep in sync with the
-        // list of devices in File_Api_CheckInternetAccess
-        //
-
-        if (ok)         // \Device\RawIp6
-            ok = File_BlockInternetAccess2(proc, File_RawIp, 0);
-
-        if (ok)         // \Device\RawIp4
-            ok = File_BlockInternetAccess2(proc, File_RawIp, -1);
-
-        if (ok)         // \Device\Http\*
-            ok = File_BlockInternetAccess2(proc, File_Http, +1);
-
-        if (ok)         // \Device\Tcp6
-            ok = File_BlockInternetAccess2(proc, File_Tcp, 0);
-
-        if (ok)         // \Device\Tcp4
-            ok = File_BlockInternetAccess2(proc, File_Tcp, -1);
-
-        if (ok)         // \Device\Udp6
-            ok = File_BlockInternetAccess2(proc, File_Udp, 0);
-
-        if (ok)         // \Device\Udp4
-            ok = File_BlockInternetAccess2(proc, File_Udp, -1);
-
-        if (ok)         // \Device\Ip6
-            ok = File_BlockInternetAccess2(proc, File_Ip, 0);
-
-        if (ok)         // \Device\Ip4
-            ok = File_BlockInternetAccess2(proc, File_Ip, -1);
-
-        if (ok)         // \Device\Afd*
-            ok = File_BlockInternetAccess2(proc, File_Afd, +1);
-
-        if (ok)         // \Device\Nsi
-            ok = File_BlockInternetAccess2(proc, File_Nsi, 0);
-    }
-
-    return ok;
-}
-
-
-//---------------------------------------------------------------------------
-// File_BlockInternetAccess2
-//---------------------------------------------------------------------------
-
-
-_FX BOOLEAN File_BlockInternetAccess2(
-    PROCESS *proc, const WCHAR *name, int modifier)
-{
-    WCHAR device_name[32];
-    BOOLEAN add_star;
-
-    wmemcpy(device_name,    File_Mup, 8);   // \Device\ prefix
-    wcscpy(device_name + 8, name);
-
-    if (modifier == +1)
-        add_star = TRUE;
-    else {
-        add_star = FALSE;
-
-        if (modifier == -1) {
-            WCHAR *ptr = device_name + wcslen(device_name) - 1;
-            *ptr = L'\0';
-        }
-    }
-
-    return Process_AddPath(
-        proc, &proc->closed_file_paths, NULL, TRUE, device_name, add_star);
-}
-
-
-//---------------------------------------------------------------------------
-// File_InitProcess
-//---------------------------------------------------------------------------
-
-
-_FX BOOLEAN File_InitProcess(PROCESS *proc)
-{
-    BOOLEAN ok = File_InitPaths(proc,   &proc->open_file_paths,
-                                        &proc->closed_file_paths,
-                                        &proc->read_file_paths,
-                                        &proc->write_file_paths);
-    if (ok)
-        ok = File_BlockInternetAccess(proc);
-
-    if (ok) {
-
-        //
-        // check if should we warn on direct access to disk devices
-        //
-
-        proc->file_warn_direct_access = Conf_Get_Boolean(
-                    proc->box->name, L"NotifyDirectDiskAccess", 0, FALSE);
-    }
-
-    proc->file_open_devapi_cmapi = Conf_Get_Boolean(proc->box->name, L"OpenDevCMApi", 0, FALSE);
-
-    if (ok && proc->image_path && (! proc->image_sbie)) {
-
-        //
-        // make sure the image path does not match a ClosedFilePath setting
-        //
-
+        if ((mp_flags & (proc->image_from_box ? COPY_PATH_READ_FLAG : TRUE_PATH_READ_FLAG)) == 0)
+            ok = FALSE;
+#else
         BOOLEAN is_open, is_closed;
         Process_MatchPath(
             proc->pool, proc->image_path, wcslen(proc->image_path),
@@ -895,6 +1045,7 @@ _FX BOOLEAN File_InitProcess(PROCESS *proc)
 
         if (is_closed)
             ok = FALSE;
+#endif
     }
 
     return ok;
@@ -965,18 +1116,17 @@ _FX NTSTATUS File_Generic_MyParseProc(
     // skip requests dealing with devices we don't care about
     //
 
-    if (device_type != FILE_DEVICE_DISK &&
+    if ((device_type != FILE_DEVICE_DISK &&
         device_type != FILE_DEVICE_NAMED_PIPE &&
         device_type != FILE_DEVICE_MAILSLOT &&
         device_type != FILE_DEVICE_NETWORK &&
         device_type != FILE_DEVICE_MULTI_UNC_PROVIDER &&
         device_type != FILE_DEVICE_NETWORK_FILE_SYSTEM &&
-        device_type != FILE_DEVICE_DFS)
+        device_type != FILE_DEVICE_DFS) || proc->disable_file_flt)
     {
         if ((proc->file_trace & TRACE_IGNORE) || Session_MonitorCount) {
 
-            ULONG ignore_str_len;
-            WCHAR *ignore_str;
+            WCHAR ignore_str[24];
             WCHAR *device_name_ptr;
 
             status = Obj_GetParseName(
@@ -986,21 +1136,17 @@ _FX NTSTATUS File_Generic_MyParseProc(
             else
                 device_name_ptr = Obj_Unnamed.Name.Buffer;
 
-            ignore_str_len = (wcslen(device_name_ptr) + 24) * sizeof(WCHAR);
-            ignore_str = Mem_Alloc(proc->pool, ignore_str_len);
             if (ignore_str) {
 
-                swprintf(ignore_str,
-                    L"(FI) %08X %s", device_type, device_name_ptr);
+                RtlStringCbPrintfW(ignore_str, sizeof(ignore_str),
+                    L"(FI) %08X %s", device_type);
 
                 if (proc->file_trace & TRACE_IGNORE)
-                    Log_Debug_Msg(MONITOR_IGNORE, ignore_str, Driver_Empty);
+                    Log_Debug_Msg(MONITOR_IGNORE, ignore_str, device_name_ptr);
 
-                else if (Session_MonitorCount &&
+                else if (Session_MonitorCount && !proc->disable_monitor &&
                         device_type != FILE_DEVICE_PHYSICAL_NETCARD)
-                    Session_MonitorPut(MONITOR_IGNORE, ignore_str + 4, proc->pid);
-
-                Mem_Free(ignore_str, ignore_str_len);
+                    Session_MonitorPut(MONITOR_IGNORE, device_name_ptr, proc->pid);
             }
 
             if (Name && Name != &Obj_Unnamed)
@@ -1111,7 +1257,7 @@ _FX NTSTATUS File_Generic_MyParseProc(
             }
         }
 
-    } else if (Box_IsBoxedPath(proc->box, file, &Name->Name))
+    } else if (Box_IsBoxedPath(proc->box, file, &Name->Name) || (proc->box->file_raw_path && Box_IsBoxedPath(proc->box, file_raw, &Name->Name)))
         IsBoxedPath = TRUE;
 
     //
@@ -1177,8 +1323,12 @@ _FX NTSTATUS File_Generic_MyParseProc(
         // allow/deny access to paths outside the sandbox
         //
 
+#ifdef USE_MATCH_PATH_EX
+        ULONG mp_flags;
+#else
         LIST *open_file_paths;
         BOOLEAN is_open, is_closed;
+#endif
 
         WCHAR *path = Name->Name.Buffer;
         ULONG path_len = Name->Name.Length / sizeof(WCHAR);
@@ -1221,6 +1371,10 @@ _FX NTSTATUS File_Generic_MyParseProc(
                 && 0 == Box_NlsStrCmp(
                     path, Driver_HomePathNt, Driver_HomePathNt_Len)) {
 
+            if(_wcsicmp(&path[Driver_HomePathNt_Len], L"\\Certificate.dat") == 0)
+                status = STATUS_ACCESS_DENIED;
+            else
+
             if (write_access)
                 status = STATUS_ACCESS_DENIED;
             else
@@ -1243,6 +1397,11 @@ _FX NTSTATUS File_Generic_MyParseProc(
         //   and this is a write access
         //
 
+#ifdef USE_MATCH_PATH_EX
+        mp_flags = Process_MatchPathEx(proc, path, path_len, L'f',
+            &proc->normal_file_paths, &proc->open_file_paths, &proc->closed_file_paths,
+            &proc->read_file_paths, &proc->write_file_paths, NULL);
+#else
         if (write_access)
             open_file_paths = &proc->open_file_paths;
         else
@@ -1252,20 +1411,32 @@ _FX NTSTATUS File_Generic_MyParseProc(
             proc->pool, path, path_len,
             open_file_paths, &proc->closed_file_paths,
             &is_open, &is_closed);
+#endif
 
+        //
+        // if the path has ho specified handling,
+        // check if its a network path and apply network specific presets.
+        //
+
+#ifdef USE_MATCH_PATH_EX
+        // is_write = ((mp_flags & TRUE_PATH_MASK) == TRUE_PATH_CLOSED_FLAG) && ((mp_flags & COPY_PATH_MASK) == COPY_PATH_OPEN_FLAG); 
+        // is_open = ((mp_flags & TRUE_PATH_MASK) == TRUE_PATH_OPEN_FLAG);
+        // is_closed = ((mp_flags & TRUE_PATH_MASK) == 0)
+        if (proc->use_rule_specificity || ((!write_access || !((mp_flags & TRUE_PATH_WRITE_FLAG) != 0)) && !((mp_flags & TRUE_PATH_MASK) == 0))) {
+#else
         if ((! is_open) && (! is_closed)) {
-
-    //
-    // if we have a path that looks like any of these
-    // \Device\LanmanRedirector\server\shr\f1.txt
-    // \Device\LanmanRedirector\;Q:000000000000b09f\server\shr\f1.txt
-    // \Device\Mup\;LanmanRedirector\server\share\f1.txt
-    // \Device\Mup\;LanmanRedirector\;Q:000000000000b09f\server\share\f1.txt
-    // then translate to
-    // \Device\Mup\server\shr\f1.txt
-    // and test again.  We do this because open/closed paths are
-    // recorded in the \Device\Mup format.  See File_TranslateShares.
-    //
+#endif
+            //
+            // if we have a path that looks like any of these
+            // \Device\LanmanRedirector\server\shr\f1.txt
+            // \Device\LanmanRedirector\;Q:000000000000b09f\server\shr\f1.txt
+            // \Device\Mup\;LanmanRedirector\server\share\f1.txt
+            // \Device\Mup\;LanmanRedirector\;Q:000000000000b09f\server\share\f1.txt
+            // then translate to
+            // \Device\Mup\server\shr\f1.txt
+            // and test again.  We do this because open/closed paths are
+            // recorded in the \Device\Mup format.  See File_TranslateShares.
+            //
 
             ULONG PrefixLen;
             if (_wcsnicmp(path, File_Redirector, File_RedirectorLen) == 0)
@@ -1290,6 +1461,10 @@ _FX NTSTATUS File_Generic_MyParseProc(
 
                 if (ptr && ptr[0] && ptr[1]) {
 
+                    //
+                    // the path represents a network share
+                    //
+
                     ULONG len1   = wcslen(ptr + 1);
                     ULONG len2   = (File_MupLen + len1 + 8) * sizeof(WCHAR);
                     WCHAR *path2 = Mem_Alloc(proc->pool, len2);
@@ -1302,6 +1477,22 @@ _FX NTSTATUS File_Generic_MyParseProc(
                         wmemcpy(path2 + File_MupLen + 1, ptr + 1, len1 + 1);
                         len1 += File_MupLen + 1;
 
+#ifdef USE_MATCH_PATH_EX
+                        //
+                        // if this is not a attribute or sync request update the permissions for the network path
+                        //
+
+                        if (proc->use_rule_specificity || 
+                            (MyContext->OriginalDesiredAccess != FILE_READ_ATTRIBUTES) &&
+                            (MyContext->OriginalDesiredAccess != SYNCHRONIZE))
+                        {
+                            mp_flags = Process_MatchPathEx(proc, path2, len1, L'n',
+                                &proc->normal_file_paths, &proc->open_file_paths, &proc->closed_file_paths,
+                                &proc->read_file_paths, &proc->write_file_paths, NULL);
+
+                            //DbgPrint("MyParseProc %S, desired = %x, type = %x, flags = %x\n", path2, MyContext->OriginalDesiredAccess, device_type, mp_flags);
+                        }
+#else
                         Process_MatchPath(
                             proc->pool, path2, len1,
                             open_file_paths, &proc->closed_file_paths,
@@ -1335,7 +1526,7 @@ _FX NTSTATUS File_Generic_MyParseProc(
                         //DbgPrint("MyParseProc %S, desired = %x, type = %x\n", path2, MyContext->OriginalDesiredAccess, device_type);
                         if ((MyContext->OriginalDesiredAccess != FILE_READ_ATTRIBUTES) &&
                             (MyContext->OriginalDesiredAccess != SYNCHRONIZE) &&
-                            !is_open && Conf_Get_Boolean(proc->box->name, L"BlockNetworkFiles", 0, FALSE))
+                            !is_open && proc->file_block_network_files)
                         {
                             if (!write_access)
                             {
@@ -1348,13 +1539,30 @@ _FX NTSTATUS File_Generic_MyParseProc(
                             if (!is_open)
                                 is_closed = TRUE;
                         }
-
+#endif
                         Mem_Free(path2, len2);
                     }
                 }
             }
         }
 
+        //
+        // finally evaluate if access should be denided
+        //
+
+#ifdef USE_MATCH_PATH_EX
+        //if ((mp_flags & (write_access ? TRUE_PATH_WRITE_FLAG : TRUE_PATH_READ_FLAG)) != 0) {
+        if ((mp_flags & TRUE_PATH_MASK) == 0 || (write_access && (mp_flags & TRUE_PATH_WRITE_FLAG) == 0)) {
+
+            if((mp_flags & COPY_PATH_WRITE_FLAG) != 0) // if we could create this file in the sandbox
+                status = STATUS_OBJECT_NAME_NOT_FOUND; // hide it instead of returning access denided
+            else
+                status = STATUS_ACCESS_DENIED;
+
+            if ((mp_flags & TRUE_PATH_MASK) == 0)
+                ShouldMonitorAccess = TRUE;
+        }
+#else
         if (is_closed || (write_access && (! is_open))) {
 
             status = STATUS_ACCESS_DENIED;
@@ -1362,6 +1570,7 @@ _FX NTSTATUS File_Generic_MyParseProc(
             if (is_closed)
                 ShouldMonitorAccess = TRUE;
         }
+
 
         //
         // read-only paths are also listed as open paths, so if we granted
@@ -1382,6 +1591,7 @@ _FX NTSTATUS File_Generic_MyParseProc(
                 ShouldMonitorAccess = TRUE;
             }
         }
+#endif
 
         //
         // release lock
@@ -1398,26 +1608,26 @@ _FX NTSTATUS File_Generic_MyParseProc(
 
         if ((! proc->sbiedll_loaded) && status == STATUS_SUCCESS
                 && (CreateOptions & FILE_DIRECTORY_FILE) == 0) {
-
+        
             WCHAR *backslash = wcsrchr(path, L'\\');
             if (backslash && File_IsDelayLoadDll(proc, backslash + 1)) {
-
+        
                 ULONG len = sizeof(BLOCKED_DLL) + path_len * sizeof(WCHAR);
                 BLOCKED_DLL *blk = Mem_Alloc(proc->pool, len);
                 if (blk) {
-
+        
                     blk->path_len = path_len;
                     wmemcpy(blk->path, path, path_len + 1);
-
+        
                     KeRaiseIrql(APC_LEVEL, &irql);
                     ExAcquireResourceExclusiveLite(proc->file_lock, TRUE);
-
+        
                     List_Insert_After(&proc->blocked_dlls, NULL, blk);
-
+        
                     ExReleaseResourceLite(proc->file_lock);
                     KeLowerIrql(irql);
                 }
-
+        
                 status = STATUS_OBJECT_NAME_NOT_FOUND;
             }
         }
@@ -1495,26 +1705,26 @@ skip_due_to_home_folder:
 
         if (letter) {
 
-            USHORT mon_type = IsPipeDevice ? MONITOR_PIPE : MONITOR_FILE;
+            ULONG mon_type = IsPipeDevice ? MONITOR_PIPE : MONITOR_FILE;
             if (!IsBoxedPath) {
                 if (ShouldMonitorAccess == TRUE)
                     mon_type |= MONITOR_DENY;
-                else
+                else if (write_access && NT_SUCCESS(status))
                     mon_type |= MONITOR_OPEN;
             }
             if(!IsPipeDevice && !ShouldMonitorAccess)
                 mon_type |= MONITOR_TRACE;
 
-            swprintf(access_str, L"(F%c) %08X.%02X.%08X",
+            RtlStringCbPrintfW(access_str, sizeof(access_str), L"(F%c) %08X.%02X.%08X",
                 letter, DesiredAccess,
                 CreateDisposition & 0x0F, CreateOptions);
             Log_Debug_Msg(mon_type, access_str, Name->Name.Buffer);
         }
     }
 
-    else if (IsPipeDevice && Session_MonitorCount) {
+    else if (IsPipeDevice && Session_MonitorCount && !proc->disable_monitor) {
 
-        USHORT mon_type = MONITOR_PIPE;
+        ULONG mon_type = MONITOR_PIPE;
         WCHAR *mon_name = Name->Name.Buffer;
 
         if (MonitorPrefixLen && MonitorSuffixPtr) {
@@ -1526,7 +1736,7 @@ skip_due_to_home_folder:
             mon_type |= MONITOR_DENY;
         Session_MonitorPut(mon_type, mon_name, proc->pid);
 
-    } else if (ShouldMonitorAccess) {
+    } else if (ShouldMonitorAccess && Session_MonitorCount && !proc->disable_monitor) {
 
         Session_MonitorPut(MONITOR_FILE | MONITOR_DENY, Name->Name.Buffer, proc->pid);
 
@@ -1672,8 +1882,9 @@ _FX void File_ReplaceTokenIfFontRequest(
     // Using impersonation token in ClientToken if it is available
     // Replacing the primary token caused BSOD with Digital Guardian when dereferencing the token
     //
-
-    ObReferenceObject(proc->primary_token);
+    
+    // $Workaround$ - 3rd party fix
+    ObReferenceObject(proc->primary_token); // HACK ALERT! this causes a resource leak!!!
 
     if (!AccessState->SubjectSecurityContext.ClientToken)
     {
@@ -1713,7 +1924,11 @@ _FX NTSTATUS File_Api_Rename(PROCESS *proc, ULONG64 *parms)
     OBJECT_ATTRIBUTES objattrs;
     UNICODE_STRING objname;
     IO_STATUS_BLOCK IoStatusBlock;
+#ifdef USE_MATCH_PATH_EX
+    ULONG mp_flags;
+#else
     BOOLEAN is_open, is_closed;
+#endif
     KIRQL irql;
 
     //
@@ -1774,12 +1989,21 @@ _FX NTSTATUS File_Api_Rename(PROCESS *proc, ULONG64 *parms)
     KeRaiseIrql(APC_LEVEL, &irql);
     ExAcquireResourceSharedLite(proc->file_lock, TRUE);
 
+#ifdef USE_MATCH_PATH_EX
+    mp_flags = Process_MatchPathEx(proc, path, wcslen(path), L'f',
+        &proc->normal_file_paths, &proc->open_file_paths, &proc->closed_file_paths,
+        &proc->read_file_paths, &proc->write_file_paths, NULL);
+
+    //if ((mp_flags & TRUE_PATH_WRITE_FLAG) == 0 || (mp_flags & COPY_PATH_MASK) == 0) { // this fails renamings
+    if ((mp_flags & TRUE_PATH_WRITE_FLAG) == 0) {
+#else
     Process_MatchPath(
         proc->pool, path, wcslen(path),
         &proc->open_file_paths, &proc->closed_file_paths,
         &is_open, &is_closed);
 
     if ((! is_open) || is_closed) {
+#endif
 
         ExReleaseResourceLite(proc->file_lock);
         KeLowerIrql(irql);
@@ -1794,16 +2018,25 @@ _FX NTSTATUS File_Api_Rename(PROCESS *proc, ULONG64 *parms)
 
     *name = L'\0';
 
+#ifdef USE_MATCH_PATH_EX
+    mp_flags = Process_MatchPathEx(proc, path, wcslen(path), L'f',
+        &proc->normal_file_paths, &proc->open_file_paths, &proc->closed_file_paths,
+        &proc->read_file_paths, &proc->write_file_paths, NULL);
+#else
     Process_MatchPath(
         proc->pool, path, wcslen(path),
         &proc->open_file_paths, &proc->closed_file_paths,
         &is_open, &is_closed);
+#endif
 
     ExReleaseResourceLite(proc->file_lock);
     KeLowerIrql(irql);
 
+#ifdef USE_MATCH_PATH_EX
+    if ((mp_flags & TRUE_PATH_MASK) == TRUE_PATH_OPEN_FLAG || (mp_flags & TRUE_PATH_MASK) == 0) {
+#else
     if (is_open || is_closed) {
-
+#endif
         Mem_Free(path, path_len);
         return STATUS_BAD_INITIAL_PC;
     }
@@ -1900,107 +2133,115 @@ _FX NTSTATUS File_Api_Rename(PROCESS *proc, ULONG64 *parms)
 _FX NTSTATUS File_Api_GetName(PROCESS *proc, ULONG64 *parms)
 {
     API_GET_FILE_NAME_ARGS *args = (API_GET_FILE_NAME_ARGS *)parms;
-    FILE_OBJECT *object;
+    void *object;
     NTSTATUS status;
 
     status = ObReferenceObjectByHandle(
-        args->handle.val, 0, *IoFileObjectType, UserMode, &object, NULL);
-
-    if (NT_SUCCESS(status)) {
-
-        /*DbgPrint("Handle %08X DeviceObject %08X (Type %08X) ObjectName=<%*.*S>\n",
-            args->handle.val, object->DeviceObject,
-            object->DeviceObject ? object->DeviceObject->DeviceType : -1,
-            object->FileName.Length / sizeof(WCHAR), object->FileName.Length / sizeof(WCHAR), object->FileName.Buffer);*/
-
-        if (    (! object->DeviceObject)
-            ||  (! object->FileName.Length)
-            ||  (! object->FileName.Buffer)) {
-
-            ObDereferenceObject(object);
-            status = STATUS_BAD_DEVICE_TYPE;
-        }
-    }
+        args->handle.val, 0, NULL, UserMode, &object, NULL);
 
     if (NT_SUCCESS(status)) {
 
         POOL *pool = proc ? proc->pool : Driver_Pool;
         OBJECT_NAME_INFORMATION *Name = NULL;
         ULONG NameLength, len;
-        WCHAR *user;
+        WCHAR *name_buf;
+        ULONG *name_len;
+        WCHAR *type_buf;
 
         __try {
 
-            if (object->DeviceObject->DeviceType == FILE_DEVICE_DISK) {
+            void *object2 = object;
+            wchar_t* fileName_Buffer = NULL;
+            ULONG fileName_Length = 0;
 
-                //
-                // normal case for a file on a disk
-                //
+            POBJECT_TYPE objectType = pObGetObjectType(object);
+            if (*IoFileObjectType == objectType) {
 
-                status = Obj_GetName(pool, object, &Name, &NameLength);
-                if (NT_SUCCESS(status) && (Name == &Obj_Unnamed)) {
-                    Name = NULL;
-                    status = STATUS_OBJECT_PATH_NOT_FOUND;
-                }
+                FILE_OBJECT* fileObject = (FILE_OBJECT*)object;
+                if (fileObject->DeviceObject->DeviceType != FILE_DEVICE_DISK) {
 
-                if (NT_SUCCESS(status)) {
+                    object2 = fileObject->DeviceObject;
 
-                    len = Name->Name.Length
-                        + sizeof(WCHAR) * 2;  // null padding
-                    if (len > args->name_len.val)
-                        status = STATUS_BUFFER_TOO_SMALL;
-                    else {
+                    if (fileObject->FileName.Buffer && fileObject->DeviceObject->DeviceType != FILE_DEVICE_CONSOLE) {
 
-                        user = args->name_buf.val;
-                        ProbeForWrite(user, len, sizeof(WCHAR));
+                        fileName_Buffer = fileObject->FileName.Buffer;
+                        fileName_Length = fileObject->FileName.Length;
 
-                        memcpy(user, Name->Name.Buffer, Name->Name.Length);
-                        user += Name->Name.Length / sizeof(WCHAR);
-                        *user = L'\0';
+                        if (fileObject->DeviceObject->DeviceType == FILE_DEVICE_NETWORK_FILE_SYSTEM) {
 
-                        status = STATUS_SUCCESS;
+                            //
+                            // strip \;Q:000000000000b09f prefix 
+                            //
 
-                        //DbgPrint("Result DISK:  %S\n", args->name_buf.val);
+                            if (fileName_Buffer[1] == L';') {
+                                wchar_t* ptr = wcschr(fileName_Buffer + 2, L'\\');
+                                if (ptr) {
+                                    fileName_Length -= (ULONG)(ptr - fileName_Buffer);
+                                    fileName_Buffer = ptr;
+                                }
+                            }
+                        }
                     }
                 }
+            }
 
-            } else {
+            type_buf = args->type_buf.val;
+            if (type_buf) {
 
-                //
-                // not file or not on disk
-                //
+                len = objectType->Name.Length + sizeof(WCHAR);
 
-                status = Obj_GetName(
-                    pool, object->DeviceObject, &Name, &NameLength);
-                if (NT_SUCCESS(status) && (Name == &Obj_Unnamed)) {
-                    Name = NULL;
-                    status = STATUS_OBJECT_PATH_NOT_FOUND;
+                ProbeForWrite(type_buf, len, sizeof(WCHAR));
+
+                memcpy(type_buf, objectType->Name.Buffer, objectType->Name.Length);
+                type_buf += objectType->Name.Length / sizeof(wchar_t);
+                *type_buf = L'\0';
+            }
+
+            name_buf = args->name_buf.val;
+            name_len = args->name_len.val;
+            if (!name_buf || !name_len)
+                __leave;
+
+            status = Obj_GetName(pool, object2, &Name, &NameLength);
+            if (NT_SUCCESS(status) && (Name == &Obj_Unnamed)) {
+                Name = NULL;
+            //    status = STATUS_OBJECT_PATH_NOT_FOUND;
+            }
+
+            if (NT_SUCCESS(status)) {
+
+                len = sizeof(WCHAR);
+                if (Name) {
+                    len += Name->Name.Length;
+                    if (fileName_Buffer)
+                        len += fileName_Length;
                 }
 
-                if (NT_SUCCESS(status)) {
+                ProbeForWrite(name_len, sizeof(ULONG), sizeof(ULONG));
 
-                    len = Name->Name.Length
-                        + object->FileName.Length
-                        + sizeof(WCHAR) * 2;  // null padding
-                    if (len > args->name_len.val)
-                        status = STATUS_BUFFER_TOO_SMALL;
-                    else {
+                if (len > *name_len)
+                    status = STATUS_BUFFER_TOO_SMALL;
+                else {
 
-                        user = args->name_buf.val;
-                        ProbeForWrite(user, len, sizeof(WCHAR));
+                    ProbeForWrite(name_buf, len, sizeof(WCHAR));
 
-                        memcpy(user, Name->Name.Buffer, Name->Name.Length);
-                        user += Name->Name.Length / sizeof(WCHAR);
-                        memcpy(user, object->FileName.Buffer,
-                                     object->FileName.Length);
-                        user += object->FileName.Length / sizeof(WCHAR);
-                        *user = L'\0';
-
-                        status = STATUS_SUCCESS;
-
-                        //DbgPrint("Result MISC:  %S\n", args->name_buf.val);
+                    if (Name) {
+                        memcpy(name_buf, Name->Name.Buffer, Name->Name.Length);
+                        name_buf += Name->Name.Length / sizeof(WCHAR);
+                        if (fileName_Buffer) {
+                            memcpy(name_buf, fileName_Buffer, fileName_Length);
+                            name_buf += fileName_Length / sizeof(WCHAR);
+                        }
                     }
+                    *name_buf = L'\0';
+
+                    status = STATUS_SUCCESS;
+
+                    //DbgPrint("Result %d:  %S\n", object->DeviceObject->DeviceType, name_buf);
+                    //DbgPrint("Result %d:  %S | %S\n", object->DeviceObject->DeviceType, Name->Name.Buffer, object->FileName.Buffer);
                 }
+
+                *name_len = len;
             }
 
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -2018,6 +2259,25 @@ _FX NTSTATUS File_Api_GetName(PROCESS *proc, ULONG64 *parms)
 
 
 //---------------------------------------------------------------------------
+// File_PurgePathList
+//---------------------------------------------------------------------------
+
+
+_FX VOID File_PurgePathList(LIST* path_list)
+{
+    PATTERN *pat;
+
+    while (1) {
+        pat = List_Head(path_list);
+        if (! pat)
+            break;
+        List_Remove(path_list, pat);
+        Pattern_Free(pat);
+    }
+}
+
+
+//---------------------------------------------------------------------------
 // File_Api_RefreshPathList
 //---------------------------------------------------------------------------
 
@@ -2025,10 +2285,13 @@ _FX NTSTATUS File_Api_GetName(PROCESS *proc, ULONG64 *parms)
 _FX NTSTATUS File_Api_RefreshPathList(PROCESS *proc, ULONG64 *parms)
 {
     NTSTATUS status;
-    LIST open_paths,    *p_open_paths;
-    LIST closed_paths,  *p_closed_paths;
-    LIST read_paths,    *p_read_paths;
-    LIST write_paths,   *p_write_paths;
+#ifdef USE_MATCH_PATH_EX
+    LIST normal_paths;
+#endif
+    LIST open_paths;
+    LIST closed_paths;
+    LIST read_paths;
+    LIST write_paths;
     PATTERN *pat;
     BOOLEAN ok;
     KIRQL irql;
@@ -2044,92 +2307,74 @@ _FX NTSTATUS File_Api_RefreshPathList(PROCESS *proc, ULONG64 *parms)
     // build a new path list in a temporary space
     //
 
+#ifdef USE_MATCH_PATH_EX
+    List_Init(&normal_paths);
+#endif
     List_Init(&open_paths);
     List_Init(&closed_paths);
     List_Init(&read_paths);
     List_Init(&write_paths);
 
     ok = File_InitPaths(proc,
-            &open_paths, &closed_paths, &read_paths, &write_paths);
-
-    //
-    // select which set of path lists to delete, the currently active set
-    // in case of success, or the partially created new set on failure
-    //
+#ifdef USE_MATCH_PATH_EX
+                                &normal_paths,
+#endif
+                                &open_paths, 
+                                &closed_paths, 
+                                &read_paths, 
+                                &write_paths);
 
     KeRaiseIrql(APC_LEVEL, &irql);
     ExAcquireResourceExclusiveLite(proc->file_lock, TRUE);
 
     if (ok) {
 
-        p_open_paths    = &proc->open_file_paths;
-        p_closed_paths  = &proc->closed_file_paths;
-        p_read_paths    = &proc->read_file_paths;
-        p_write_paths   = &proc->write_file_paths;
+        //
+        // purge the old set of path lists
+        //
 
-    } else {
+#ifdef USE_MATCH_PATH_EX
+        File_PurgePathList(&proc->normal_file_paths);
+#endif
+        File_PurgePathList(&proc->open_file_paths);
+        File_PurgePathList(&proc->closed_file_paths);
+        File_PurgePathList(&proc->read_file_paths);
+        File_PurgePathList(&proc->write_file_paths);
 
-        p_open_paths    = &open_paths;
-        p_closed_paths  = &closed_paths;
-        p_read_paths    = &read_paths;
-        p_write_paths   = &write_paths;
+        //
+        // apply the newly created set of path lists
+        //
 
-    }
-
-    //
-    // delete the selected path lists
-    //
-
-    while (1) {
-        pat = List_Head(p_open_paths);
-        if (! pat)
-            break;
-        List_Remove(p_open_paths, pat);
-        Pattern_Free(pat);
-    }
-
-    while (1) {
-        pat = List_Head(p_closed_paths);
-        if (! pat)
-            break;
-        List_Remove(p_closed_paths, pat);
-        Pattern_Free(pat);
-    }
-
-    while (1) {
-        pat = List_Head(p_read_paths);
-        if (! pat)
-            break;
-        List_Remove(p_read_paths, pat);
-        Pattern_Free(pat);
-    }
-
-    while (1) {
-        pat = List_Head(p_write_paths);
-        if (! pat)
-            break;
-        List_Remove(p_write_paths, pat);
-        Pattern_Free(pat);
-    }
-
-    //
-    // restore old path lists, in case of failure
-    //
-
-    if (ok) {
-
+#ifdef USE_MATCH_PATH_EX
+        memcpy(&proc->normal_file_paths,  &normal_paths,    sizeof(LIST));
+#endif
         memcpy(&proc->open_file_paths,    &open_paths,      sizeof(LIST));
         memcpy(&proc->closed_file_paths,  &closed_paths,    sizeof(LIST));
         memcpy(&proc->read_file_paths,    &read_paths,      sizeof(LIST));
         memcpy(&proc->write_file_paths,   &write_paths,     sizeof(LIST));
-	}
+
+    } else {
+
+        //
+        // on failure purge the partially created new set of path lists
+        //
+
+#ifdef USE_MATCH_PATH_EX
+        File_PurgePathList(&normal_paths);
+#endif
+        File_PurgePathList(&open_paths);
+        File_PurgePathList(&closed_paths);
+        File_PurgePathList(&read_paths);
+        File_PurgePathList(&write_paths);
+    }
 
 	//
-	// now we need to re block the internet access
+	// this api call is also used to update network access permissions
+    // so we need to update the WFP configuration
 	//
 
-	if (ok)
-		ok = File_BlockInternetAccess(proc);
+    if (ok)
+        ok = WFP_UpdateProcess(proc);
 
 	if (ok) {
 
@@ -2167,7 +2412,11 @@ _FX NTSTATUS File_Api_Open(PROCESS *proc, ULONG64 *parms)
     ULONG CreateOptions;
     ULONG AccessCheckOptions;
     KIRQL irql;
+#ifdef USE_MATCH_PATH_EX
+    ULONG mp_flags;
+#else
     BOOLEAN is_open, is_closed;
+#endif
 
     //
     // this API must be invoked by a sandboxed process on Windows XP
@@ -2210,19 +2459,65 @@ _FX NTSTATUS File_Api_Open(PROCESS *proc, ULONG64 *parms)
     KeRaiseIrql(APC_LEVEL, &irql);
     ExAcquireResourceSharedLite(proc->file_lock, TRUE);
 
+#ifdef USE_MATCH_PATH_EX
+    mp_flags = Process_MatchPathEx(proc, path, wcslen(path), L'f',
+        &proc->normal_file_paths, &proc->open_file_paths, &proc->closed_file_paths,
+        &proc->read_file_paths, &proc->write_file_paths, NULL);
+#else
     Process_MatchPath(
         proc->pool, path, wcslen(path),
         NULL, &proc->closed_file_paths,
         &is_open, &is_closed);
+#endif
 
     ExReleaseResourceLite(proc->file_lock);
     KeLowerIrql(irql);
 
+#ifdef USE_MATCH_PATH_EX
+    if ((mp_flags & TRUE_PATH_MASK) == 0) {
+#else
     if (is_closed) {
-
+#endif
         DesiredAccess  = FILE_READ_ATTRIBUTES | SYNCHRONIZE;
         CreateOptions |= FILE_DIRECTORY_FILE;
     }
+
+    if (proc->file_trace & (TRACE_ALLOW | TRACE_DENY)) {
+
+        WCHAR access_str[48];
+        WCHAR letter;
+
+#ifdef USE_MATCH_PATH_EX
+        if ((mp_flags & TRUE_PATH_MASK) == 0 && (proc->file_trace & TRACE_DENY))
+#else
+        if (is_closed && (proc->file_trace & TRACE_DENY))
+#endif
+            letter = L'D';
+        else if (proc->file_trace & TRACE_ALLOW)
+            letter = L'A';
+        else
+            letter = 0;
+
+        if (letter) {
+
+            ULONG mon_type = MONITOR_FILE;
+            mon_type |= MONITOR_TRACE;
+
+            RtlStringCbPrintfW(access_str, sizeof(access_str), L"(F%c) %08X.%02X.%08X",
+                letter, DesiredAccess,
+                0 & 0x0F, CreateOptions);
+            Log_Debug_Msg(mon_type, access_str, path);
+        }
+    }
+#ifdef USE_MATCH_PATH_EX
+    else if ((mp_flags & TRUE_PATH_MASK) == 0 && Session_MonitorCount && !proc->disable_monitor) {
+#else
+    else if (is_closed && Session_MonitorCount && !proc->disable_monitor) {
+#endif
+
+        Session_MonitorPut(MONITOR_FILE | MONITOR_DENY, path, proc->pid);
+    }
+
 
     //
     // for a named pipe in the sandbox, use other parameters for the
@@ -2278,8 +2573,8 @@ _FX NTSTATUS File_Api_CheckInternetAccess(PROCESS *proc, ULONG64 *parms)
         (API_CHECK_INTERNET_ACCESS_ARGS *)parms;
     WCHAR *user_devname;
     WCHAR device_name[42];
-    WCHAR *ptr, *ptr2;
-    ULONG len;
+    //WCHAR *ptr, *ptr2;
+    //ULONG len;
     HANDLE ProcessId;
     NTSTATUS status;
     KIRQL irql;
@@ -2290,79 +2585,19 @@ _FX NTSTATUS File_Api_CheckInternetAccess(PROCESS *proc, ULONG64 *parms)
     //
 
     user_devname = args->device_name.val;
-    if (! user_devname)
-        return STATUS_INVALID_PARAMETER;
+    if (!user_devname)
+        goto get_program; //return STATUS_INVALID_PARAMETER;
     ProbeForRead(user_devname, sizeof(WCHAR) * 32, sizeof(WCHAR));
     wmemcpy(device_name,        File_Mup,     8);   // \Device\ prefix
     wmemcpy(device_name + 8,    user_devname, 32);
-
-    //
-    // convert the device name to lowercase, stop at the first backslash
-    //
-
-    ptr = device_name + 8;
-    ptr[32] = L'\0';
-    len = 0;
-    for (ptr2 = ptr; *ptr2; ++ptr2) {
-        if (*ptr2 == L'\\') {
-            *ptr2 = L'\0';
-            break;
-        }
-        if (*ptr2 >= L'A' && *ptr2 <= L'Z')
-            *ptr2 = (*ptr2 - L'A') + L'a';
-        ++len;
-    }
-
-    //
-    // check if this is an internet device
-    //
-
-    chk = FALSE;
-    if (len == 6) {
-
-        if (wmemcmp(ptr, File_RawIp, 6) == 0)
-            chk = TRUE;
-
-    } else if (len == 5) {
-
-        if (wmemcmp(ptr, File_RawIp, 5) == 0)
-            chk = TRUE;
-
-    } else if (len == 4) {
-
-        if (wmemcmp(ptr, File_Http, 4) == 0)
-            chk = TRUE;
-        if (wmemcmp(ptr, File_Tcp, 4) == 0)
-            chk = TRUE;
-        else if (wmemcmp(ptr, File_Udp, 4) == 0)
-            chk = TRUE;
-
-    } else if (len == 3) {
-
-        if (wmemcmp(ptr, File_Tcp, 3) == 0)
-            chk = TRUE;
-        else if (wmemcmp(ptr, File_Udp, 3) == 0)
-            chk = TRUE;
-        else if (wmemcmp(ptr, File_Ip, 3) == 0)
-            chk = TRUE;
-        else if (wmemcmp(ptr, File_Afd, 3) == 0)
-            chk = TRUE;
-        else if (wmemcmp(ptr, File_Nsi, 3) == 0)
-            chk = TRUE;
-
-    } else if (len == 2) {
-
-        if (wmemcmp(ptr, File_Ip, 2) == 0)
-            chk = TRUE;
-    }
-
-    if (! chk)
-        return STATUS_OBJECT_NAME_INVALID;
+    device_name[8+32] = L'\0';
 
     //
     // if a ProcessId was specified, then locate and lock the matching
     // process. ProcessId must be specified if the caller is not sandboxed
     //
+
+get_program:
 
     ProcessId = args->process_id.val;
     if (proc) {
@@ -2387,23 +2622,37 @@ _FX NTSTATUS File_Api_CheckInternetAccess(PROCESS *proc, ULONG64 *parms)
     // check file access restrictions
     //
 
-    if (1) {
+    if (user_devname) {
 
+#ifdef USE_MATCH_PATH_EX
+        ULONG mp_flags;
+#else
         BOOLEAN is_open, is_closed;
+#endif
         KIRQL irql2;
 
         KeRaiseIrql(APC_LEVEL, &irql2);
         ExAcquireResourceSharedLite(proc->file_lock, TRUE);
 
+#ifdef USE_MATCH_PATH_EX
+        mp_flags = Process_MatchPathEx(proc, device_name, wcslen(device_name), L'f',
+            &proc->normal_file_paths, &proc->open_file_paths, &proc->closed_file_paths,
+            &proc->read_file_paths, &proc->write_file_paths, NULL);
+#else
         Process_MatchPath(
             proc->pool, device_name, wcslen(device_name),
             NULL, &proc->closed_file_paths,
             &is_open, &is_closed);
+#endif
 
         ExReleaseResourceLite(proc->file_lock);
         KeLowerIrql(irql2);
 
+#ifdef USE_MATCH_PATH_EX
+        if ((mp_flags & TRUE_PATH_MASK) == 0) {
+#else
         if (is_closed) {
+#endif
 
             status = STATUS_ACCESS_DENIED;
 
@@ -2421,6 +2670,18 @@ _FX NTSTATUS File_Api_CheckInternetAccess(PROCESS *proc, ULONG64 *parms)
 
             status = STATUS_SUCCESS;
         }
+    }
+    else { // check for WFP state
+
+        status = STATUS_SUCCESS;
+
+        if (!proc->AllowInternetAccess) { // if the process isn't exempted check the config
+
+            if (!Process_GetConf_bool(proc, L"AllowNetworkAccess", TRUE)) {
+
+                status = STATUS_ACCESS_DENIED;
+            }
+	    }
     }
 
     //

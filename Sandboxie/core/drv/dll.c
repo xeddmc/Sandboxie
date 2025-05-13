@@ -72,9 +72,12 @@ static void *Dll_GetProc2(
 static LIST Dll_List;
 static BOOLEAN Dll_List_Initialized = FALSE;
 
-const WCHAR *Dll_NTDLL = L"NTDLL";
-const WCHAR *Dll_USER = L"USER32";
-
+const WCHAR *Exe_NTOSKRNL = L"NTOSKRNL.exe";
+const WCHAR *Dll_NTDLL = L"NTDLL.dll";
+const WCHAR *Dll_WIN32U = L"WIN32U.dll";
+#ifdef XP_SUPPORT
+const WCHAR *Dll_USER = L"USER32.dll";
+#endif
 
 //---------------------------------------------------------------------------
 // Dll_Init
@@ -88,8 +91,10 @@ _FX BOOLEAN Dll_Init(void)
 
     if (! Dll_Load(Dll_NTDLL))
         return FALSE;
+#ifdef XP_SUPPORT
     if (! Dll_Load(Dll_USER))
         return FALSE;
+#endif
 
     return TRUE;
 }
@@ -130,7 +135,6 @@ _FX void Dll_Unload(void)
 
 _FX DLL_ENTRY *Dll_Load(const WCHAR *DllBaseName)
 {
-    static const WCHAR *_DotDll = L".dll";
     NTSTATUS status;
     DLL_ENTRY *dll;
     WCHAR path[128];
@@ -174,17 +178,7 @@ _FX DLL_ENTRY *Dll_Load(const WCHAR *DllBaseName)
     // open the dll file and query its on-disk size
     //
 
-    swprintf(path, L"\\SystemRoot\\System32\\%s%s", DllBaseName, _DotDll);
-
-#ifdef _WIN64
-
-    /* if we have to open a 32-bit DLL on 64-bit Windows, adjust path
-       if (DllBaseName == Dll_NTDLL_32) {
-        wmemcpy(path + 15, L"Wow64", 5);
-        wmemcpy(path + 26, _DotDll, 5);
-    }*/
-
-#endif _WIN64
+    RtlStringCbPrintfW(path, sizeof(path), L"\\SystemRoot\\System32\\%s", DllBaseName);
 
     RtlInitUnicodeString(&uni, path);
     InitializeObjectAttributes(
@@ -358,7 +352,7 @@ _FX void *Dll_GetProc(
 
     if (! proc) {
         WCHAR dll_proc_name[96];
-        swprintf(dll_proc_name, L"%s.%S", DllName, ProcName);
+        RtlStringCbPrintfW(dll_proc_name, sizeof(dll_proc_name), L"%s.%S", DllName, ProcName);
         Log_Msg1(MSG_DLL_GET_PROC, dll_proc_name);
     }
 
@@ -400,7 +394,7 @@ _FX ULONG Dll_GetNextProc(
             if (! dll_offset) {
 
                 WCHAR dll_proc_name[96];
-                swprintf(dll_proc_name, L"%s.%S", dll->name, SearchName);
+                RtlStringCbPrintfW(dll_proc_name, sizeof(dll_proc_name), L"%s.%S", dll->name, SearchName);
                 Log_Msg1(MSG_1112, dll_proc_name);
             }
 

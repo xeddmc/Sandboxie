@@ -22,9 +22,12 @@
 #include "stdafx.h"
 
 #include <Sddl.h>
+#include <lmcons.h>
+#include "MountManager.h"
 #include "DriverAssist.h"
 #include "PipeServer.h"
 #include "GuiServer.h"
+#include "UserServer.h"
 #include "ProcessServer.h"
 #include "sbieiniserver.h"
 #include "serviceserver.h"
@@ -77,12 +80,14 @@ const  ULONG                 tzuk = 'xobs';
 
        SYSTEM_INFO           _SystemInfo;
 
+#ifdef _M_ARM64
+       BOOLEAN               DisableCHPE = FALSE;
+#endif
 
 //---------------------------------------------------------------------------
 // WinMain
 //---------------------------------------------------------------------------
 
-ULONG Dll_Windows = 0;
 
 int WinMain(
     HINSTANCE hInstance,
@@ -97,9 +102,6 @@ int WinMain(
     _Ntdll      = GetModuleHandle(L"ntdll.dll");
     _Kernel32   = GetModuleHandle(L"kernel32.dll");
     GetSystemInfo(&_SystemInfo);
-    if (GetProcAddress(_Ntdll, "LdrFastFailInLoaderCallout")) {
-        Dll_Windows = 10;
-    }
 
     WCHAR *cmdline = GetCommandLine();
     if (cmdline) {
@@ -125,6 +127,12 @@ int WinMain(
         WCHAR *cmdline5 = wcsstr(cmdline, SANDBOXIE L"_GuiProxy");
         if (cmdline5) {
             GuiServer::RunSlave(cmdline5);
+            return NO_ERROR;
+        }
+
+        WCHAR *cmdline6 = wcsstr(cmdline, SANDBOXIE L"_UserProxy");
+        if (cmdline6) {
+            UserServer::RunWorker(cmdline6);
             return NO_ERROR;
         }
 
@@ -163,6 +171,10 @@ void WINAPI ServiceMain(DWORD argc, WCHAR *argv[])
     if (! SetServiceStatus(ServiceStatusHandle, &ServiceStatus))
         status = GetLastError();
 
+    /*while (! IsDebuggerPresent()) {
+        Sleep(1000);
+    } __debugbreak();*/
+
     if (status == 0)
         status = InitializeEventLog();
 
@@ -172,8 +184,11 @@ void WINAPI ServiceMain(DWORD argc, WCHAR *argv[])
             status = 0x1234;
     }
 
-    if (status == 0)
+    if (status == 0) {
         status = InitializePipe();
+
+		SbieDll_DisableCHPE();
+    }
 
     if (status == 0) {
 
@@ -227,6 +242,7 @@ DWORD InitializePipe(void)
     new IpHlpServer(pipeServer);
     new NetApiServer(pipeServer);
     new QueueServer(pipeServer);
+    new MountManager(pipeServer);
     new EpMapperServer(pipeServer);
 
     if (! pipeServer->Start())
@@ -249,6 +265,28 @@ DWORD WINAPI ServiceHandlerEx(
         PipeServer *pipeServer = PipeServer::GetPipeServer();
         delete pipeServer;
 
+#ifdef _M_ARM64
+        if (DisableCHPE) {
+            HKEY hkey = NULL;
+            LSTATUS rc = RegCreateKeyEx(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Wow64\\x86\\xtajit",
+                0, NULL, 0, KEY_ALL_ACCESS, NULL, &hkey, NULL);
+            if (rc == 0)
+            {
+                DWORD value;
+                DWORD size = sizeof(value);
+                rc = RegQueryValueEx(hkey, L"LoadCHPEBinaries_old", NULL, NULL, (BYTE*)&value, &size);
+                if (rc == 0) {
+                    RegSetValueEx(hkey, L"LoadCHPEBinaries", NULL, REG_DWORD, (BYTE*)&value, size);
+                    RegDeleteValue(hkey, L"LoadCHPEBinaries_old");
+                }
+                else
+                    RegDeleteValue(hkey, L"LoadCHPEBinaries");
+
+                RegCloseKey(hkey);
+            }
+        }
+#endif
+
         ServiceStatus.dwCurrentState        = SERVICE_STOPPED;
         ServiceStatus.dwCheckPoint          = 0;
         ServiceStatus.dwWaitHint            = 0;
@@ -257,6 +295,8 @@ DWORD WINAPI ServiceHandlerEx(
             pComServer->DeleteAllSlaves();
 
         DriverAssist::Shutdown();
+
+        MountManager::Shutdown();
 
     } else if (dwControl != SERVICE_CONTROL_INTERROGATE)
         return ERROR_CALL_NOT_IMPLEMENTED;
@@ -294,6 +334,61 @@ void LogEvent(ULONG msgid, ULONG level, ULONG detail)
         ReportEvent(EventLog, EVENTLOG_ERROR_TYPE, 0, msgid, NULL,
                     num_extra, 0, ptr_extra, NULL);
     }
+}
+
+
+//---------------------------------------------------------------------------
+// LogMessage_Event
+//---------------------------------------------------------------------------
+
+
+void LogMessage_Event(ULONG code, wchar_t* data, ULONG pid)
+{
+    //
+    // get log message
+    //
+
+    WCHAR *str1 = data;
+    ULONG str1_len = wcslen(str1);
+    WCHAR *str2 = str1 + str1_len + 1;
+    ULONG str2_len = wcslen(str2);
+
+    WCHAR *text = SbieDll_FormatMessage2(code, str1, str2);
+    if (! text)
+        return;
+
+    //
+    // add user name
+    //
+    /*
+    WCHAR user[UNLEN + 1];
+    WCHAR domain[DNLEN + 1];
+    bool GetUserNameFromProcess(DWORD pid, WCHAR * user, DWORD userSize, WCHAR * domain, DWORD domainSize);
+    if (GetUserNameFromProcess(pid, user, UNLEN + 1, domain, DNLEN + 1)) {
+
+        WCHAR *text2 = (WCHAR *)LocalAlloc(
+            LMEM_FIXED, (wcslen(text) + UNLEN + DNLEN + 10) * sizeof(WCHAR));
+        if (text2) {
+
+            wsprintf(text2, L"%s (%s\\%s)", text, domain, user);
+
+            LocalFree(text);
+            text = text2;
+        }
+    }*/
+
+    //
+    // add event
+    //
+
+    const WCHAR* ptr_extra[2] = { text, NULL };
+    USHORT num_extra = 1;
+
+    if (EventLog) {
+        ReportEvent(EventLog, EVENTLOG_INFORMATION_TYPE, 0, code, NULL, num_extra, 0, ptr_extra, NULL);
+    }
+
+    LocalFree(text);
 }
 
 
@@ -485,9 +580,135 @@ finish:
 //---------------------------------------------------------------------------
 
 
-bool CheckDropRights(const WCHAR *BoxName)
+bool CheckDropRights(const WCHAR *BoxName, const WCHAR *ExeName)
 {
-    if (SbieApi_QueryConfBool(BoxName, L"DropAdminRights", FALSE))
+    // Allow setting of DropAdminRights to suppress UAC prompts / elevation from the sandboxed realm
+    // NOTE: use the SBIE_FLAG_APP_COMPARTMENT !!!!
+    //if (SbieApi_QueryConfBool(BoxName, L"NoSecurityIsolation", FALSE))
+    //    return false; // if we are not swapping the token we can not drop admin rights so keep this consistent
+    if (SbieApi_QueryConfBool(BoxName, L"UseSecurityMode", FALSE))
+        return true;
+    if (SbieDll_GetSettingsForName_bool(BoxName, ExeName, L"DropAdminRights", FALSE))
         return true;
     return false;
+}
+
+
+//---------------------------------------------------------------------------
+// IsProcessWoW64
+//---------------------------------------------------------------------------
+
+
+bool IsProcessWoW64(HANDLE pid)
+{
+    typedef BOOL (*P_IsWow64Process)(HANDLE, BOOL *);
+    static P_IsWow64Process pIsWow64Process = NULL;
+    if(!pIsWow64Process)
+        pIsWow64Process = (P_IsWow64Process)GetProcAddress(_Kernel32, "IsWow64Process");
+
+    if (!pIsWow64Process)
+        return false;
+
+    bool IsWow64 = false;
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                    FALSE, (ULONG)(ULONG_PTR)pid);
+    if (hProcess) {
+
+        BOOL xwow64 = FALSE;
+        if (pIsWow64Process && pIsWow64Process(hProcess, &xwow64) && xwow64) {
+
+            IsWow64 = true;
+        }
+
+        CloseHandle(hProcess);
+    }
+#ifdef DEBUG_COMSERVER
+    else {
+
+        WCHAR txt[256]; wsprintf(txt, L"Cannot determine wow64ness for idProcess=%d\n", idProcess);
+        OutputDebugString(txt);
+    }
+#endif
+
+    return IsWow64;
+}
+
+
+//---------------------------------------------------------------------------
+// IsBoxedPath
+//---------------------------------------------------------------------------
+
+
+extern "C" {
+    WINBASEAPI DWORD WINAPI GetFinalPathNameByHandleW(
+        _In_ HANDLE hFile,
+        _Out_writes_(cchFilePath) LPWSTR lpszFilePath,
+        _In_ DWORD cchFilePath,
+        _In_ DWORD dwFlags
+    );
+}
+
+bool IsHostPath(HANDLE idProcess, WCHAR* dos_path)
+{
+    bool result = false; // false on failure
+    WCHAR* request_path = NULL;
+    WCHAR* sandbox_path = NULL;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    ULONG len = 0;
+
+    //
+    // get the final file path by opening it and retrieving it from the handle
+    //
+
+    handle = CreateFileW(dos_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (handle == INVALID_HANDLE_VALUE)
+        goto finish;
+
+    len = 8192;
+    request_path = (WCHAR*)HeapAlloc(GetProcessHeap(), 0, len * sizeof(WCHAR));
+    if (!request_path)
+        goto finish;
+
+    DWORD dwRet = GetFinalPathNameByHandleW(handle, request_path, len, VOLUME_NAME_NT);
+    if (dwRet == 0 || dwRet > len) // failed || buffer to small
+        goto finish;
+
+    if(len > 12 && _wcsnicmp(request_path, L"\\Device\\Mup\\", 12) == 0)
+        goto finish; // files on network shares are not files on the host
+
+    //
+    // get the box file path for the calling process
+    //
+
+    if (!NT_SUCCESS(SbieApi_QueryProcessPath(idProcess, NULL, NULL, NULL, &len, NULL, NULL)))
+        goto finish;
+
+    sandbox_path = (WCHAR*)HeapAlloc(GetProcessHeap(), 0, len + 8 * sizeof(WCHAR));
+    if (!sandbox_path)
+        goto finish;
+
+    if (!NT_SUCCESS(SbieApi_QueryProcessPath(idProcess, sandbox_path, NULL, NULL, &len, NULL, NULL)))
+        goto finish;
+
+    //
+    // make sure the specified path is _NOT_ inside the sandbox
+    //
+
+    ULONG sandbox_path_len = wcslen(sandbox_path);
+    ULONG request_path_len = wcslen(request_path);
+    if (request_path_len <= sandbox_path_len || _wcsnicmp(sandbox_path, request_path, sandbox_path_len) != 0) {
+
+        result = true;
+    }
+
+finish:
+    if (request_path)
+        HeapFree(GetProcessHeap(), 0, request_path);
+    if (sandbox_path)
+        HeapFree(GetProcessHeap(), 0, sandbox_path);
+    if (handle != INVALID_HANDLE_VALUE) 
+        NtClose(handle);
+
+    return result;
 }

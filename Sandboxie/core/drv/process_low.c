@@ -24,6 +24,7 @@
 #include "process.h"
 #include "api.h"
 #include "util.h"
+#include "conf.h"
 
 
 //---------------------------------------------------------------------------
@@ -98,7 +99,7 @@ _FX BOOLEAN Process_Low_Inject(
     SVC_PROCESS_MSG msg;
     ULONG_PTR is_wow64 = 0;
     NTSTATUS status = STATUS_SUCCESS;
-    BOOLEAN sbielow_loaded = FALSE;
+    BOOLEAN done = FALSE;
     KIRQL irql;
 
     //
@@ -172,13 +173,13 @@ _FX BOOLEAN Process_Low_Inject(
         LARGE_INTEGER time;
         ULONG retries = 0;
 
-        while ((retries < 40) && (! Driver_Unloading)) {
+        while ((retries < 40 * 3) && (! Driver_Unloading)) {
 
             proc = Process_Find(process_id, &irql);
 
             if (proc && proc->create_time == create_time) {
 
-                sbielow_loaded = proc->sbielow_loaded;
+                done = proc->sbielow_loaded || proc->terminated;
 
                 if (! is_wow64)
                     proc->ntdll32_base = -1;
@@ -187,7 +188,7 @@ _FX BOOLEAN Process_Low_Inject(
             ExReleaseResourceLite(Process_ListLock);
             KeLowerIrql(irql);
 
-            if (sbielow_loaded)
+            if (done)
                 break;
 
             time.QuadPart = -(SECONDS(1) / 4); // 250ms*40 = 10s
@@ -196,7 +197,7 @@ _FX BOOLEAN Process_Low_Inject(
             ++retries;
         }
 
-        if (! sbielow_loaded)           // if no response from SbieSvc
+        if (! done)           // if no response from SbieSvc
             status = STATUS_TIMEOUT;
     }
 
@@ -216,27 +217,12 @@ _FX BOOLEAN Process_Low_Inject(
         ExReleaseResourceLite(Process_ListLock);
         KeLowerIrql(irql);
 
-        if (1) {
-
-            BOX dummy_box;
-            PROCESS dummy_proc;
-            memzero(&dummy_box, sizeof(dummy_box));
-            memzero(&dummy_proc, sizeof(dummy_proc));
-            dummy_box.session_id = session_id;
-            dummy_proc.box = &dummy_box;
-            dummy_proc.pid = process_id;
-            dummy_proc.create_time = create_time;
-            dummy_proc.image_name = (WCHAR *)image_name;
-
-            Process_CancelProcess(&dummy_proc);
-        }
-
-		Log_Status_Ex_Process(MSG_1231, 0x22, status, image_name, session_id, process_id);
+        Log_Status_Ex_Process(MSG_1231, 0x22, status, image_name, session_id, process_id);
 
         return FALSE;
     }
 
-    return sbielow_loaded;
+    return TRUE; // sbielow_loaded;
 }
 
 
@@ -268,8 +254,37 @@ _FX NTSTATUS Process_Low_Api_InjectComplete(PROCESS *proc, ULONG64 *parms)
         KIRQL irql;
         PROCESS *proc = Process_Find(ProcessId, &irql);
 
-        if (proc)
-            proc->sbielow_loaded = TRUE;
+        if (proc) {
+
+            ULONG error = (ULONG)parms[3];
+            if (error) 
+                Process_SetTerminated(proc, 3);
+            else
+                proc->sbielow_loaded = TRUE;
+
+            //
+            // the service dynamically allocates a per box SID to be used,
+            // if no SID is provided this feature is either disabled or failed
+            // then we fall back to using the default anonymous SID
+            //
+
+            __try {
+
+                PSID pSID = (PSID)(ULONG_PTR)parms[2];
+
+                if (pSID) {
+
+                    ProbeForRead(pSID, SECURITY_MAX_SID_SIZE, sizeof(UCHAR));
+
+                    ULONG sid_length = RtlLengthSid(pSID);
+                    proc->SandboxieLogonSid = Mem_Alloc(proc->pool, sid_length);
+                    memcpy(proc->SandboxieLogonSid, pSID, sid_length);
+                }
+
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                status = GetExceptionCode();
+            }
+        }
 
         ExReleaseResourceLite(Process_ListLock);
         KeLowerIrql(irql);
@@ -295,6 +310,11 @@ _FX NTSTATUS Process_Low_Api_InjectComplete(PROCESS *proc, ULONG64 *parms)
 _FX BOOLEAN Process_Low_InitConsole(PROCESS *proc)
 {
     NTSTATUS status;
+
+	// NoSbieCons BEGIN
+	if (proc->bAppCompartment || Conf_Get_Boolean(proc->box->name, L"NoSandboxieConsole", 0, FALSE))
+		return TRUE;
+	// NoSbieCons END
 
     //
     // on Windows 7, a console process tries to launch conhost.exe through

@@ -39,17 +39,6 @@
 //---------------------------------------------------------------------------
 
 
-/*typedef struct _API_WORK_ITEM {
-
-    LIST_ELEM list_elem;
-    ULONG length;           // length includes both header and data
-    ULONG session_id;
-    ULONG type;
-
-    ULONG data[1];
-
-} API_WORK_ITEM;*/
-
 typedef struct _Sbie_SeFilterTokenArg
 {
     PACCESS_TOKEN       ExistingToken;
@@ -107,21 +96,12 @@ void Api_ResetServiceProcess(void);
 BOOLEAN Api_SendServiceMessage(ULONG msgid, ULONG data_len, void *data);
 
 //
-// Publish WORK_ITEM to be consumed by SandboxieService.  Caller must
-// allocate work_item from Driver_Pool, and initialize type, length and data
-//
-
-//BOOLEAN Api_AddWork(API_WORK_ITEM *work_item);
-
-
-//
 // Add message to log buffer
 //
 
 void Api_AddMessage(
 	NTSTATUS error_code,
-	const WCHAR *string1, ULONG string1_len,
-	const WCHAR *string2, ULONG string2_len,
+	const WCHAR** strings, ULONG* lengths,
 	ULONG session_id,
 	ULONG process_id);
 
@@ -148,6 +128,9 @@ BOOLEAN Api_CopySidStringFromUser(
 
 void Api_CopyStringToUser(
     UNICODE_STRING64 *uni, WCHAR *str, size_t len);
+
+NTSTATUS Api_CopyStringFromUser(
+    WCHAR** str, size_t* len, UNICODE_STRING64* uni);
 
 NTSTATUS Sbie_SepFilterTokenHandler(
     void*       TokenObject,

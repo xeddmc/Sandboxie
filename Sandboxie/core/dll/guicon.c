@@ -79,6 +79,23 @@ static P_GetMessage                 __sys_GetMessageW               = NULL;
 
 _FX BOOLEAN Gui_InitConsole1(void)
 {
+    HMODULE module = Dll_Kernel32;
+
+    // NoSbieCons BEGIN
+    if (Dll_CompartmentMode || SbieApi_QueryConfBool(NULL, L"NoSandboxieConsole", FALSE)) {
+
+        //
+        // We need to set Gui_ConsoleHwnd in order for Gui_InitConsole2 to start up properly,
+        // this functions starts a thread which listens for WM_DEVICECHANGE which we need
+        // we could go for a different signaling method in future but for now we stick to this method
+        //
+
+        Gui_ConsoleHwnd = GetConsoleWindow();
+
+        return TRUE;
+    }
+	// NoSbieCons END
+
     //
     // on Windows 7 we may need to connect this process to a console
     // instance (conhost.exe) outside the sandbox
@@ -144,16 +161,6 @@ _FX BOOL Gui_ConnectConsole(ULONG ShowFlag)
     HANDLE ProcessToken;
     NTSTATUS status;
 
-	// NoSbieDesk BEGIN
-	if (SbieApi_QueryConfBool(NULL, L"NoSandboxieDesktop", FALSE)) {
-
-		typedef BOOL(*P_AllocConsole)();
-		P_AllocConsole AllocConsole = (P_AllocConsole)
-			GetProcAddress(Dll_Kernel32, "AllocConsole");
-		return AllocConsole();
-	}
-	// NoSbieDesk END
-
     //
     // on Windows 7, a console process tries to launch conhost.exe through
     // csrss.exe during initialization of kernel32.dll in the function
@@ -213,6 +220,26 @@ _FX BOOL Gui_ConnectConsole(ULONG ShowFlag)
 
                 if (! AttachConsole(rpl->process_id))
                     status = STATUS_NOT_SAME_DEVICE;
+
+                //
+                // wait for the count to indicate the service has quit
+                //
+
+                typedef DWORD (*P_GetConsoleProcessList)(LPDWORD lpdwProcessList, DWORD dwProcessCount);
+                P_GetConsoleProcessList GetConsoleProcessList = (P_GetConsoleProcessList)
+                    GetProcAddress(Dll_Kernel32, "GetConsoleProcessList");
+
+                DWORD pids[10]; // 2 should be enough but lets go with 10
+
+                int retries = 40; // 40*50ms=2s should be enough for the service to quit
+                while (retries--) {
+
+                    Sleep(50);
+
+                    ULONG num_pids = GetConsoleProcessList(pids, ARRAYSIZE(pids));
+                    if (num_pids < 2)
+                        break;
+                }
             }
 
             Dll_Free(rpl);
@@ -257,6 +284,7 @@ _FX void Gui_InitConsole2(void)
     HANDLE *Handles;
     HMODULE User32;
 
+    // $Workaround$ - 3rd party fix
     //
     // hack:  the Kaspersky process klwtblfs.exe is protected from
     // termination through TerminateProcess, so make sure we terminate
@@ -379,11 +407,14 @@ _FX ULONG Gui_ConsoleThread(void *xHandles)
 
     while (1) {
 
-        if (Gui_ConsoleHwnd && Dll_InitComplete) {
-
-            Taskbar_SetWindowAppUserModelId(Gui_ConsoleHwnd);
-            Gui_ConsoleHwnd = NULL;
-        }
+        //
+        // this causes git.exe to hang also jumplists for a console process are pointless anyways
+        // 
+        //if (Gui_ConsoleHwnd && Dll_InitComplete) {
+        //
+        //    Taskbar_SetWindowAppUserModelId(Gui_ConsoleHwnd);
+        //    Gui_ConsoleHwnd = NULL;
+        //}
 
         while (__sys_PeekMessageW(&msg, NULL, 0, 0, PM_NOREMOVE)) {
 

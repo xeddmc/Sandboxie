@@ -1,5 +1,6 @@
 ;------------------------------------------------------------------------
 ; Copyright 2004-2020 Sandboxie Holdings, LLC 
+; Copyright 2020-2024 David Xanatos, xanasoft.com
 ;
 ; This program is free software: you can redistribute it and/or modify
 ;   it under the terms of the GNU General Public License as published by
@@ -96,17 +97,17 @@ PUBLIC _ProtectCall4@20
 
 
 ;----------------------------------------------------------------------------
-; Secure_NdrAsyncClientCall
+; RpcRt_NdrAsyncClientCall
 ;----------------------------------------------------------------------------
 
 
-EXTERN C Secure_CheckElevation    : PROC
+EXTERN C RpcRt_NdrAsyncClientCall_x86 : PROC
 EXTERN C Secure_HandleElevation   : PROC
 EXTERN C __sys_NdrAsyncClientCall : DWORD
 
-Secure_NdrAsyncClientCall   PROC C PUBLIC
+RpcRt_NdrAsyncClientCall   PROC C PUBLIC
 
-        call Secure_CheckElevation
+        call RpcRt_NdrAsyncClientCall_x86
         test al,al
         jnz WeHandleElevation
     
@@ -116,9 +117,9 @@ WeHandleElevation:
 
         jmp Secure_HandleElevation
 
-Secure_NdrAsyncClientCall   ENDP
+RpcRt_NdrAsyncClientCall   ENDP
 
-PUBLIC C Secure_NdrAsyncClientCall
+PUBLIC C RpcRt_NdrAsyncClientCall
 
 
 ;----------------------------------------------------------------------------
@@ -139,6 +140,7 @@ Ldr_Inject_Entry32@0        PROC C PUBLIC
     ; assumes the stack is zero
     ;
     
+    ; $Workaround$ - 3rd party fix
     lea edi,[esp-200h]
     mov ecx,200h/4
     xor eax,eax
@@ -278,28 +280,106 @@ RpcRt_NdrClientCall2   ENDP
 PUBLIC C RpcRt_NdrClientCall2
 
 
+
 ;----------------------------------------------------------------------------
-; RpcRt_NdrClientCall4
+; InstrumentationCallback
 ;----------------------------------------------------------------------------
 
+assume fs:nothing
+extern _InstrumentationCallback@8:near
 
-EXTERN C RpcRt_NdrClientCall4_x86    : PROC
-;EXTERN C RpcRt_NdrClientCall4_...   : PROC
-EXTERN C __sys_NdrClientCall4 : DWORD
+InstrumentationCallbackAsm@0 proc
 
-RpcRt_NdrClientCall4   PROC C PUBLIC
+    push    esp                         ; back-up ESP, ECX, and EAX to restore them
+    push    ecx
+    push    eax
 
-        call RpcRt_NdrClientCall4_x86
-        test al,al
-        jnz CancelCall4
+    mov     eax, 1                      ; Set EAX to 1 for comparison
+    cmp     fs:1b8h, eax                ; See if the recursion flag (Win10 TEB InstrumentationCallbackDisabled) has been set
+    je      resume                      ; Jump and restore the registers if it has and resume
+
+    pop     eax
+    pop     ecx
+    pop     esp
+
+    mov     fs:1b0h, ecx                ; InstrumentationCallbackPreviousPc
+    mov     fs:1b4h, esp                ; InstrumentationCallbackPreviousSp
     
-        jmp dword ptr [__sys_NdrClientCall4]
+    pushad                              ; Push registers to stack
+    pushfd                              ; Push flags to the stack
+    cld                                 ; Clear direction flag
+    
+    push    eax                         ; Return value
+    push    ecx                         ; Return address
+    call    _InstrumentationCallback@8
+    ;add     esp, 08h                    ; Correct stack position
 
-CancelCall4:
+    popfd                               ; Restore stored flags
+    popad                               ; Restore stored registers
 
-;        jmp RpcRt_NdrClientCall4_...
-		ret
+    mov     esp, fs:1b4h                ; Restore ESP
+    mov     ecx, fs:1b0h                ; Restore ECX
+    jmp     ecx                         ; Resume execution
 
-RpcRt_NdrClientCall4   ENDP
+resume:
+    pop     eax
+    pop     ecx
+    pop     esp
 
-PUBLIC C RpcRt_NdrClientCall4
+    jmp     ecx
+
+
+if 0
+
+	;cmp eax, 0			; STATUS_SUCCESS
+	;jne ReturnToCaller
+    
+	pushad
+    
+	push eax
+	push ecx
+	call _InstrumentationCallback@8
+	
+	pop edi
+	pop esi
+	pop ebp
+	add esp, 4
+	pop ebx
+	pop edx
+	pop ecx
+	add esp, 4 ; preserve new eax
+
+;ReturnToCaller:
+	jmp ecx
+
+endif
+
+InstrumentationCallbackAsm@0 endp
+
+PUBLIC C InstrumentationCallbackAsm@0
+
+
+
+;----------------------------------------------------------------------------
+; ApiInstrumentationProxy
+;----------------------------------------------------------------------------
+
+extern @ApiInstrumentation@8:near
+
+ApiInstrumentationAsm@0 proc
+
+    ; prepare arguments for instrumentation
+    lea ecx,[eax + 8] ; pName
+    lea edx,[esp + 4] ; pArgs
+
+    ; invoke api entry instrumentation
+    push eax
+    call @ApiInstrumentation@8
+    pop eax
+
+    ; jump to detour function
+	jmp dword ptr [eax]
+
+ApiInstrumentationAsm@0 endp
+
+PUBLIC C ApiInstrumentationAsm@0

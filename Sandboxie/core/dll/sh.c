@@ -1,6 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
- * Copyright 2020 David Xanatos, xanasoft.com
+ * Copyright 2020-2023 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -32,6 +32,7 @@
 #include "common/my_shlwapi.h"
 #include "msgs/msgs.h"
 #include "gui_p.h"
+#include "core/svc/UserWire.h"
 
 //---------------------------------------------------------------------------
 // Functions
@@ -48,6 +49,9 @@ static BOOL SH32_ShellExecuteExW(SHELLEXECUTEINFOW *lpExecInfo);
 
 static BOOL SH32_Shell_NotifyIconW(
     DWORD dwMessage, PNOTIFYICONDATAW lpData);
+
+//static HRESULT SH32_SHGetFolderPathW(
+//    HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPWSTR pszPath);
 
 static WCHAR *SbieDll_AssocQueryCommandInternal(
     const WCHAR *subj, const WCHAR *verb);
@@ -86,6 +90,9 @@ typedef BOOL (*P_ShellExecuteEx)(
 typedef BOOL (*P_Shell_NotifyIconW)(
     DWORD dwMessage, PNOTIFYICONDATAW lpData);
 
+//typedef HRESULT (*P_SHGetFolderPathW)(
+//    HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPWSTR pszPath);
+
 typedef ULONG (*P_SHChangeNotifyRegister)(
     HWND hwnd, int fSources, LONG fEvents, UINT wMsg,
     int cEntries, SHChangeNotifyEntry *pfsne);
@@ -111,6 +118,8 @@ typedef HRESULT (*P_SHGetFolderLocation)(
 static P_ShellExecuteEx         __sys_ShellExecuteExW               = NULL;
 
 static P_Shell_NotifyIconW      __sys_Shell_NotifyIconW             = NULL;
+
+//static P_SHGetFolderPathW       __sys_SHGetFolderPathW              = NULL;
 
 static P_SHChangeNotifyRegister __sys_SHChangeNotifyRegister        = NULL;
 
@@ -295,6 +304,54 @@ _FX WCHAR *SH32_AdjustPath(WCHAR *src, WCHAR **pArgs)
 
 
 //---------------------------------------------------------------------------
+// SH32_BreakoutDocument
+//---------------------------------------------------------------------------
+
+
+_FX BOOL SH32_BreakoutDocument(const WCHAR* path, ULONG len)
+{
+    if (SbieDll_CheckPatternInList(path, len, NULL, L"BreakoutDocument")) {
+
+        NTSTATUS status;
+        static WCHAR* _QueueName = NULL;
+
+        if (!_QueueName) {
+            _QueueName = Dll_Alloc(32 * sizeof(WCHAR));
+            Sbie_snwprintf(_QueueName, 32, L"*USERPROXY_%08X", Dll_SessionId);
+        }
+
+        ULONG path_len = (len + 1) * sizeof(WCHAR);
+        ULONG req_len = sizeof(USER_SHELL_EXEC_REQ) + path_len;
+        ULONG path_pos = sizeof(USER_SHELL_EXEC_REQ);
+
+        USER_SHELL_EXEC_REQ* req = (USER_SHELL_EXEC_REQ*)Dll_AllocTemp(req_len);
+
+        WCHAR* path_buff = ((UCHAR*)req) + path_pos;
+        memcpy(path_buff, path, path_len);
+
+        req->msgid = USER_SHELL_EXEC;
+
+        req->FileNameOffset = path_pos;
+
+        ULONG* rpl = SbieDll_CallProxySvr(_QueueName, req, req_len, sizeof(*rpl), 100);
+        if (!rpl)
+            status = STATUS_INTERNAL_ERROR;
+        else {
+            status = rpl[0];
+
+            Dll_Free(rpl);
+        }
+
+        Dll_Free(req);
+
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+
+//---------------------------------------------------------------------------
 // SH32_ShellExecuteExW
 //---------------------------------------------------------------------------
 
@@ -309,6 +366,16 @@ _FX BOOL SH32_ShellExecuteExW(SHELLEXECUTEINFOW *lpExecInfo)
     BOOL b;
     ULONG err;
     BOOLEAN is_explore_verb;
+
+    //
+    // check if the request is to open a file located in a break out folder
+    //
+
+    if (lpExecInfo->lpFile) {
+
+        if (SH32_BreakoutDocument(lpExecInfo->lpFile, wcslen(lpExecInfo->lpFile)))
+            return TRUE;
+    }
 
     //
     // check if the request is to open a directory
@@ -418,22 +485,6 @@ _FX BOOL SH32_ShellExecuteExW(SHELLEXECUTEINFOW *lpExecInfo)
 
 HICON SH32_BorderToIcon(HICON hIcon, COLORREF color)
 {
-    typedef HDC(*P_GetDC)(HWND hWnd);
-    typedef int(*P_ReleaseDC)(HWND hWnd, HDC hDC);
-    typedef BOOL(*P_GetIconInfo)(HICON hIcon, PICONINFO piconinfo);
-    typedef HICON(*P_CreateIconIndirect)(PICONINFO piconinfo);
-
-    typedef HDC(*P_CreateCompatibleDC)(HDC hdc);
-    typedef HGDIOBJ(*P_SelectObject)(HDC hdc, HGDIOBJ h);
-    typedef COLORREF(*P_GetPixel)(HDC hdc, int x, int y);
-    typedef COLORREF(*P_SetPixel)(HDC hdc, int x, int y, COLORREF color);
-    typedef BOOL(*P_DeleteObject)(HGDIOBJ ho);
-    typedef BOOL(*P_DeleteDC)(HDC hdc);
-
-#define GET_WIN_API(name, lib) \
-    P_##name name = Ldr_GetProcAddrNew(lib, #name, #name); \
-    if(!name) return NULL;
-
     GET_WIN_API(GetDC, DllName_user32);
     GET_WIN_API(ReleaseDC, DllName_user32);
     GET_WIN_API(GetIconInfo, DllName_user32);
@@ -562,6 +613,18 @@ _FX BOOL SH32_Shell_NotifyIconW(
 
     return ret;
 }
+
+
+//---------------------------------------------------------------------------
+// SH32_SHGetFolderPathW
+//---------------------------------------------------------------------------
+
+
+//_FX HRESULT SH32_SHGetFolderPathW(
+//    HWND hwnd, int csidl, HANDLE hToken, DWORD dwFlags, LPWSTR pszPath)
+//{
+//    return __sys_SHGetFolderPathW(hwnd, csidl, hToken, dwFlags, pszPath);
+//}
 
 
 //---------------------------------------------------------------------------
@@ -779,6 +842,9 @@ _FX BOOL SH32_DoRunAs(
     // remove any quotes around the program name.
     //
 
+    if (CmdLine == NULL)
+        return FALSE;
+
     if (CmdLine[0] == L'\"') {
         ++CmdLine;
         arg = wcschr(CmdLine, L'\"');
@@ -951,6 +1017,7 @@ _FX BOOLEAN SH32_Init(HMODULE module)
 {
     P_ShellExecuteEx ShellExecuteExW;
     P_Shell_NotifyIconW Shell_NotifyIconW;
+    //P_SHGetFolderPathW SHGetFolderPathW;
     P_SHChangeNotifyRegister SHChangeNotifyRegister;
     void *SHGetItemFromObject;
     P_SHOpenFolderAndSelectItems SHOpenFolderAndSelectItems;
@@ -982,6 +1049,11 @@ _FX BOOLEAN SH32_Init(HMODULE module)
     SBIEDLL_HOOK(SH32_,ShellExecuteExW);
 
     SBIEDLL_HOOK(SH32_,Shell_NotifyIconW);
+
+    //SHGetFolderPathW = (P_SHGetFolderPathW)
+    //    GetProcAddress(module, "SHGetFolderPathW");
+    //
+    //SBIEDLL_HOOK(SH32_,SHGetFolderPathW);
 
     if (SHChangeNotifyRegister && SHGetItemFromObject) {
 
@@ -1043,7 +1115,7 @@ _FX BOOLEAN SH32_Init(HMODULE module)
 
             *(ULONG_PTR *)&__sys_LdrGetDllHandleEx = (ULONG_PTR)
                 SbieDll_Hook("LdrGetDllHandleEx",
-                    __sys_LdrGetDllHandleEx, SH32_LdrGetDllHandleEx);
+                    __sys_LdrGetDllHandleEx, SH32_LdrGetDllHandleEx, module);
         }
 
         //
@@ -1139,6 +1211,7 @@ retry:
     // then look again in HKEY_CLASSES_ROOT\Wow64
     //
 
+#ifndef _WIN64
     if (Dll_IsWow64) {
 
         wcscpy(subkey2, L"Wow6432Node\\");
@@ -1149,6 +1222,7 @@ retry:
         if (NT_SUCCESS(status))
             return hkey;
     }
+#endif
 
     //
     // if we looked at HKEY_CURRENT_USER, try again for HKEY_LOCAL_MACHINE
@@ -1423,7 +1497,7 @@ _FX ULONG SH_GetInternetExplorerVersion(void)
 //
 // Code running in Explorer (both Windows and Internet) may AddRef() on the
 // host process using SHGetInstanceExplorer and then forget to Release().
-// This causes a sandboxed IE or Explorer to go on running indefinately.
+// This causes a sandboxed IE or Explorer to go on running indefinitely.
 // To work around this, we have a thread that monitors the number of open
 // windows, and forces Explorer to close when there are no more windows.
 //
@@ -1569,7 +1643,10 @@ _FX ULONG SH_WindowMonitorCount(void)
     args[0] = (ULONG_PTR)info;
     args[1] = 0;
 
-    Gui_EnumWindows(SH_WindowMonitorEnum, (LPARAM)args);
+    if(!Gui_UseProxyService && __sys_EnumWindows)
+		__sys_EnumWindows(SH_WindowMonitorEnum, (LPARAM)args);
+    else
+        Gui_EnumWindows(SH_WindowMonitorEnum, (LPARAM)args);
 
     Dll_Free(info);
 
@@ -1765,12 +1842,16 @@ _FX HRESULT SH32_IShellExtInit_Initialize(
     void *pShellExtInit,
     void *pidlFolder, IDataObject *pDataObject, HKEY hkeyProgID)
 {
-    typedef HRESULT (*P_Initialize)(void *, void *, IDataObject *, HKEY);
+#if !defined(_M_ARM64) && !defined(_M_ARM64EC)
     ULONG_PTR *StubData = Dll_JumpStubData();
+#else
+    ULONG_PTR *StubData = (ULONG_PTR *)hkeyProgID;
+    hkeyProgID = (HKEY)StubData[3];
+#endif
 
     extern IDataObject *Ole_XDataObject_From_IDataObject(
         IDataObject *pDataObject);
-
+    typedef HRESULT (*P_Initialize)(void *, void *, IDataObject *, HKEY);
     return ((P_Initialize)StubData[1])(
                         pShellExtInit, pidlFolder,
                         Ole_XDataObject_From_IDataObject(pDataObject),
@@ -1779,12 +1860,16 @@ _FX HRESULT SH32_IShellExtInit_Initialize(
 
 
 _FX HRESULT SH32_IContextMenuHook_QueryInterface(
-    void *pContextMenu, REFIID riid, void **ppv)
-{
+    void *pContextMenu, REFIID riid, void **ppv
+#if !defined(_M_ARM64) && !defined(_M_ARM64EC)
+    ) {
+    ULONG_PTR *StubData = Dll_JumpStubData();
+#else 
+    , ULONG_PTR *StubData) {
+#endif
+
     EXTERN_C const IID IID_IShellExtInit;
     typedef HRESULT (*P_QueryInterface)(void *, REFIID, void **);
-    ULONG_PTR *StubData = Dll_JumpStubData();
-
     HRESULT hr = ((P_QueryInterface)StubData[1])(pContextMenu, riid, ppv);
     if (SUCCEEDED(hr) &&
             memcmp(riid, &IID_IShellExtInit, sizeof(GUID)) == 0) {

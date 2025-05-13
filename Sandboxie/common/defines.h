@@ -51,7 +51,11 @@
 #define PAGE_SIZE 4096
 #endif
 
+#define BOXNAME_COUNT				(32 + 2)
+
 #define DYNAMIC_PORT_NAME_CHARS     96  // number of wchars in an Epmapper dynamic endpoint port name
+#define DYNAMIC_PORT_ID_CHARS       81
+
 
 //---------------------------------------------------------------------------
 
@@ -86,14 +90,12 @@
 //#define wmemchr(mem,c, len)   memchr((mem), (c), (len)*sizeof(WCHAR))
 
 
-typedef enum {
-    SPOOLER_PORT,
-    WPAD_PORT,
-    GAME_CONFIG_STORE_PORT,
-    SMART_CARD_PORT,
-    BT_PORT,
-    NUM_DYNAMIC_PORTS
-} ENUM_DYNAMIC_PORT_TYPE;
+#define SPOOLER_PORT_ID				L"PrintSpooler"
+//#define WPAD_PORT_ID				L"WPAD"
+//#define GAME_CONFIG_STORE_PORT_ID	L"GamePort"
+//#define SMART_CARD_PORT_ID			L"SmartCard"
+//#define BT_PORT_ID					L"bthserv"
+//#define SSDP_PORT_ID				L"ssdpsrv"
 
 //---------------------------------------------------------------------------
 

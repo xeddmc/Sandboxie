@@ -94,11 +94,11 @@ _FX NTSTATUS Syscall_DeviceIoControlFile(
             case 0x211: //CM_Create_DevNode
             case 0x212: //CM_Uninstall_DevNode
             //case 0x213: //CM_Reenumerate_DevNode,CM_Setup_DevNode
-            case 0x214: //CM_Open_Device_Interface_Key
+            //case 0x214: //CM_Open_Device_Interface_Key
             case 0x215: //CM_Delete_Device_Interface_Key
-            case 0x216: //OpenLogConfKey,OpenLogConfKey,CM_Open_DevNode_Key,CM_Get_DevNode_Custom_Property,OpenDeviceHwProfileKey
+            //case 0x216: //OpenLogConfKey,OpenLogConfKey,CM_Open_DevNode_Key,CM_Get_DevNode_Custom_Property,OpenDeviceHwProfileKey
             case 0x217: //CM_Delete_DevNode_Key
-            case 0x218: //CM_Open_Class_Key
+            //case 0x218: //CM_Open_Class_Key
             case 0x219: //CM_Delete_Class_Key
                 
                 filter = TRUE;
@@ -106,10 +106,27 @@ _FX NTSTATUS Syscall_DeviceIoControlFile(
 
             /*
             WCHAR msg_str[240];
-            swprintf(msg_str, L"DeviceIoContoleFile, CMApi, func = 0x%X, filter=%d, p=%06d t=%06d, %s\n",
+            RtlStringCbPrintfW(msg_str, sizeof(msg_str), L"DeviceIoContoleFile, CMApi, func = 0x%X, filter=%d, p=%06d t=%06d, %s\n",
                 function, filter, PsGetCurrentProcessId(), PsGetCurrentThreadId(), proc->image_name);
-            const WCHAR* strings[2] = { msg_str, NULL };
-            Session_MonitorPutEx(MONITOR_OTHER | MONITOR_TRACE, strings, NULL, PsGetCurrentProcessId(), PsGetCurrentThreadId());*/
+            Log_Debug_Msg(MONITOR_OTHER | MONITOR_TRACE, msg_str, Driver_Empty);*/
+
+            if (Session_MonitorCount && (proc->ipc_trace & (TRACE_ALLOW | TRACE_DENY))) {
+
+                ULONG mon_type = MONITOR_IPC;
+
+                if (filter && (proc->ipc_trace & TRACE_DENY))
+                    mon_type |= MONITOR_DENY;
+                else if (!filter && (proc->ipc_trace & TRACE_ALLOW))
+                    mon_type |= MONITOR_OPEN;
+                else
+                    mon_type = 0;
+
+                if (mon_type) {
+                    WCHAR msg_str[24];
+                    RtlStringCbPrintfW(msg_str, sizeof(msg_str), L"Func: %02X", (ULONG)function);
+                    Log_Debug_Msg(mon_type, msg_str, L"\\Device\\DeviceApi\\CMApi");
+                }
+            }
 
             if(filter)
                 return STATUS_ACCESS_DENIED;

@@ -47,7 +47,7 @@ void *Token_QueryPrimary(TOKEN_INFORMATION_CLASS InfoClass, ULONG SessionId);
 void *Token_Filter(void *TokenObject, ULONG DropRights, ULONG SessionId);
 
 void *Token_Restrict(
-    void *TokenObject, ULONG FilterFlags, ULONG *OutIntegrityLevel, PROCESS *proc);
+    void *TokenObject, ULONG FilterFlags, PROCESS *proc);
 
 NTSTATUS Token_AssignPrimaryHandle(
     void *ProcessObject, HANDLE TokenKernelHandle, ULONG SessionId);
@@ -60,5 +60,8 @@ BOOLEAN Token_ResetPrimary(PROCESS *proc);
 ULONG GetThreadTokenOwnerPid();
 //---------------------------------------------------------------------------
 
+NTSTATUS Token_Api_Filter(PROCESS *proc, ULONG64 *parms);
+
+//---------------------------------------------------------------------------
 
 #endif // _MY_TOKEN_H

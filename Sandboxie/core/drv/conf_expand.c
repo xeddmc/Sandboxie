@@ -23,6 +23,7 @@
 #include <stdlib.h>         // itow
 #include "conf.h"
 #include "file.h"
+#include "util.h"
 
 
 //---------------------------------------------------------------------------
@@ -123,24 +124,24 @@ _FX NTSTATUS Conf_Expand_RegValue(
     WCHAR *PageSizeBuffer)
 {
     NTSTATUS status;
-    RTL_QUERY_REGISTRY_TABLE qrt[2];
+    //RTL_QUERY_REGISTRY_TABLE qrt[2];
     UNICODE_STRING uni;
     WCHAR *KeyPath;
     ULONG KeyPath_len;
 
     memzero(PageSizeBuffer, sizeof(WCHAR) * (1024 + 4));
 
-    uni.Length = sizeof(WCHAR) * 1024;  // only half the PageSizeBuffer
-    uni.MaximumLength = uni.Length + sizeof(WCHAR);
+    uni.Length = 0;
+    uni.MaximumLength = sizeof(WCHAR) * (1024 + 1); // only half the PageSizeBuffer
     uni.Buffer = PageSizeBuffer;
 
-    memzero(qrt, sizeof(qrt));
-    qrt[0].Flags =  RTL_QUERY_REGISTRY_REQUIRED |
-                    RTL_QUERY_REGISTRY_DIRECT |
-                    RTL_QUERY_REGISTRY_NOEXPAND;
-    qrt[0].Name = (WCHAR *)ValueName;
-    qrt[0].EntryContext = &uni;
-    qrt[0].DefaultType = REG_NONE;
+    //memzero(qrt, sizeof(qrt));
+    //qrt[0].Flags =  RTL_QUERY_REGISTRY_REQUIRED |
+    //                RTL_QUERY_REGISTRY_TYPECHECK | 
+    //                RTL_QUERY_REGISTRY_NOEXPAND;
+    //qrt[0].Name = (WCHAR *)ValueName;
+    //qrt[0].EntryContext = &uni;
+    //qrt[0].DefaultType = REG_NONE;
 
     if (RootKey == RTL_REGISTRY_USER) {
 
@@ -177,7 +178,8 @@ _FX NTSTATUS Conf_Expand_RegValue(
         KeyPath = (WCHAR *)SubKeyPath;
     }
 
-    status = RtlQueryRegistryValues(RootKey, KeyPath, qrt, NULL, NULL);
+    //status = RtlQueryRegistryValues(RootKey, KeyPath, qrt, NULL, NULL);
+    status = GetRegString(RootKey, KeyPath, ValueName, &uni);
 
     if (status == STATUS_SUCCESS) {
 
@@ -249,7 +251,7 @@ _FX NTSTATUS Conf_Expand_Template(
     varname2 = Mem_Alloc(args->pool, varname2_len);
     if (! varname2)
         return STATUS_INSUFFICIENT_RESOURCES;
-    swprintf(varname2, L"%s.%s", varname, varvalue);
+    RtlStringCbPrintfW(varname2, varname2_len, L"%s.%s", varname, varvalue);
 
     Conf_AdjustUseCount(TRUE);
 
@@ -295,6 +297,12 @@ _FX WCHAR *Conf_Expand_Helper(
         L"\\REGISTRY\\MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion";
     static const WCHAR *_ProgramFiles = L"ProgramFiles";
     static const WCHAR *_ProgramFilesDir = L"ProgramFilesDir";
+    static const WCHAR *_ProgramFiles32 = L"ProgramFiles(x86)";
+    static const WCHAR *_ProgramFilesDir32 = L"ProgramFilesDir (x86)";
+    static const WCHAR *_CommonProgramFiles = L"CommonProgramFiles";
+    static const WCHAR *_CommonProgramFilesDir = L"CommonFilesDir";
+    static const WCHAR *_CommonProgramFiles32 = L"CommonProgramFiles(x86)";
+    static const WCHAR *_CommonProgramFilesDir32 = L"CommonFilesDir (x86)";
     static const WCHAR *_SystemRoot = L"SystemRoot";
     static const WCHAR *_ProfileList = L"ProfileList";
     static const WCHAR *_homedrive = L"homedrive";
@@ -409,6 +417,10 @@ _FX WCHAR *Conf_Expand_Helper(
 
         wcscpy(varvalue, args->sandbox);
 
+    } else if (_wcsicmp(varname, L"SbieHome") == 0) {
+
+        wcscpy(varvalue, Driver_HomePathNt);
+
     } else if (_wcsicmp(varname, L"sid") == 0) {
 
         wcscpy(varvalue, args->sid);
@@ -426,6 +438,21 @@ _FX WCHAR *Conf_Expand_Helper(
 
         status = Conf_Expand_RegValue(args,
             RTL_REGISTRY_ABSOLUTE, _Windows, _ProgramFilesDir, varvalue);
+
+    } else if (_wcsicmp(varname, _ProgramFiles32) == 0) {
+
+        status = Conf_Expand_RegValue(args,
+            RTL_REGISTRY_ABSOLUTE, _Windows, _ProgramFilesDir32, varvalue);
+
+    } else if (_wcsicmp(varname, _CommonProgramFiles) == 0) {
+
+        status = Conf_Expand_RegValue(args,
+            RTL_REGISTRY_ABSOLUTE, _Windows, _CommonProgramFilesDir, varvalue);
+
+    } else if (_wcsicmp(varname, _CommonProgramFiles32) == 0) {
+
+        status = Conf_Expand_RegValue(args,
+            RTL_REGISTRY_ABSOLUTE, _Windows, _CommonProgramFilesDir32, varvalue);
 
     } else if (_wcsicmp(varname, _SystemRoot) == 0) {
 
@@ -518,6 +545,10 @@ _FX WCHAR *Conf_Expand_Helper(
                     L"AllUsersProfile", varvalue + PrefixLen);
             }
         }
+
+    } else if (_wcsicmp(varname, L"PUBLIC") == 0) {
+
+        wcscpy(varvalue, L"%SystemDrive%\\Users\\Public");
 
     //
     // environment variables from HKCU\Volatile Environment

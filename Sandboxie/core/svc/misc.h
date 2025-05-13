@@ -21,11 +21,13 @@
 #include "msgs/msgs.h"
 
 void LogEvent(ULONG msgid, ULONG level, ULONG detail);
+void LogMessage_Event(ULONG code, wchar_t* data, ULONG pid);
 void AbortServer(void);
 bool RestrictToken(void);
-bool CheckDropRights(const WCHAR *BoxName);
+bool CheckDropRights(const WCHAR *BoxName, const WCHAR *ExeName);
 
-SECURITY_ATTRIBUTES *GetSecurityAttributes(ACCESS_MASK EveryoneAccess);
+bool IsProcessWoW64(HANDLE pid);
+bool IsHostPath(HANDLE idProcess, WCHAR* dos_path);
 
 extern HMODULE _Ntdll;
 extern HMODULE _Kernel32;

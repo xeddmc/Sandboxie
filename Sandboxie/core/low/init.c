@@ -1,6 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
- * Copyright 2020 David Xanatos, xanasoft.com
+ * Copyright 2020-2024 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -29,7 +29,7 @@ typedef long NTSTATUS;
 #include "common/defines.h"
 #include "core/drv/api_defs.h"
 #include "lowdata.h"
-
+#include "common/hook_util.c"
 
 //---------------------------------------------------------------------------
 // Defines
@@ -45,15 +45,20 @@ typedef long NTSTATUS;
 
 #ifdef _WIN64
 // Pointer to 64-bit ProcessHeap is at offset 0x0030 of 64-bit PEB
+#ifdef _M_ARM64
+#define GET_ADDR_OF_PEB (*((ULONG_PTR*)(__getReg(18) + 0x60)))
+#else
 #define GET_ADDR_OF_PEB __readgsqword(0x60)
-#define GET_ADDR_OF_PROCESS_HEAP ((ULONG_PTR *)(GET_ADDR_OF_PEB + 0x30))
-
+#endif
+//#define GET_ADDR_OF_PROCESS_HEAP ((ULONG_PTR *)(GET_ADDR_OF_PEB + 0x30))
+#define GET_ADDR_OF_PROCESS_BASE (*(ULONG_PTR *)(GET_ADDR_OF_PEB + 0x10))
 
 #else ! _WIN64
 
 // Pointer to 32-bit ProcessHeap is at offset 0x0018 of 32-bit PEB
 #define GET_ADDR_OF_PEB __readfsdword(0x30)
-#define GET_ADDR_OF_PROCESS_HEAP ((ULONG_PTR *)(GET_ADDR_OF_PEB + 0x18))
+//#define GET_ADDR_OF_PROCESS_HEAP ((ULONG_PTR *)(GET_ADDR_OF_PEB + 0x18))
+#define GET_ADDR_OF_PROCESS_BASE (*(ULONG_PTR *)(GET_ADDR_OF_PEB + 0x08))
 
 #endif _WIN64
 
@@ -64,21 +69,32 @@ typedef long NTSTATUS;
 // Functions
 //---------------------------------------------------------------------------
 
-#ifdef _WIN64
-ULONG_PTR EntrypointC(SBIELOW_DATA *data, void *ActivationContext, void *SystemService, void * ActivationContext64);
-extern void InitInject(SBIELOW_DATA *data, void *,void *);
+#ifdef _M_ARM64
+
+extern void* SystemServiceARM64;
+extern void* NtDeviceIoControlFileEC;
+extern ULONG DeviceIoControlSvc;
+extern UINT_PTR EcExitThunkPtr;
+
+extern void* DetourCodeARM64;
+
+extern SBIELOW_DATA SbieLowData;
+
+ULONG_PTR EntrypointC();
 #else
-ULONG_PTR EntrypointC(SBIELOW_DATA *data, void *ActivationContext, void *SystemService);
-extern void InitInject(SBIELOW_DATA *data, void *);
+ULONG_PTR EntrypointC(SBIELOW_DATA *data, void *DetourCode, void *SystemService);
 #endif
+
+extern void InitInject(SBIELOW_DATA *data, void *DetourCode);
+
 static void InitSyscalls(SBIELOW_DATA *data, void *);
 
-static void InitConsole(SBIELOW_DATA *data);
+#ifdef _M_ARM64
+static void DisableCHPE(SBIELOW_DATA *data);
+#endif
 
+static void InitConsoleWOW64(SBIELOW_DATA *data);
 
-
-NTSTATUS SystemServiceC(
-    SBIELOW_DATA *data, ULONG syscall_index, ULONG_PTR *syscall_args);
 
 
 //---------------------------------------------------------------------------
@@ -106,44 +122,38 @@ _FX NTSTATUS SbieApi_Ioctl(SBIELOW_DATA *data, void *parms)
 //---------------------------------------------------------------------------
 
 
-#ifdef _WIN64
-
-
-_FX ULONG64 SbieApi_QueryProcessInfo(SBIELOW_DATA *data, ULONG info_type)
-{
-    NTSTATUS status;
-    __declspec(align(8)) ULONG64 ResultValue;
-    __declspec(align(8)) ULONG64 parms[API_NUM_ARGS];
-    API_QUERY_PROCESS_INFO_ARGS *args = (API_QUERY_PROCESS_INFO_ARGS *)parms;
-
-    memzero(parms, sizeof(parms));
-    args->func_code             = API_QUERY_PROCESS_INFO;
-
-    args->process_id.val64      = 0;
-    args->info_type.val64       = (ULONG64)(ULONG_PTR)info_type;
-    args->info_data.val64       = (ULONG64)(ULONG_PTR)&ResultValue;
-
-    status = SbieApi_Ioctl(data, parms);
-    if (! NT_SUCCESS(status))
-        ResultValue = 0;
-
-    return ResultValue;
-}
-
-
-#endif _WIN64
+//#ifdef _WIN64
+//_FX ULONG64 SbieApi_QueryProcessInfo(SBIELOW_DATA *data, ULONG info_type)
+//{
+//    NTSTATUS status;
+//    __declspec(align(8)) ULONG64 ResultValue;
+//    __declspec(align(8)) ULONG64 parms[API_NUM_ARGS];
+//    API_QUERY_PROCESS_INFO_ARGS *args = (API_QUERY_PROCESS_INFO_ARGS *)parms;
+//
+//    memzero(parms, sizeof(parms));
+//    args->func_code             = API_QUERY_PROCESS_INFO;
+//
+//    args->process_id.val64      = 0;
+//    args->info_type.val64       = (ULONG64)(ULONG_PTR)info_type;
+//    args->info_data.val64       = (ULONG64)(ULONG_PTR)&ResultValue;
+//
+//    status = SbieApi_Ioctl(data, parms);
+//    if (! NT_SUCCESS(status))
+//        ResultValue = 0;
+//
+//    return ResultValue;
+//}
+//#endif _WIN64
 
 
 //---------------------------------------------------------------------------
-// SbieApi_DebugPrint
+// SbieApi_LogMsg
 //---------------------------------------------------------------------------
 
 
-#if 0
-_FX NTSTATUS SbieApi_DebugPrint(SBIELOW_DATA *data, const WCHAR *text)
+_FX NTSTATUS SbieApi_LogMsg(ULONG64 pNtDeviceIoControlFile, ULONG64 api_device_handle, ULONG code, const WCHAR *text)
 {
-#ifdef _WIN64
-    NTSTATUS status;
+    NTSTATUS status = 0;
     __declspec(align(8)) UNICODE_STRING64 msgtext;
     __declspec(align(8)) ULONG64 parms[API_NUM_ARGS];
     API_LOG_MESSAGE_ARGS *args = (API_LOG_MESSAGE_ARGS *)parms;
@@ -159,15 +169,44 @@ _FX NTSTATUS SbieApi_DebugPrint(SBIELOW_DATA *data, const WCHAR *text)
     memzero(parms, sizeof(parms));
     args->func_code = API_LOG_MESSAGE;
     args->session_id.val = -1;
-    args->msgid.val = 2101;
+    args->msgid.val = code;
     args->msgtext.val = &msgtext;
+    //status = SbieApi_Ioctl(data, parms);
 
-    return SbieApi_Ioctl(data, parms);
-#else ! _WIN64
-    return 0;
+    IO_STATUS_BLOCK MyIoStatusBlock;
+#ifdef _WIN64
+    ULONG MyIoStatusBlock32[2];
+    *(ULONG_PTR *)&MyIoStatusBlock = (ULONG_PTR)MyIoStatusBlock32;
 #endif _WIN64
+    return ((P_NtDeviceIoControlFile)pNtDeviceIoControlFile)(
+        (HANDLE)api_device_handle, NULL, NULL, NULL, &MyIoStatusBlock,
+        API_SBIEDRV_CTLCODE, parms, sizeof(ULONG64) * 8, NULL, 0);
+
+    return status;
 }
-#endif
+
+
+//---------------------------------------------------------------------------
+// SbieApi_DebugError
+//---------------------------------------------------------------------------
+
+
+_FX NTSTATUS SbieApi_DebugError(SBIELOW_DATA* data, ULONG error)
+{
+    // Note: A normal string like L"text" would not result in position independent code !!!
+    // hence we create a string array and fill it byte by byte
+
+    //wchar_t text[] = { 'L','o','w','L','e','v','e','l',' ','E','r','r','o','r',':',' ','0','x',0,0,0,0,0,0,0,0,0,0};
+    wchar_t text[] = { '0','x',0,0,0,0,0,0,0,0,0,0};
+
+    // convert ulong to hex string and copy it into the message array
+    wchar_t* ptr = &text[2]; // 18 // point after L"...0x"
+    wchar_t table[] = { '0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F' };
+    for(int i=28; i >= 0; i-=4)
+        *ptr++ = table[(error >> i) & 0xF];
+
+    return SbieApi_LogMsg(data->NtDeviceIoControlFile, data->api_device_handle, 2180, text);
+}
 
 
 //---------------------------------------------------------------------------
@@ -193,55 +232,102 @@ _FX void WaitForDebugger(SBIELOW_DATA *data)
 
     __debugbreak();
 }
+
 #endif
 
 
 //---------------------------------------------------------------------------
-// InitSyscalls
+// WriteMemorySafe
 //---------------------------------------------------------------------------
 
-#ifdef _WIN64
 
-#define MAX_FUNC_SIZE 0x76
-
-//Note any change to this function requires the same modification to the same function in sbiedll: see dllhook.c (findChromeTarget)
-ULONGLONG * findChromeTarget(unsigned char* addr)
+_FX void WriteMemorySafe(SBIELOW_DATA* data, void *Address, SIZE_T Size, void *Data)
 {
-    int i = 0;
-    ULONGLONG target = 0;
-    ULONG_PTR * ChromeTarget = NULL;
-
-    for (i = 0; i < MAX_FUNC_SIZE; i++) {
-        if ((*(USHORT *)&addr[i] == 0x8b48)) {
-            //Look for mov rcx,[target 4 byte offset] or in some cases mov rax,[target 4 byte offset]
-            if ((addr[i + 2] == 0x0d || addr[i + 2] == 0x05)) {
-                LONG delta;
-                target = (ULONG_PTR)(addr + i + 7);
-                delta = *(LONG *)&addr[i + 3];
-                //  if (delta > 0 && delta < 0x100000 )  { //may need to check delta in a future version of chrome
-                target += delta;
-                ChromeTarget = *(ULONGLONG **)target;
-                // }
-                break;
-            }
-        }
-    }
-    return ChromeTarget;
-}
-#endif
-
-_FX void InitSyscalls(SBIELOW_DATA *data, void * SystemService)
-{
-    UCHAR *SystemServiceAsm, *ZwXxxPtr;
-    ULONG *SyscallPtr;
-    void *RegionBase;
-    SIZE_T RegionSize;
+    void *RegionBase = Address;
+    SIZE_T RegionSize = Size;
     ULONG OldProtect;
 
-    const ULONG OFFSET_ULONG_PTR =
-#ifdef _WIN64
+    SBIELOW_CALL(NtProtectVirtualMemory)(
+        NtCurrentProcess(), &RegionBase, &RegionSize,
+        PAGE_EXECUTE_READWRITE, &OldProtect);
+
+    // memcopy is not available, lets do our own
+    switch (Size) {
+    case 1: *(UCHAR*)Address = *(UCHAR*)Data;       break;
+    case 2: *(USHORT*)Address = *(USHORT*)Data;     break;
+    case 4: *(ULONG*)Address = *(ULONG*)Data;       break;
+    case 8: *(ULONG64*)Address = *(ULONG64*)Data;   break;
+    default:
+        for (SIZE_T i = 0; i < Size; i++)
+            ((UCHAR*)Address)[i] = ((UCHAR*)Data)[i];
+    }
+
+    SBIELOW_CALL(NtProtectVirtualMemory)(
+        NtCurrentProcess(), &RegionBase, &RegionSize,
+        OldProtect, &OldProtect);
+}
+
+
+//---------------------------------------------------------------------------
+// PrepSyscalls
+//---------------------------------------------------------------------------
+
+
+_FX void PrepSyscalls(SBIELOW_DATA *data, void * SystemService)
+{
+#ifdef _M_ARM64
+    if (data->flags.is_arm64ec) {
+
+        //
+        // Windows on arm64 uses a special syscall wrapper functions
+        // when running in arm64ec / x64 mode hence we need to 
+        // point our SystemService's NtDeviceIoControlFile to 
+        // a replica of the #NtDeviceIoControlFile EC variant
+        //
+
+        ULONG64 pNtDeviceIoControlFileEC = (ULONG64)&NtDeviceIoControlFileEC;
+        WriteMemorySafe(data, &data->NtDeviceIoControlFile, sizeof(ULONG64), &pNtDeviceIoControlFileEC);
+
+
+        // 
+        // On arm64 NtDeviceIoControlFile_code looks like this:
+        //  svc #0x07
+        //  ret
+        // 
+        // as DeviceIoControlSvc points to our svc instruction,
+        // we can just copy the ULONG strait out of the native function
+        //
+
+        WriteMemorySafe(data, &DeviceIoControlSvc, sizeof(ULONG), &data->NtDeviceIoControlFile_code[0]);
+
+
+        //
+        // get the EcExitThunkPtr which points to
+        // __os_arm64x_dispatch_call_no_redirect
+        // 
+        // syscall_ec_data[0] // total data length
+        // syscall_ec_data[1] // extra data offset
+        // 
+        // EcExitThunkPtr is at (extra_data_offset - 8)
+        // 
+
+        ULONG* syscall_ec_data = (ULONG*)data->syscall_data;
+
+        UINT_PTR pEcExitThunkPtr = *(UINT_PTR*)((UINT_PTR)syscall_ec_data + syscall_ec_data[1] - 8);
+        WriteMemorySafe(data, &EcExitThunkPtr, sizeof(UINT_PTR), &pEcExitThunkPtr);
+    }
+    else
+#endif
+    {
+        ULONG64 pNtDeviceIoControlFile = (ULONG64)&data->NtDeviceIoControlFile_code[0];
+        WriteMemorySafe(data, &data->NtDeviceIoControlFile, sizeof(ULONG64), &pNtDeviceIoControlFile);
+    }
+
+    const LONG OFFSET_ULONG_PTR =
+#ifdef _M_ARM64
+    -(LONG)sizeof(ULONG_PTR); // on arm64 windows we use a prepended data region
+#elif _WIN64
     2;  // on 64-bit Windows, "mov rax, 0" instruction is two bytes
-    ULONGLONG *chrome64Target = NULL;
 #else
     1;  // on 32-bit Windows, "mov edx, 0" instruction is one byte
 #endif
@@ -251,20 +337,32 @@ _FX void InitSyscalls(SBIELOW_DATA *data, void * SystemService)
     // to include the data area pointer
     //
 
+    WriteMemorySafe(data, ((UCHAR *)SystemService) + OFFSET_ULONG_PTR, sizeof(ULONG_PTR), &data);
+
+    //
+    // store the SystemService address in pSystemService
+    //
+
+    ULONG64 SystemServicePtr = (ULONG64)SystemService;
+    WriteMemorySafe(data, &data->pSystemService, sizeof(ULONG64), &SystemServicePtr);
+}
+
+
+//---------------------------------------------------------------------------
+// InitSyscalls
+//---------------------------------------------------------------------------
+
+
+_FX void InitSyscalls(SBIELOW_DATA *data, void * SystemService)
+{
+    UCHAR *SystemServiceAsm, *ZwXxxPtr;
+    ULONG *SyscallPtr;
+    ULONG SyscallNum;
+    void *RegionBase;
+    SIZE_T RegionSize;
+    ULONG OldProtect;
 
     SystemServiceAsm = (UCHAR *)SystemService;
-    RegionBase = (void *)(SystemServiceAsm + OFFSET_ULONG_PTR);
-    RegionSize = sizeof(ULONG_PTR);
-
-    SBIELOW_CALL(NtProtectVirtualMemory)(
-        NtCurrentProcess(), &RegionBase, &RegionSize,
-        PAGE_EXECUTE_READWRITE, &OldProtect);
-
-    *(ULONG_PTR *)(SystemServiceAsm + OFFSET_ULONG_PTR) = (ULONG_PTR)data;
-
-    SBIELOW_CALL(NtProtectVirtualMemory)(
-        NtCurrentProcess(), &RegionBase, &RegionSize,
-        OldProtect, &OldProtect);
 
     //
     // our syscall data area describes the ZwXxx functions in ntdll,
@@ -273,9 +371,9 @@ _FX void InitSyscalls(SBIELOW_DATA *data, void * SystemService)
     //
 
     SyscallPtr = (ULONG *)(data->syscall_data
-                         + sizeof(ULONG)         // size of buffer
-                         + sizeof(ULONG)         // offset to extra data
-                         + (32 * 4));            // saved code from ntdll
+                         + sizeof(ULONG)                                    // size of buffer
+                         + sizeof(ULONG)                                    // offset to extra data
+                         + (NATIVE_FUNCTION_SIZE * NATIVE_FUNCTION_COUNT)); // saved code from ntdll
 
     while (SyscallPtr[0] || SyscallPtr[1]) {
 
@@ -292,55 +390,28 @@ _FX void InitSyscalls(SBIELOW_DATA *data, void * SystemService)
         // saved by chrome, rather than the chrome hook itself (32-bit only)
         //
 
-#ifndef _WIN64 //if not _WIN64
-
-        if (ZwXxxPtr[0] == 0xB8 &&                  // mov eax,?
-            ZwXxxPtr[5] == 0xBA &&                  // mov edx,?
-            *(USHORT *)&ZwXxxPtr[10] == 0xE2FF)		// jmp edx
-        {
-            ULONG i = 0;
-
-            ULONG *longs = *(ULONG **)&ZwXxxPtr[6];
-            for (i = 0; i < 20; i++, longs++)
-            {
-                if (longs[0] == 0x5208EC83 && longs[1] == 0x0C24548B &&
-                    longs[2] == 0x08245489 && longs[3] == 0x0C2444C7 &&
-                    longs[5] == 0x042444C7)
-                {
-                    ZwXxxPtr = (UCHAR *)longs[4];
-                    break;
-                }
+        void* ChromeFunc = Hook_CheckChromeHook(ZwXxxPtr, (void*)GET_ADDR_OF_PROCESS_BASE);
+        if (ChromeFunc != NULL) {
+            if (ChromeFunc != (void*)-1)
+                ZwXxxPtr = ChromeFunc;
+            else {
+                if(data->flags.hook_dbg)
+                    SbieApi_DebugError(data, 0x60 | (SyscallPtr[0] << 16));
+                //SyscallPtr += 2;
+                //continue;
             }
         }
-#else // _WIN64
-        if (ZwXxxPtr[0] == 0x50 &&	//push rax
-            ZwXxxPtr[1] == 0x48 &&	//mov rax,?
-            ZwXxxPtr[2] == 0xb8) {
-            ULONGLONG *longlongs = *(ULONGLONG **)&ZwXxxPtr[3];
-            chrome64Target = findChromeTarget((unsigned char *)longlongs);
-        }
-        // Chrome 49+ 64bit hook
-        // mov rax, <target> 
-        // jmp rax 
-        else if (ZwXxxPtr[0] == 0x48 && //mov rax,<target>
-            ZwXxxPtr[1] == 0xb8 &&
-            *(USHORT *)&ZwXxxPtr[10] == 0xe0ff)/* jmp rax */ {
-            ULONGLONG *longlongs = *(ULONGLONG **)&ZwXxxPtr[2];
-            chrome64Target = findChromeTarget((unsigned char *)longlongs);
-
-        }
-#endif 
 
         //
         // make the syscall address writable
         //
+
         RegionBase = ZwXxxPtr;
 
-#ifdef _WIN64
-        RegionSize = 12;
-        if (!chrome64Target) {
-            chrome64Target = (ULONG_PTR*)ZwXxxPtr;
-        }
+#ifdef _M_ARM64
+        RegionSize = 16;
+#elif _WIN64
+        RegionSize = data->Sbie64bitJumpTable ? 13 : 14; // 16;
 #else ! _WIN64
         RegionSize = 10;
 #endif _WIN64
@@ -354,68 +425,121 @@ _FX void InitSyscalls(SBIELOW_DATA *data, void * SystemService)
         // and then restore the original page protection
         //
 
-#ifdef _WIN64
-        if (chrome64Target) {
-            RegionSize = 16;
-            ZwXxxPtr = (UCHAR *)chrome64Target;
-            RegionBase = ZwXxxPtr;
+        SBIELOW_CALL(NtProtectVirtualMemory)(
+            NtCurrentProcess(), &RegionBase, &RegionSize,
+            PAGE_EXECUTE_READWRITE, &OldProtect);
 
-            SBIELOW_CALL(NtProtectVirtualMemory)(
-                NtCurrentProcess(), &RegionBase, &RegionSize,
-                PAGE_EXECUTE_READWRITE, &OldProtect);
+        SyscallNum = SyscallPtr[0];
 
-            if (data->Sbie64bitJumpTable) {
-                unsigned char * jTableTarget = (unsigned char *)&data->Sbie64bitJumpTable->entry[SyscallPtr[0] & 0x3ff];
-                // write new patch for jump table
-                // The jTable is now injected in the same memory module with lowlevel; no need for a 64 bit long jump
-                jTableTarget[0] = 0x49;
-                jTableTarget[1] = 0xc7;
-                jTableTarget[2] = 0xc2;
-                *(ULONG *)&jTableTarget[3] = SyscallPtr[0];
-                if (data->is_win10) {
-                    jTableTarget[7] = 0x48;
-                    jTableTarget[8] = 0xe9;
-                    *(ULONG *)&jTableTarget[9] = (ULONG)(ULONG_PTR)(SystemServiceAsm - (jTableTarget + 13));
-                }
-                else {
+#ifdef _M_ARM64
 
-                    jTableTarget[7] = 0xe9;
-                    *(ULONG *)&jTableTarget[8] = (ULONG)(ULONG_PTR)(SystemServiceAsm - (jTableTarget + 12));
+        //
+        // On arm64 syscall wrapper functions looks like this:
+        //  svc #0xXXX
+        //  ret
+        //  DCD 0
+        //  DCD 0
+        // so we have only 16 bytes to use per detour
+        //
 
-                }
-                //  *(ULONGLONG *) &jTableTarget[-8] = 0x9090909090909090; /*patch location for sboxdll hook. jtable elements need to be at 0x18 in size for this*/
-                // jump table: using push rcx instead of push rax to differentiate from the chrome sandbox hook
-                // the sboxdll.dll needs this distinction to handle the chrome type hook properly and to not search
-                // for the chrome target in a sbox 64 bit jtable hook
+        if (data->Sbie64bitJumpTable) {
 
-                ZwXxxPtr[0] = 0x51;     //push rcx
-                // mov rax,<8 byte address to jTableEntry>
-                ZwXxxPtr[1] = 0x48;
-                ZwXxxPtr[2] = 0xb8;
-                *(ULONGLONG *)&ZwXxxPtr[3] = (ULONGLONG)jTableTarget;
-                *(ULONG *)&ZwXxxPtr[11] = 0x24048948;       // mov [rsp],rax
-                ZwXxxPtr[15] = 0xc3;    // ret
-            }
+            unsigned char * jTableTarget = (unsigned char *)&data->Sbie64bitJumpTable->entry[SyscallNum & 0x3ff]; // jump table is sized for up to 1024 entries
 
-            chrome64Target = NULL;
+            ULONG* aCode = (ULONG*)jTableTarget;
+
+            MOV mov;
+            mov.OP   = 0xD2800011;  // mov x17, #0xFFFF
+            mov.imm16 = (USHORT)SyscallNum; 
+            *aCode++ = mov.OP;
+	        *aCode++ = 0x58000048;	// ldr x8, 8
+	        *aCode++ = 0xD61F0100;	// br x8
+            *(ULONG_PTR*)aCode = (ULONG_PTR)SystemServiceAsm;   // DCQ &SystemServiceAsm
+            // 20
+
+            aCode = (ULONG*)ZwXxxPtr;
+	        *aCode++ = 0x58000048;	// ldr x8, 8
+	        *aCode++ = 0xD61F0100;	// br x8
+            *(ULONG_PTR*)aCode = (ULONG_PTR)jTableTarget;       // DCQ &jTableTarget
+            // 16
         }
-        else
-        {
-            RegionBase = ZwXxxPtr;
+        else {
 
-            SBIELOW_CALL(NtProtectVirtualMemory)(
-                NtCurrentProcess(), &RegionBase, &RegionSize,
-                PAGE_EXECUTE_READWRITE, &OldProtect);
+            ULONG* aCode = (ULONG*)ZwXxxPtr;
 
-            ZwXxxPtr[0] = 0x49;                 // mov r10, SyscallNumber
+            MOV mov;
+            mov.OP   = 0xD2800011;  // mov x17, #0xFFFF
+            mov.imm16 = (USHORT)SyscallNum; 
+            *aCode++ = mov.OP;
+	        *aCode++ = 0x18000048;	// ldr w8, 8
+	        *aCode++ = 0xD61F0100;	// br x8
+            *(ULONG*)aCode = (ULONG)(ULONG_PTR)SystemServiceAsm;// DCD &SystemServiceAsm
+            // 16
+        }
+
+        SBIELOW_CALL(NtFlushInstructionCache)(
+            NtCurrentProcess(), RegionBase, (ULONG)RegionSize);
+
+#elif _WIN64
+
+        if (data->Sbie64bitJumpTable) {
+            // bytes overwritten /*16*/ 13;
+
+            unsigned char * jTableTarget = (unsigned char *)&data->Sbie64bitJumpTable->entry[SyscallNum & 0x3ff]; // jump table is sized for up to 1024 entries
+            // write new patch for jump table
+            // The jTable is now injected in the same memory module with lowlevel; no need for a 64 bit long jump
+            // mov r10, <4 byte SyscallNum>
+            jTableTarget[0] = 0x49;
+            jTableTarget[1] = 0xc7;
+            jTableTarget[2] = 0xc2;
+            *(ULONG *)&jTableTarget[3] = SyscallNum;
+            // jmp <4 byte SystemServiceAsm>
+            if (data->flags.is_win10) {
+                jTableTarget[7] = 0x48;
+                jTableTarget[8] = 0xe9;
+                *(ULONG *)&jTableTarget[9] = (ULONG)(ULONG_PTR)(SystemServiceAsm - (jTableTarget + 13));
+            }
+            else {
+
+                jTableTarget[7] = 0xe9;
+                *(ULONG *)&jTableTarget[8] = (ULONG)(ULONG_PTR)(SystemServiceAsm - (jTableTarget + 12));
+
+            }
+            //  *(ULONGLONG *) &jTableTarget[-8] = 0x9090909090909090; /*patch location for sboxdll hook. jtable elements need to be at 0x18 in size for this*/
+            // jump table: using push rcx instead of push rax to differentiate from the chrome sandbox hook
+            // the sboxdll.dll needs this distinction to handle the chrome type hook properly and to not search
+            // for the chrome target in a sbox 64 bit jtable hook
+
+            // using ret is not compatible with CET - Hardware-enforced Stack Protection
+            /*ZwXxxPtr[0] = 0x51;     //push rcx
+            // mov rax,<8 byte address to jTableEntry>
+            ZwXxxPtr[1] = 0x48;
+            ZwXxxPtr[2] = 0xb8;
+            *(ULONGLONG *)&ZwXxxPtr[3] = (ULONGLONG)jTableTarget;
+            *(ULONG *)&ZwXxxPtr[11] = 0x24048948;       // mov [rsp],rax
+            ZwXxxPtr[15] = 0xc3;    // ret*/
+
+            // mov rax,<8 byte address to jTableEntry>
+            ZwXxxPtr[0] = 0x90; // start with a nop so that it does not look lile a chrome hook
+            ZwXxxPtr[1] = 0x48;
+            ZwXxxPtr[2] = 0xb8;
+            *(ULONGLONG*)&ZwXxxPtr[3] = (ULONGLONG)jTableTarget;
+            // jmp rax
+            ZwXxxPtr[11] = 0xFF;
+            ZwXxxPtr[12] = 0xE0;
+        }
+        else {
+            // bytes overwritten 14;
+
+            ZwXxxPtr[0] = 0x49;                     // mov r10, SyscallNumber
             ZwXxxPtr[1] = 0xC7;
             ZwXxxPtr[2] = 0xC2;
-            *(ULONG *)&ZwXxxPtr[3] = SyscallPtr[0];
-            if (!data->long_diff) {
+            *(ULONG *)&ZwXxxPtr[3] = SyscallNum;
+            if (!data->flags.long_diff) {
 
-                if (data->is_win10) {
+                if (data->flags.is_win10) {
                     ZwXxxPtr[7] = 0x48;             // jmp SystemServiceAsm
-                    ZwXxxPtr[8] = 0xE9;             // jmp SystemServiceAsm
+                    ZwXxxPtr[8] = 0xE9;
                     *(ULONG *)&ZwXxxPtr[9] = (ULONG)(ULONG_PTR)(SystemServiceAsm - (ZwXxxPtr + 13));
                 }
                 else {
@@ -425,19 +549,16 @@ _FX void InitSyscalls(SBIELOW_DATA *data, void * SystemService)
             }
             else {
 
-                ZwXxxPtr[7] = 0xB8;             // mov eax, SystemServiceAsm
+                ZwXxxPtr[7] = 0xB8;                 // mov eax, SystemServiceAsm
                 *(ULONG *)&ZwXxxPtr[8] = (ULONG)(ULONG_PTR)SystemServiceAsm;
                 *(USHORT *)&ZwXxxPtr[12] = 0xE0FF;  // jmp rax
             }
         }
 #else ! _WIN64
+        // bytes overwritten 10;
 
-        SBIELOW_CALL(NtProtectVirtualMemory)(
-            NtCurrentProcess(), &RegionBase, &RegionSize,
-            PAGE_EXECUTE_READWRITE, &OldProtect);
-
-        ZwXxxPtr[0] = 0xB8;                 // mov eax, SyscallNumber
-        *(ULONG *)&ZwXxxPtr[1] = SyscallPtr[0];
+        ZwXxxPtr[0] = 0xB8;                 // mov eax, SyscallNumber, with param count in the highest byte
+        *(ULONG *)&ZwXxxPtr[1] = SyscallNum;
         ZwXxxPtr[5] = 0xE9;                 // jmp SystemServiceAsm
         *(ULONG *)&ZwXxxPtr[6] =
             (ULONG)(ULONG_PTR)(SystemServiceAsm - (ZwXxxPtr + 10));
@@ -453,21 +574,145 @@ _FX void InitSyscalls(SBIELOW_DATA *data, void * SystemService)
 }
 
 
+#ifdef _M_ARM64
+
 //---------------------------------------------------------------------------
-// InitConsole
+// MyImageOptionsEx
 //---------------------------------------------------------------------------
+
+
+_FX NTSTATUS MyImageOptionsEx(PUNICODE_STRING SubKey, PCWSTR ValueName, 
+    ULONG Type, PVOID Buffer, ULONG BufferSize, PULONG ReturnedLength, BOOLEAN Wow64, SBIELOW_DATA* data)
+{
+    // Note: A normal string like L"LoadCHPEBinaries" would not result in position independent code !!!
+    wchar_t LoadCHPEBinaries[] = { 'L','o','a','d','C','H','P','E','B','i','n','a','r','i','e','s',0 }; 
+    PCWSTR ptr = ValueName;
+    for (PCWSTR tmp = LoadCHPEBinaries; *ptr && *tmp && *ptr == *tmp; ptr++, tmp++);
+	if (*ptr == L'\0'){ //if (_wcsicmp(ValueName, L"LoadCHPEBinaries") == 0)
+		*(ULONG*)Buffer = 0;
+		return 0; // STATUS_SUCCESS
+	}
+    //return 0xC0000034; // STATUS_OBJECT_NAME_NOT_FOUND
+
+    typedef (*P_ImageOptionsEx)(PUNICODE_STRING, PCWSTR, ULONG, PVOID, ULONG, PULONG, BOOLEAN);
+    return ((P_ImageOptionsEx)data->RtlImageOptionsEx_tramp)(SubKey, ValueName, Type, Buffer, BufferSize, ReturnedLength, Wow64);
+}
+
+
+//---------------------------------------------------------------------------
+// DisableCHPE
+//---------------------------------------------------------------------------
+
+
+_FX void DisableCHPE(SBIELOW_DATA* data)
+{
+    SYSCALL_DATA* syscall_data;
+    SBIELOW_EXTRA_DATA *extra;
+    ULONG uError = 0;
+
+    //
+    // Sandboxie on ARM64 requires x86 applications NOT to use the CHPE (Compiled Hybrid Portable Executable)
+    // binaries as when hooking a hybrid binary it is required to hook the internal native functions.
+    // 
+    // This can be done quite easily for ARM64EC (x64 on ARM64) by compiling SbieDll.dll as ARM64EC
+    // and resolving the FFS sequence targets, which then can be hooked with the native SbieDll.dll functions.
+    // 
+    // For CHPE MSFT how ever does not provide any public build tool chain, hence it would be required
+    // to hand craft native detour targets and then properly transition to x86 code which is not documented.
+    // When the use of hybrid binaries for x86 is disabled all loaded DLL's, except the native ntdll.dll
+    // are pure x86 binaries and can be easily hooked with SbieDll.dll's x86 functions.
+    // 
+    // To prevent the kernel from loading the CHPE version of ntdll.dll we can pass PsAttributeChpe = 0
+    // in the AttributeList of NtCreateUserProcess, however then the created process will still try to 
+    // load the rest of the system dll's from the SyChpe32 directory and fail to initialize.
+    // There for we have to hook LdrQueryImageFileExecutionOptionsEx and simulate the LoadCHPEBinaries = 0
+    // in its "Image File Execution Options" key this way the process will continue with loading
+    // the regular x86 binaries from the SysWOW64 directory and initialize properly.
+    // 
+    // Note: This hook affects only the native function and is only installed on x86 processes
+    //          hence we install a similar hook in SbieDll.dll!Proc_Init which causes 
+    //          CreateProcessInternalW to set PsAttributeChpe = 0 when creating new processes.
+    //
+
+    syscall_data = (SYSCALL_DATA *)data->syscall_data;
+
+    extra = (SBIELOW_EXTRA_DATA *) (data->syscall_data + syscall_data->extra_data_offset);
+
+    void* RtlImageOptionsEx = FindDllExport((void*)data->ntdll_base, 
+                                    (UCHAR*)extra + extra->RtlImageOptionsEx_offset, &uError);
+    if (!RtlImageOptionsEx)
+        return;
+
+    void *RegionBase;
+    SIZE_T RegionSize;
+    ULONG OldProtect;
+    ULONG* aCode;
+
+    //
+    // backup target & create simple trampoline
+    //
+
+    RegionBase = (void*)data->RtlImageOptionsEx_tramp;
+    RegionSize = sizeof(data->RtlImageOptionsEx_tramp);
+    SBIELOW_CALL(NtProtectVirtualMemory)(
+        NtCurrentProcess(), &RegionBase, &RegionSize,
+        PAGE_EXECUTE_READWRITE, &OldProtect);
+
+    ULONG DetourSize = 28;
+    memcpy(data->RtlImageOptionsEx_tramp, RtlImageOptionsEx, DetourSize); 
+
+    aCode = (ULONG*)(data->RtlImageOptionsEx_tramp + DetourSize); // 28
+	aCode[0] = 0x58000048;	// ldr x8, 8 - Rest of RtlImageOptionsEx
+	aCode[1] = 0xD61F0100;	// br x8
+	*(DWORD64*)&aCode[2] = (DWORD64)RtlImageOptionsEx + DetourSize; 
+    // 44
+
+    SBIELOW_CALL(NtProtectVirtualMemory)(
+        NtCurrentProcess(), &RegionBase, &RegionSize,
+        OldProtect, &OldProtect);
+
+    SBIELOW_CALL(NtFlushInstructionCache)(
+        NtCurrentProcess(), RegionBase, (ULONG)RegionSize);
+
+    //
+    // make target writable & create detour
+    //
+
+    RegionBase = (void*)RtlImageOptionsEx;
+    RegionSize = DetourSize;
+    SBIELOW_CALL(NtProtectVirtualMemory)(
+        NtCurrentProcess(), &RegionBase, &RegionSize,
+        PAGE_EXECUTE_READWRITE, &OldProtect);
+
+	aCode = (ULONG*)RtlImageOptionsEx;
+    aCode[0] = 0x580000a7;	// ldr x7, 20 - data
+	aCode[1] = 0x58000048;	// ldr x8, 8 - MyImageOptionsEx
+	aCode[2] = 0xD61F0100;	// br x8
+	*(DWORD64*)&aCode[3] = (DWORD64)MyImageOptionsEx; 
+    *(DWORD64*)&aCode[5] = (DWORD64)data;
+    //28
+
+    SBIELOW_CALL(NtProtectVirtualMemory)(
+        NtCurrentProcess(), &RegionBase, &RegionSize,
+        OldProtect, &OldProtect);
+
+    SBIELOW_CALL(NtFlushInstructionCache)(
+        NtCurrentProcess(), RegionBase, (ULONG)RegionSize);
+}
+#endif
 
 
 #ifdef _WIN64
 
+//---------------------------------------------------------------------------
+// InitConsoleWOW64
+//---------------------------------------------------------------------------
 
-_FX void InitConsole(SBIELOW_DATA *data)
+
+_FX void InitConsoleWOW64(SBIELOW_DATA *data)
 {
     ULONG64 addr64;
     ULONG   addr32;
-
-    if (! data->is_wow64)
-        return;
 
     //
     // on Windows 7, Process_Low_InitConsole from core/drv/process_low.c
@@ -485,7 +730,7 @@ _FX void InitConsole(SBIELOW_DATA *data)
     //
 
     // get 64-bit PEB
-    addr64 = __readgsqword(0x60);
+    addr64 = GET_ADDR_OF_PEB;
     // get 64-bit RTL_USER_PROCESS_PARAMETERS
     addr64 = *(ULONG_PTR *)(addr64 + 0x20);
     // ConsoleHandle member is at offset 0x10
@@ -494,7 +739,12 @@ _FX void InitConsole(SBIELOW_DATA *data)
     if (*(ULONG64 *)addr64 == -1) {
 
         // get 32-bit TEB
+#ifdef _M_ARM64
+        addr32  = (ULONG)(__getReg(18));
+        addr32 = *(ULONG *)(ULONG_PTR)(addr32 + 0x00);
+#else
         addr32 = __readgsdword(0);
+#endif
         // get 32-bit PEB
         addr32 = *(ULONG *)(ULONG_PTR)(addr32 + 0x30);
         // get 32-bit RTL_USER_PROCESS_PARAMETERS
@@ -506,8 +756,6 @@ _FX void InitConsole(SBIELOW_DATA *data)
         *(ULONG *)(ULONG_PTR)addr32 = *(ULONG *)addr64;
     }
 }
-
-
 #endif _WIN64
 
 
@@ -516,12 +764,15 @@ _FX void InitConsole(SBIELOW_DATA *data)
 //---------------------------------------------------------------------------
 
 
-#ifdef _WIN64
-_FX ULONG_PTR EntrypointC(SBIELOW_DATA *data,void *ActivationContext, void *SystemService,void * ActivationContext64)
+#ifdef _M_ARM64
+ULONG_PTR EntrypointC() {
+    SBIELOW_DATA* data = &SbieLowData;
+    void* DetourCode = &DetourCodeARM64;
+    void* SystemService = &SystemServiceARM64;
 #else
-_FX ULONG_PTR EntrypointC(SBIELOW_DATA *data,void *ActivationContext, void *SystemService)
+ULONG_PTR EntrypointC(SBIELOW_DATA *data, void *DetourCode, void *SystemService) {
 #endif
-{
+
     //
     // use the ProcessHeap field in the PEB to synchronize multiple
     // threads running our low level initialization code:
@@ -533,50 +784,98 @@ _FX ULONG_PTR EntrypointC(SBIELOW_DATA *data,void *ActivationContext, void *Syst
     // LdrInitializeThunk which stores new value into ProcessHeap which
     // will not be -1, thus releasing any waiting threads
     //
-    volatile ULONG_PTR *ProcessHeap = GET_ADDR_OF_PROCESS_HEAP;
+    //volatile ULONG_PTR *ProcessHeap = GET_ADDR_OF_PROCESS_HEAP;
 
-    ULONG_PTR OldProcessHeap =
+    if(!data->Init_Done)
+    {
+        SYSCALL_DATA* syscall_data;
+        SBIELOW_EXTRA_DATA *extra;
+
+        //
+        // Starting with Windows 11 build 26040 ProcessHeap must be 0
+        // for the process initialisation to be successful, hence from
+        // now on we use Init_Lock in the SBIELOW_EXTRA_DATA to synchronize
+        // the execution of the init code, the first thread to arrive here
+        // will encounter the initial 0 value and be allowed to execute
+        // the value will be changed to -1 indicating initialization in
+        // progress. Subsequent threads will wait, until the first thread,
+        // once done changes the value to 1 indicating initialization completion.
+        // 
+        // Since SBIELOW_EXTRA_DATA is freed by Ldr_Inject_Entry hence we need
+        // to also use Init_Done in SBIELOW_DATA its initially 0 and
+        // once the initialization is completed will be set to 1, such
+        // that later created threads can skip the initialization code.
+        //
+
+        syscall_data = (SYSCALL_DATA*)data->syscall_data;
+      
+        extra = (SBIELOW_EXTRA_DATA *) (data->syscall_data + syscall_data->extra_data_offset);
+
+        volatile ULONG_PTR *Init_Lock = &extra->Init_Lock;
+
 #ifdef _WIN64
-        _InterlockedCompareExchange64(ProcessHeap, -1, 0);
-
+        ULONG_PTR OldInit_Lock = _InterlockedCompareExchange64(Init_Lock, -1, 0);
 #else ! _WIN64
-                    _InterlockedCompareExchange(ProcessHeap, -1, 0);
+        ULONG_PTR OldInit_Lock = _InterlockedCompareExchange(Init_Lock, -1, 0);
 #endif _WIN64
 
-    if (OldProcessHeap == 0) {
+        if (OldInit_Lock == 0) {
 
-        //
-        // the first thread arrives here
-        //
+            //
+            // the first thread arrives here
+            //
 
-        // WaitForDebugger(data);
+            // WaitForDebugger(data);
 
-		if(!data->bHostInject)
-			InitSyscalls(data, SystemService);
+            //wchar_t text[] = { 't','e','s','t',0 };
+            //SbieApi_LogMsg(data->NtDeviceIoControlFile, data->api_device_handle, 1122, text);
+
+            PrepSyscalls(data, SystemService);
+            if (!data->flags.bHostInject && !data->flags.bNoSysHooks)
+                InitSyscalls(data, SystemService);
+
+		    InitInject(data, DetourCode);
+
 #ifdef _WIN64
-		InitInject(data, ActivationContext, ActivationContext64);
-		if (!data->bHostInject)
-			InitConsole(data);
-#else
-		InitInject(data, ActivationContext);
+            if (data->flags.is_wow64) {
+
+#ifdef _M_ARM64
+                if(!data->flags.is_chpe32)
+		            DisableCHPE(data);
+#endif
+                if (!data->flags.bNoConsole)
+                    InitConsoleWOW64(data);
+            }
 #endif
 
-    } else if (OldProcessHeap == -1) {
+            // Set Init_Done 
+            UCHAR Init_Done = 1;
+            WriteMemorySafe(data, &data->Init_Done, sizeof(UCHAR), &Init_Done);
 
-        //
-        // any other threads arrive here and will wait for
-        // the first thread to finish initializing SbieLow
-        //
+            // Release waiting threads
+#ifdef _WIN64
+            _InterlockedExchange64(Init_Lock, 1);
+#else ! _WIN64
+            _InterlockedExchange(Init_Lock, 1);
+#endif _WIN64
 
-        LARGE_INTEGER delay;
-        delay.QuadPart = -SECONDS(3) / 100; // 0FFFFFFFFh 0FFFB6C20h
+        } else if (OldInit_Lock == -1) {
 
-        while (*ProcessHeap == -1) {
+            //
+            // any other threads arrive here and will wait for
+            // the first thread to finish initializing SbieLow
+            //
 
-            const P_NtDelayExecution NtDelayExecution =
-                (P_NtDelayExecution) &data->NtDelayExecution_code;
+            LARGE_INTEGER delay;
+            delay.QuadPart = -SECONDS(3) / 100; // 0FFFFFFFFh 0FFFB6C20h
 
-            NtDelayExecution(FALSE, &delay);
+            while (*Init_Lock == -1) {
+
+                const P_NtDelayExecution NtDelayExecution =
+                    (P_NtDelayExecution) &data->NtDelayExecution_code;
+
+                NtDelayExecution(FALSE, &delay);
+            }
         }
     }
 
@@ -588,4 +887,3 @@ _FX ULONG_PTR EntrypointC(SBIELOW_DATA *data,void *ActivationContext, void *Syst
 
     return (ULONG_PTR)&data->LdrInitializeThunk_tramp;
 }
-

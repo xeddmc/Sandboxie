@@ -27,13 +27,13 @@ typedef struct _LOG_BUFFER
 	SIZE_T buffer_size;
 	SIZE_T buffer_used;
 	CHAR* buffer_start_ptr;
-	CHAR buffer_data[0]; // [[SIZE 4][DATA n][SEQ 4][SITE 4]][...] // Note 2nd size tags allows to traverse the ring in booth directions
+	CHAR buffer_data[0]; // [[SIZE 4][DATA n][SEQ 4][SITE 4]][...] // Note 2nd size tags allows to traverse the ring in both directions
 } LOG_BUFFER;
 
 LOG_BUFFER* log_buffer_init(SIZE_T buffer_size);
 void log_buffer_free(LOG_BUFFER* ptr_buffer);
 
-CHAR* log_buffer_push_entry(LOG_BUFFER_SIZE_T size, LOG_BUFFER* ptr_buffer);
+CHAR* log_buffer_push_entry(LOG_BUFFER_SIZE_T size, LOG_BUFFER* ptr_buffer, BOOLEAN can_pop);
 void log_buffer_pop_entry(LOG_BUFFER* ptr_buffer);
 CHAR* log_buffer_byte_at(CHAR** data_ptr, LOG_BUFFER* ptr_buffer);
 BOOLEAN log_buffer_push_bytes(CHAR* data, SIZE_T size, CHAR** write_ptr, LOG_BUFFER* ptr_buffer);

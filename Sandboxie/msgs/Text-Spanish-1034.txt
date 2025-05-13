@@ -1,7 +1,7 @@
 #----------------------------------------------------------------------------
 # SbieDrv
 #
-# Initialization errors issued to to the System event Log
+# Initialization errors issued to the System event Log
 #----------------------------------------------------------------------------
 
 1101;evt;inf;01
@@ -3180,7 +3180,7 @@ Las siguientes exclusiones permiten a los navegadores web en ejecución en esta 
 .
 
 4323;txt;01
-Forzar a %2 a ejecutarse en esta sandbox (Sólo versión registrada)
+Forzar a %2 a ejecutarse en esta sandbox
 .
 
 4324;txt;02
@@ -3785,6 +3785,10 @@ instalación.
 Seleccione Sí para conservar los valores de configuración en el archivo Sandboxie.ini.
 
 Seleccione No para borrar el archivo Sandboxie.ini y perder sus valores de configuración.
+.
+
+8055;ins;01
+Hay disponible una actualización en línea de Templates.ini y/o las traducciones para esta versión de sandboxie, ¿quieres instalarla?
 .
 
 #----------------------------------------------------------------------------

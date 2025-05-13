@@ -65,9 +65,12 @@ ULONG Dll_GetNextProc(
 //---------------------------------------------------------------------------
 
 
+extern const WCHAR *Exe_NTOSKRNL;
 extern const WCHAR *Dll_NTDLL;
+extern const WCHAR *Dll_WIN32U;
+#ifdef XP_SUPPORT
 extern const WCHAR *Dll_USER;
-
+#endif
 
 //---------------------------------------------------------------------------
 

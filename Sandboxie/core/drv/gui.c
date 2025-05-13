@@ -27,6 +27,7 @@
 #include "log.h"
 #include "api.h"
 #include "util.h"
+#include "dyn_data.h"
 
 
 //---------------------------------------------------------------------------
@@ -52,9 +53,11 @@ static NTSTATUS Gui_Api_Clipboard(PROCESS *proc, ULONG64 *parms);
 //---------------------------------------------------------------------------
 
 
+#ifdef XP_SUPPORT
 #ifndef _WIN64
 #include "gui_xp.c"
 #endif _WIN64
+#endif
 
 
 //---------------------------------------------------------------------------
@@ -72,6 +75,7 @@ static const WCHAR *Gui_OpenClass_Name = L"OpenWinClass";
 
 _FX BOOLEAN Gui_Init(void)
 {
+#ifdef XP_SUPPORT
 #ifndef _WIN64
 
     if (Driver_OsVersion < DRIVER_WINDOWS_VISTA) {
@@ -93,6 +97,7 @@ _FX BOOLEAN Gui_Init(void)
     }
 
 #endif ! _WIN64
+#endif
 
     Api_SetFunction(API_INIT_GUI,       Gui_Api_Init);
     Api_SetFunction(API_GUI_CLIPBOARD,  Gui_Api_Clipboard);
@@ -110,6 +115,7 @@ _FX NTSTATUS Gui_Api_Init(PROCESS *proc, ULONG64 *parms)
 {
     NTSTATUS status = STATUS_SUCCESS;
 
+#ifdef XP_SUPPORT
 #ifndef _WIN64
 
     if (Driver_OsVersion < DRIVER_WINDOWS_VISTA) {
@@ -118,6 +124,7 @@ _FX NTSTATUS Gui_Api_Init(PROCESS *proc, ULONG64 *parms)
     }
 
 #endif ! _WIN64
+#endif
 
     if (NT_SUCCESS(status) && (! Process_ReadyToSandbox)) {
 
@@ -128,6 +135,7 @@ _FX NTSTATUS Gui_Api_Init(PROCESS *proc, ULONG64 *parms)
 }
 
 
+#ifdef XP_SUPPORT
 //---------------------------------------------------------------------------
 // Gui_Unload
 //---------------------------------------------------------------------------
@@ -144,6 +152,7 @@ _FX void Gui_Unload(void)
 
 #endif ! _WIN64
 }
+#endif
 
 
 //---------------------------------------------------------------------------
@@ -155,6 +164,7 @@ _FX BOOLEAN Gui_InitProcess(PROCESS *proc)
 {
     //static const WCHAR *_OpenClass = L"OpenWinClass";
     //static const WCHAR *_Asterisk  = L"*";
+#ifndef USE_TEMPLATE_PATHS
     static const WCHAR *openclasses[] = {
         L"Shell_TrayWnd",
         L"TrayNotifyWnd",
@@ -183,12 +193,18 @@ _FX BOOLEAN Gui_InitProcess(PROCESS *proc)
         L"MdiClass",                        // PowerPoint
         NULL
     };
+#endif
+
     ULONG i;
     BOOLEAN ok;
 
     ok = Process_GetPaths(
-            proc, &proc->open_win_classes, Gui_OpenClass_Name, FALSE);
+            proc, &proc->open_win_classes, proc->box->name, Gui_OpenClass_Name, FALSE);
 
+#ifdef USE_TEMPLATE_PATHS
+    if (ok) 
+        ok = Process_GetTemplatePaths(proc, &proc->open_win_classes, Gui_OpenClass_Name);
+#else
     if (ok) {
         for (i = 0; openclasses[i] && ok; ++i) {
             ok = Process_AddPath(proc, &proc->open_win_classes, NULL,
@@ -203,15 +219,19 @@ _FX BOOLEAN Gui_InitProcess(PROCESS *proc)
                     proc, &proc->open_win_classes, NULL,
                     TRUE, L"Sandbox:*:ConsoleWindowClass", FALSE);
             AddMSTaskSwWClass = TRUE;
-        } else if ((! proc->image_from_box) &&
+        } 
+#ifdef XP_SUPPORT
+        else if ((! proc->image_from_box) &&
                 (  _wcsicmp(proc->image_name, L"excel.exe")    == 0
                 || _wcsicmp(proc->image_name, L"powerpnt.exe") == 0))
             AddMSTaskSwWClass = TRUE;
+#endif
         if (ok && AddMSTaskSwWClass) {
             ok = Process_AddPath(proc, &proc->open_win_classes, NULL,
                                  TRUE, L"MSTaskSwWClass", FALSE);
         }
     }
+#endif
 
     /*if (ok) {
         BOOLEAN is_closed;
@@ -312,28 +332,8 @@ _FX GUI_CLIPBOARD *Gui_GetClipboard(void)
     // Clipboard offset can be found in win32k!FindClipFormat
     // In windows 10 find the offset in win32kfull!FindClipFormat
 
-    ULONG Clipboard_Offset = 0;
-
-#ifdef _WIN64
-    if (Driver_OsVersion <= DRIVER_WINDOWS_7) {
-        Clipboard_Offset = 0x58;
-    }
-    else if (Driver_OsBuild < 18980) {      // Covers Win 8 up through Win 10-18980
-        Clipboard_Offset = 0x60;
-    }
-    else
-        Clipboard_Offset = 0x80;
-
-#else ! _WIN64
-    if (Driver_OsVersion <= DRIVER_WINDOWS_7) {
-        Clipboard_Offset = 0x2c;
-    }
-    else if (Driver_OsBuild < 18980) {      // Covers Win 8 up through Win 10-18980
-        Clipboard_Offset = 0x30;
-    }
-    else
-        Clipboard_Offset = 0x40;
-#endif _WIN64
+    if (!Dyndata_Active)
+        return NULL;
 
     //
     // get the window station object to which caller is connected
@@ -356,7 +356,7 @@ _FX GUI_CLIPBOARD *Gui_GetClipboard(void)
     // get the clipboard data in the window station object
     //
 
-    Clipboard = (GUI_CLIPBOARD *) ((ULONG_PTR)WinStaObject + Clipboard_Offset);
+    Clipboard = (GUI_CLIPBOARD *) ((ULONG_PTR)WinStaObject + Dyndata_Config.Clipboard_offset);
 
     if (Clipboard->items && Clipboard->count)
         return Clipboard;

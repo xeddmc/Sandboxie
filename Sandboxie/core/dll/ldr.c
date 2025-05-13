@@ -1,5 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
+ * Copyright 2021-2024 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -21,6 +22,7 @@
 
 
 #include "dll.h"
+#include "sbieapi.h"
 #include "core/drv/api_flags.h"
 
 //---------------------------------------------------------------------------
@@ -30,9 +32,6 @@
 
 #define LDR_NUM_CALLBACKS 8 
 
-#define LDR_TOKEN_PRIMARY -4
-#define LDR_TOKEN_IMPERSONATION -5
-#define LDR_TOKEN_EFFECTIVE -6
 
 //---------------------------------------------------------------------------
 // Structures and Types
@@ -41,7 +40,6 @@
 
 typedef struct tagDLL {
     const WCHAR *nameW;
-    const char  *nameA;
     BOOLEAN(*init_func)(HMODULE);
     int state;
 } DLL;
@@ -72,8 +70,8 @@ typedef union _LDR_DLL_NOTIFICATION_DATA {
 //---------------------------------------------------------------------------
 
 
-static void Ldr_CallOneDllCallback(const UCHAR *ImageNameA, ULONG_PTR ImageBase);
-static void Ldr_CallOneDllCallbackXP(const UCHAR *ImageNameA, ULONG_PTR ImageBase);
+static void Ldr_CallOneDllCallback(const UCHAR *ImageNameA, ULONG_PTR ImageBase, BOOL LoadState);
+static void Ldr_CallOneDllCallbackXP(const UCHAR *ImageNameA, ULONG_PTR ImageBase, BOOL LoadState);
 static void Ldr_CallDllCallbacks(void);
 
 static NTSTATUS Ldr_LdrLoadDll(WCHAR *PathString, ULONG *DllFlags, UNICODE_STRING *ModuleName, HANDLE *ModuleHandle);
@@ -92,9 +90,9 @@ static NTSTATUS Ldr_LdrQueryImageFileExecutionOptions(
 static ULONG_PTR Ldr_NtApphelpCacheControl(
     ULONG_PTR Unknown1, ULONG_PTR Unknown2);
 
-void Ldr_MyDllCallbackA(const CHAR *ImageName, HMODULE ImageBase);
-void Ldr_MyDllCallbackW(const WCHAR *ImageName, HMODULE ImageBase);
-void Ldr_MyDllCallbackNew(const WCHAR *ImageName, HMODULE ImageBase);
+void Ldr_MyDllCallbackA(const CHAR *ImageName, HMODULE ImageBase, BOOL LoadState);
+void Ldr_MyDllCallbackW(const WCHAR *ImageName, HMODULE ImageBase, BOOL LoadState);
+void Ldr_MyDllCallbackNew(const WCHAR *ImageName, HMODULE ImageBase, BOOL LoadState);
 
 static void *Ldr_GetProcAddr_2(const WCHAR *DllName, const WCHAR *ProcName);
 
@@ -104,13 +102,12 @@ static NTSTATUS Ldr_NtLoadDriver(UNICODE_STRING *RegistryPath);
 
 static BOOL LdrCheckImmersive();
 
-static NTSTATUS Ldr_LdrRegisterDllNotification(ULONG Flags, void * NotificationFunction, PVOID Context, PVOID *Cookie);
-static NTSTATUS Ldr_LdrUnregisterDllNotification(void * Cookie);
+//static NTSTATUS Ldr_LdrRegisterDllNotification(ULONG Flags, void * NotificationFunction, PVOID Context, PVOID *Cookie);
+//static NTSTATUS Ldr_LdrUnregisterDllNotification(void * Cookie);
 
 static void CALLBACK Ldr_LdrDllNotification(ULONG NotificationReason, PLDR_DLL_NOTIFICATION_DATA NotificationData, void * Context);
 
-static BOOL Ldr_NtOpenThreadToken(HANDLE ThreadHandle, DWORD  DesiredAccess, BOOL    OpenAsSelf, PHANDLE TokenHandle);
-static BOOL Ldr_RtlEqualSid(void * sid1, void * sid2);
+static void Ldr_LoadSkipList();
 
 //---------------------------------------------------------------------------
 
@@ -144,35 +141,21 @@ typedef NTSTATUS(*P_LdrQueryImageFileExecutionOptions)(
 typedef ULONG_PTR(*P_NtApphelpCacheControl)(
     ULONG_PTR Unknown1, ULONG_PTR Unknown2);
 
-typedef NTSTATUS(*P_NtTerminateProcess)(HANDLE ProcessHandle, NTSTATUS ExitStatus);
+//typedef NTSTATUS(*P_NtTerminateProcess)(HANDLE ProcessHandle, NTSTATUS ExitStatus);
 
 typedef NTSTATUS(*P_NtLoadDriver)(UNICODE_STRING *RegistryPath);
 
-typedef void(*P_LdrDllCallback)(const UCHAR *ImageName, HMODULE ImageBase);
-typedef void(*P_LdrDllCallbackW)(const WCHAR *ImageName, HMODULE ImageBase);
-typedef void(*P_Ldr_CallOneDllCallback)(const UCHAR *ImageNameA, ULONG_PTR ImageBase);
+typedef void(*P_LdrDllCallback)(const UCHAR *ImageName, HMODULE ImageBase, BOOL LoadState);
+typedef void(*P_LdrDllCallbackW)(const WCHAR *ImageName, HMODULE ImageBase, BOOL LoadState);
+typedef void(*P_Ldr_CallOneDllCallback)(const UCHAR *ImageNameA, ULONG_PTR ImageBase, BOOL LoadState);
 
-typedef  NTSTATUS(WINAPI *P_NtAccessCheckByType) (
-    PSECURITY_DESCRIPTOR SecurityDescriptor,
-    PSID PrincipalSelfSid,
-    HANDLE ClientToken,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_TYPE_LIST ObjectTypeList,
-    ULONG ObjectTypeListLength,
-    PGENERIC_MAPPING GenericMapping,
-    PPRIVILEGE_SET PrivilegeSet,
-    PULONG PrivilegeSetLength,
-    PACCESS_MASK GrantedAccess,
-    PNTSTATUS AccessStatus);
-
-typedef BOOL(*P_RtlEqualSid) (void * sid1, void * sid2);
 
 //---------------------------------------------------------------------------
 
 static P_LdrRegisterDllNotification __sys_LdrRegisterDllNotification = NULL;
 static P_LdrUnregisterDllNotification __sys_LdrUnregisterDllNotification = NULL;
 
-static P_NtTerminateProcess __sys_NtTerminateProcess = NULL;
+//static P_NtTerminateProcess     __sys_NtTerminateProcess = NULL;
 
 static P_LdrLockLoaderLock      __sys_LdrLockLoaderLock = NULL;
 static P_LdrUnlockLoaderLock    __sys_LdrUnlockLoaderLock = NULL;
@@ -187,76 +170,80 @@ static P_NtApphelpCacheControl  __sys_NtApphelpCacheControl = NULL;
 
 static P_NtLoadDriver           __sys_NtLoadDriver = NULL;
 
-P_LdrGetDllHandleEx      __sys_LdrGetDllHandleEx = NULL;
+P_LdrGetDllHandleEx             __sys_LdrGetDllHandleEx = NULL;
 
 static P_Ldr_CallOneDllCallback __my_Ldr_CallOneDllCallback = NULL;
-static P_NtOpenThreadToken  __sys_NtOpenThreadToken = NULL;
-static P_RtlEqualSid __sys_RtlEqualSid = NULL;
-
-extern ULONG Dll_Windows;
-extern BOOLEAN Secure_Is_IE_NtQueryInformationToken;
 
 //---------------------------------------------------------------------------
 // Variables
 //---------------------------------------------------------------------------
 
 static DLL Ldr_Dlls[] = {
-    { L"advapi32.dll",          "advapi32.dll",         AdvApi_Init,                    0},
-    { L"crypt32.dll",           "crypt32.dll",          Crypt_Init,                     0},
-    { L"hnetcfg.dll",           "hnetcfg.dll",          HNet_Init,                      0},
-    { L"ws2_32.dll",            "ws2_32.dll",           WSA_Init,                       0},
-    { L"iphlpapi.dll",          "iphlpapi.dll",         IpHlp_Init,                     0},
-    { L"netapi32.dll",          "netapi32.dll",         NetApi_Init,                    0},
-    { L"wkscli.dll",            "wkscli.dll",           NetApi_Init_WksCli,             0},
-    { L"ole32.dll",             "ole32.dll",            Ole_Init,                       0},
-    { L"combase.dll",           "combase.dll",          Com_Init_ComBase,               0},
-    { L"pstorec.dll",           "pstorec.dll",          Pst_Init,                       0},
-    { L"secur32.dll",           "secur32.dll",          Lsa_Init_Secur32,               0},
-    { L"sspicli.dll",           "sspicli.dll",          Lsa_Init_SspiCli,               0},
-    { L"setupapi.dll",          "setupapi.dll",         Setup_Init_SetupApi,            0},
-    { L"cfgmgr32.dll",          "cfgmgr32.dll",         Setup_Init_CfgMgr32,            0},
-    { L"shell32.dll",           "shell32.dll",          SH32_Init,                      0},
-    { L"zipfldr.dll",           "zipfldr.dll",          SH32_Init_ZipFldr,              0},
-    { L"uxtheme.dll",           "uxtheme.dll",          SH32_Init_UxTheme,              0},
-    { L"shcore.dll",            "shcore.dll",           Taskbar_SHCore_Init,            0},
-    { L"user32.dll",            "user32.dll",           Gui_Init,                       0},
-    { L"imm32.dll",             "imm32.dll",            Gui_Init_IMM32,                 0},
-    { L"d3d9.dll",              "d3d9.dll",             Gui_Init_D3D9,                  0},
-    { L"sfc_os.dll",            "sfc_os.dll",           Sfc_Init,                       0},
-    { L"wtsapi32.dll",          "wtsapi32.dll",         Terminal_Init_WtsApi,           0},
-    { L"winsta.dll",            "winsta.dll",           Terminal_Init_WinSta,           0},
-    { L"wevtapi.dll",           "wevtapi.dll",          EvtApi_Init,                    0},
-    { L"sxs.dll",               "sxs.dll",              Sxs_Init,                       0},
-    { L"gdi32.dll",             "gdi32.dll",            Gdi_Init,                       0},
-    { L"gdi32full.dll",         "gdi32full.dll",        Gdi_Full_Init,                  0},
-    { L"winspool.drv",          "winspool.drv",         Gdi_Init_Spool,                 0},
-    { L"rpcrt4.dll",            "rpcrt4.dll",           RpcRt_Init,                     0},
-    { L"userenv.dll",           "userenv.dll",          UserEnv_Init,                   0},
-    { L"sechost.dll",           "sechost.dll",          Scm_SecHostDll,                 0},
-    { L"msi.dll",               "msi.dll",              Scm_MsiDll,                     0},
-    { L"osppc.dll",             "osppc.dll",            Scm_OsppcDll,                   0},
-    { L"dwrite.dll",            "dwrite.dll",           Scm_DWriteDll,                  0},
-    { L"mso.dll",               "mso.dll",              File_MsoDll,                    0},
-    { L"advpack.dll",           "advpack.dll",          Proc_Init_AdvPack,              0},
-    { L"agcore.dll",            "agcore.dll",           Custom_SilverlightAgCore,       0},
-    { L"MsgPlusLive.dll",       "MsgPlusLive.dll",      Custom_MsgPlusLive,             0},
-    { L"IDMIECC.dll",           "IDMIECC.dll",          Custom_InternetDownloadManager, 0},
-    { L"snxhk.dll",             "snxhk.dll",            Custom_Avast_SnxHk,             0},
-    { L"snxhk64.dll",           "snxhk64.dll",          Custom_Avast_SnxHk,             0},
-    { L"emet.dll",              "emet.dll",             Custom_EMET_DLL,                0},
-    { L"sysfer.dll",            "sysfer.dll",           Custom_SYSFER_DLL,              0},
-    { L"MsCorEE.dll",           "MsCorEE.dll",          MsCorEE_Init,                   0},
-    { L"Pdh.dll",               "Pdh.dll",              Pdh_Init,                       0},
-    { L"winnsi.dll",            "winnsi.dll",           NsiRpc_Init,                    0},
-    { L"acscmonitor.dll",       "acscmonitor.dll",      Acscmonitor_Init,               0},
-    { L"ComDlg32.dll",          "ComDlg32.dll",         ComDlg32_Init,                  0},
-    { L"ntmarta.dll",           "ntmarta.dll",          Ntmarta_Init,                   0},
+    { L"advapi32.dll",          AdvApi_Init,                    0},
+    { L"crypt32.dll",           Crypt_Init,                     0},
+    { L"ole32.dll",             Ole_Init,                       0}, // COM, OLE
+    { L"combase.dll",           Com_Init_ComBase,               0}, // COM
+    { L"rpcrt4.dll",            RpcRt_Init,                     0}, // RPC, epmapper
+    { L"sechost.dll",           SecHost_Init,                   0}, // SCM
+    { L"shell32.dll",           SH32_Init,                      0},
+    { L"shcore.dll",            Taskbar_SHCore_Init,            0}, // win 8, [Get/Set]CurrentProcessExplicitAppUserModelID
+    { L"wtsapi32.dll",          Terminal_Init_WtsApi,           0},
+    { L"winsta.dll",            Terminal_Init_WinSta,           0},
+    { L"MsCorEE.dll",           MsCorEE_Init,                   0}, // .net framework
+    { L"win32u.dll",            Win32_Init,                     0},
+    { L"user32.dll",            Gui_Init,                       0},
+    { L"imm32.dll",             Gui_Init_IMM32,                 0},
+    { L"gdi32.dll",             Gdi_Init,                       0},
+    { L"gdi32full.dll",         Gdi_Full_Init,                  0},
+    { L"d3d9.dll",              Gui_Init_D3D9,                  0},
+    { L"sxs.dll",               Sxs_Init,                       0}, // add message to SxsInstallW
+    { L"ws2_32.dll",            WSA_Init,                       0}, // network restrictions
+    { L"iphlpapi.dll",          IpHlp_Init,                     0}, // ping support
+    { L"msi.dll",               Scm_MsiDll,                     0}, // msi installer
+    { L"secur32.dll",           Lsa_Init_Secur32,               0}, // xp, vista - LsaRegisterLogonProcess
+    { L"sspicli.dll",           Lsa_Init_SspiCli,               0}, // win 7 - LsaRegisterLogonProcess
+    { L"netapi32.dll",          NetApi_Init,                    0}, // xp, vista - NetUseAdd
+    { L"wkscli.dll",            NetApi_Init_WksCli,             0}, // win 7 - NetUseAdd
+    { L"pstorec.dll",           Pst_Init,                       0}, // Protected Storage
+    { L"winspool.drv",          Gdi_Init_Spool,                 0}, // print spooler workaround for 32 bit
+    // Disabled functionality:
+    { L"userenv.dll",           UserEnv_Init,                   0}, // disable some GPO stuff
+    { L"sfc_os.dll",            Sfc_Init,                       0}, // disable SFC
+    { L"Pdh.dll",               Pdh_Init,                       0}, // disable Performance Counters
+    { L"wevtapi.dll",           EvtApi_Init,                    0}, // disable EvtIntAssertConfig
+    { L"cfgmgr32.dll",          Setup_Init_CfgMgr32,            0}, // CM_Add_Driver_PackageW
+    // Workarounds:
+    { L"setupapi.dll",          Setup_Init_SetupApi,            0}, // VerifyCatalogFile
+    { L"zipfldr.dll",           SH32_Init_ZipFldr,              0},
+    { L"uxtheme.dll",           SH32_Init_UxTheme,              0}, // explorer.exe, SetWindowThemeAttribute
+    { L"hnetcfg.dll",           HNet_Init,                      0}, // firewall workaround
+    { L"winnsi.dll",            NsiRpc_Init,                    0}, // WININET workaround
+//    { L"wininet.dll",           Wininet_Init,                   0},
+    { L"nsi.dll",               Nsi_Init,                       0},
+    { L"advpack.dll",           Proc_Init_AdvPack,              0}, // fix for IE
+    { L"dwrite.dll",            Scm_DWriteDll,                  0}, // hack for IE 9, make sure FontCache is running
+    { L"ComDlg32.dll",          ComDlg32_Init,                  0}, // fix for opera.exe
+    { L"ntmarta.dll",           Ntmarta_Init,                   0}, // workaround for chrome and acrobat reader
+    // Non Windows DLLs:
+    { L"osppc.dll",             Scm_OsppcDll,                   0}, // ensure osppsvc is running
+    { L"mso.dll",               File_MsoDll,                    0}, // hack for File_IsRecoverable
+    { L"agcore.dll",            Custom_SilverlightAgCore,       0}, // msft silverlight - deprecated
+
+    // $Workaround$ - 3rd party fix
+#ifndef _M_ARM64
+    // Non Microsoft DLLs:
+    { L"acscmonitor.dll",       Acscmonitor_Init,               0},
+    { L"IDMIECC.dll",           Custom_InternetDownloadManager, 0},
+    { L"snxhk.dll",             Custom_Avast_SnxHk,             0},
+    { L"snxhk64.dll",           Custom_Avast_SnxHk,             0},
+    { L"sysfer.dll",            Custom_SYSFER_DLL,              0},
+#endif
 #ifdef _WIN64
-    { L"dgapi64.dll",           "dgapi64.dll",          DigitalGuardian_Init,           0},
+    { L"dgapi64.dll",           DigitalGuardian_Init,           0},
 #else
-    { L"dgapi.dll",             "dgapi.dll",            DigitalGuardian_Init,           0},
+    { L"dgapi.dll",             DigitalGuardian_Init,           0},
 #endif _WIN64
-    { NULL,                     NULL ,                  NULL,                           0}
+    { NULL,                     NULL,                           0}
 };
 
 static ULONG_PTR *Ldr_Callbacks = 0;
@@ -266,90 +253,30 @@ static void *Ldr_LoadedModules = NULL;
 static void *LdrLoaderCookie = NULL;
 static volatile BOOLEAN Ldr_LdrLoadDll_Invoked = FALSE;
 
+static BOOLEAN Ldr_DynamicImageDetection = FALSE;
+
 //---------------------------------------------------------------------------
 
 #include "ldr_init.c"
 
-NTSTATUS Ldr_NtAccessCheckByType(
-    PSECURITY_DESCRIPTOR SecurityDescriptor,
-    PSID PrincipalSelfSid,
-    HANDLE ClientToken,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_TYPE_LIST ObjectTypeList,
-    ULONG ObjectTypeListLength,
-    PGENERIC_MAPPING GenericMapping,
-    PPRIVILEGE_SET PrivilegeSet,
-    PULONG PrivilegeSetLength,
-    PACCESS_MASK GrantedAccess,
-    PNTSTATUS AccessStatus
-);
 
-NTSTATUS  Ldr_NtAccessCheckByTypeResultList(
-    PSECURITY_DESCRIPTOR SecurityDescriptor,
-    PSID PrincipalSelfSid,
-    HANDLE ClientToken,
-    ACCESS_MASK     DesiredAccess,
-    POBJECT_TYPE_LIST ObjectTypeList,
-    ULONG ObjectTypeListLength,
-    PGENERIC_MAPPING GenericMapping,
-    PPRIVILEGE_SET  PrivilegeSet,
-    PULONG PrivilegeSetLength,
-    PACCESS_MASK    GrantedAccess,
-    PNTSTATUS   AccessStatus
-);
-
-NTSTATUS Ldr_NtAccessCheck(
-    IN PSECURITY_DESCRIPTOR SecurityDescriptor,
-    IN HANDLE               ClientToken,
-    IN ACCESS_MASK          DesiredAccess,
-    IN PGENERIC_MAPPING     GenericMapping OPTIONAL,
-    OUT PPRIVILEGE_SET      RequiredPrivilegesBuffer,
-    IN OUT PULONG           BufferLength,
-    OUT PACCESS_MASK        GrantedAccess,
-    OUT PNTSTATUS           AccessStatus);
-
-NTSTATUS Ldr_NtQuerySecurityAttributesToken(
-    IN HANDLE TokenHandle,
-    IN PUNICODE_STRING Attributes,
-    IN ULONG NumberOfAttributes,
-    OUT PVOID Buffer,
-    IN ULONG Length,
-    OUT PULONG ReturnLength);
-
-NTSTATUS Ldr_NtQueryInformationToken(
-    HANDLE TokenHandle,
-    TOKEN_INFORMATION_CLASS TokenInformationClass,
-    void *TokenInformation,
-    ULONG TokenInformationLength,
-    ULONG *ReturnLength);
-
-NTSTATUS Ldr_NtTerminateProcess(HANDLE  ProcessHandle, NTSTATUS ExitStatus);
-
-static P_NtAccessCheckByType            __sys_NtAccessCheckByType = NULL;
-static P_NtAccessCheck                  __sys_NtAccessCheck = NULL;
-static P_NtQuerySecurityAttributesToken __sys_NtQuerySecurityAttributesToken = NULL;
-static P_NtQueryInformationToken        __sys_NtQueryInformationToken = NULL;
-static P_NtAccessCheckByTypeResultList  __sys_NtAccessCheckByTypeResultList = NULL;
-
-
-
-NTSTATUS Ldr_NtTerminateProcess(HANDLE  ProcessHandle, NTSTATUS ExitStatus)
-{
-    NTSTATUS rc;
-
-    // ProcessHandle is optional. Unregister callback when current process is terminating
-    if (!ProcessHandle
-        || ProcessHandle == NtCurrentProcess()
-        || GetCurrentProcessId() == GetProcessId(ProcessHandle)
-        )
-    {
-        __sys_LdrUnregisterDllNotification(LdrLoaderCookie);
-    }
-
-    rc = __sys_NtTerminateProcess(ProcessHandle, ExitStatus);
-
-    return rc;
-}
+//NTSTATUS Ldr_NtTerminateProcess(HANDLE  ProcessHandle, NTSTATUS ExitStatus)
+//{
+//    NTSTATUS rc;
+//
+//    // ProcessHandle is optional. Unregister callback when current process is terminating
+//    if (!ProcessHandle
+//        || ProcessHandle == NtCurrentProcess()
+//        || GetCurrentProcessId() == GetProcessId(ProcessHandle)
+//        )
+//    {
+//        __sys_LdrUnregisterDllNotification(LdrLoaderCookie);
+//    }
+//
+//    rc = __sys_NtTerminateProcess(ProcessHandle, ExitStatus);
+//
+//    return rc;
+//}
 
 //---------------------------------------------------------------------------
 
@@ -358,33 +285,29 @@ void CALLBACK Ldr_LdrDllNotification(ULONG NotificationReason, PLDR_DLL_NOTIFICA
     ULONG_PTR LdrCookie = 0;
     NTSTATUS status = 0;
 
-
     if (NotificationReason == 1) {
         status = __sys_LdrLockLoaderLock(0, NULL, &LdrCookie);
-        Ldr_MyDllCallbackNew(NotificationData->Loaded.BaseDllName->Buffer, (HMODULE)NotificationData->Loaded.DllBase);
+        Ldr_MyDllCallbackNew(NotificationData->Loaded.BaseDllName->Buffer, (HMODULE)NotificationData->Loaded.DllBase, TRUE);
         __sys_LdrUnlockLoaderLock(0, LdrCookie);
-
-        return;
     }
     else if (NotificationReason == 2) {
-        Ldr_MyDllCallbackNew(NotificationData->Unloaded.BaseDllName->Buffer, 0);
+        Ldr_MyDllCallbackNew(NotificationData->Unloaded.BaseDllName->Buffer,  (HMODULE)NotificationData->Loaded.DllBase, FALSE);
     }
-    return;
 }
 
 //---------------------------------------------------------------------------
 
-_FX NTSTATUS Ldr_LdrRegisterDllNotification(ULONG Flags, void * NotificationFunction, PVOID Context, PVOID *Cookie)
-{
-    NTSTATUS status = 0;
-    status = __sys_LdrRegisterDllNotification(0, ((void *)Ldr_LdrDllNotification), NULL, Cookie);
-    return status;
-}
-
-_FX NTSTATUS Ldr_LdrUnregisterDllNotification(void * Cookie)
-{
-    return STATUS_SUCCESS;
-}
+//_FX NTSTATUS Ldr_LdrRegisterDllNotification(ULONG Flags, void * NotificationFunction, PVOID Context, PVOID *Cookie)
+//{
+//    NTSTATUS status = 0;
+//    status = __sys_LdrRegisterDllNotification(0, ((void *)Ldr_LdrDllNotification), NULL, Cookie);
+//    return status;
+//}
+//
+//_FX NTSTATUS Ldr_LdrUnregisterDllNotification(void * Cookie)
+//{
+//    return STATUS_SUCCESS;
+//}
 
 //---------------------------------------------------------------------------
 // LdrCheckImmersive
@@ -463,6 +386,8 @@ BOOL LdrCheckImmersive()
 
 _FX BOOLEAN Ldr_Init()
 {
+    HMODULE module = Dll_Ntdll;
+
     UCHAR *ReadImageFileExecOptions;
 
     //
@@ -487,11 +412,14 @@ _FX BOOLEAN Ldr_Init()
     Ldr_Callbacks = Dll_Alloc(sizeof(ULONG_PTR) * LDR_NUM_CALLBACKS);
     memzero(Ldr_Callbacks, sizeof(ULONG_PTR) * LDR_NUM_CALLBACKS);
 
-    if (Dll_OsBuild >= 6000) {
+    Ldr_LoadSkipList();
+
+
+    if (Dll_OsBuild >= 6000) { // Windows Vista and later
         SbieDll_RegisterDllCallback(Ldr_MyDllCallbackA);
         __my_Ldr_CallOneDllCallback = Ldr_CallOneDllCallback;
     }
-    else {
+    else { // Windows XP
         SbieDll_RegisterDllCallback(Ldr_MyDllCallbackW);
         __my_Ldr_CallOneDllCallback = Ldr_CallOneDllCallbackXP;
     }
@@ -499,16 +427,15 @@ _FX BOOLEAN Ldr_Init()
     //
     // hook entrypoints
     //
-    if (Dll_OsBuild >= 9600) {
+
+    Ldr_DynamicImageDetection = Config_GetSettingsForImageName_bool(L"DynamicImageDetection", TRUE);
+
+    if (Dll_OsBuild >= 9600) { // Windows 8.1 and later
         NTSTATUS rc = 0;
 
-        void *NtAccessCheckByType = GetProcAddress(Dll_Ntdll, "NtAccessCheckByType");
-        void *NtAccessCheck = GetProcAddress(Dll_Ntdll, "NtAccessCheck");
-        void *NtQuerySecurityAttributesToken = GetProcAddress(Dll_Ntdll, "NtQuerySecurityAttributesToken");
-        void *NtQueryInformationToken = GetProcAddress(Dll_Ntdll, "NtQueryInformationToken");
-        void *NtAccessCheckByTypeResultList = GetProcAddress(Dll_Ntdll, "NtAccessCheckByTypeResultList");
-        void *NtTerminateProcess = (P_NtTerminateProcess)GetProcAddress(Dll_Ntdll, "NtTerminateProcess");
-        void *RtlEqualSid = (P_RtlEqualSid)GetProcAddress(Dll_Ntdll, "RtlEqualSid");
+        //void *NtTerminateProcess = (P_NtTerminateProcess)GetProcAddress(Dll_Ntdll, "NtTerminateProcess");
+
+        // this functions are available since windows vista
         __sys_LdrRegisterDllNotification = (P_LdrRegisterDllNotification)GetProcAddress(Dll_Ntdll, "LdrRegisterDllNotification");
         __sys_LdrUnregisterDllNotification = (P_LdrUnregisterDllNotification)GetProcAddress(Dll_Ntdll, "LdrUnregisterDllNotification");
 
@@ -524,24 +451,15 @@ _FX BOOLEAN Ldr_Init()
             return FALSE;
         }
 
-        SBIEDLL_HOOK(Ldr_, NtTerminateProcess);
-        SBIEDLL_HOOK(Ldr_, NtQueryInformationToken);
-        SBIEDLL_HOOK(Ldr_, NtQuerySecurityAttributesToken);
-        SBIEDLL_HOOK(Ldr_, NtAccessCheckByType);
-        SBIEDLL_HOOK(Ldr_, NtAccessCheck);
-        SBIEDLL_HOOK(Ldr_, NtAccessCheckByTypeResultList);
+        // Todo: Fix-Me: this hangs some processes on arm64
+        //SBIEDLL_HOOK(Ldr_, NtTerminateProcess);
         SBIEDLL_HOOK(Ldr_Win10_, LdrLoadDll);
-        SBIEDLL_HOOK(Ldr_, NtLoadDriver);
-        if (DLL_IMAGE_GOOGLE_CHROME == Dll_ImageType) {
-            SBIEDLL_HOOK(Ldr_, NtOpenThreadToken);
-        }
-        SBIEDLL_HOOK(Ldr_, RtlEqualSid);
     }
-    else {
+    else { // Windows 8 and before
         SBIEDLL_HOOK(Ldr_, LdrLoadDll);
         SBIEDLL_HOOK(Ldr_, LdrUnloadDll);
         SBIEDLL_HOOK(Ldr_, LdrQueryImageFileExecutionOptions);
-        SBIEDLL_HOOK(Ldr_, NtLoadDriver);
+
         if (Dll_OsBuild >= 8400) {
 
             P_LdrResolveDelayLoadedAPI LdrResolveDelayLoadedAPI =
@@ -555,8 +473,10 @@ _FX BOOLEAN Ldr_Init()
             SBIEDLL_HOOK(Ldr_, LdrResolveDelayLoadedAPI);
             SBIEDLL_HOOK(Ldr_, NtApphelpCacheControl);
         }
-
     }
+    SBIEDLL_HOOK(Ldr_, NtLoadDriver);
+
+
     //
     // set PEB.ReadImageFileExecOptions to non-zero to force ntdll to call
     // LdrQueryImageFileExecutionOptions so we can call Ldr_CallDllCallbacks
@@ -564,7 +484,7 @@ _FX BOOLEAN Ldr_Init()
     // on Windows 8, we use a hook on NtApphelpCacheControl instead
     //
 
-    if (Dll_OsBuild < 8400) {
+    if (Dll_OsBuild < 8400) { // Windows 7 and older
 
         ReadImageFileExecOptions = (UCHAR *)(NtCurrentPeb() + 1);
 
@@ -573,6 +493,16 @@ _FX BOOLEAN Ldr_Init()
     }
     else {
         LdrCheckImmersive();
+    }
+
+
+    //
+    // set PEB.ProcessParameters->LoaderThreads = 0
+    //
+
+    if (SbieApi_QueryConfBool(NULL, L"NoParallelLoading", FALSE)) {
+        RTL_USER_PROCESS_PARAMETERS* ProcessParms = Proc_GetRtlUserProcessParameters();
+        ProcessParms->LoaderThreads = 0;
     }
 
     //
@@ -589,8 +519,8 @@ _FX BOOLEAN Ldr_Init()
     // Ldr_LoadInjectDlls();
 
     //
-   // initialize manifest
-   //
+    // initialize manifest
+    //
 
     Ldr_Inject_Init(FALSE);
     Sxs_ActivateDefaultManifest((void *)Ldr_ImageBase);
@@ -638,7 +568,7 @@ _FX BOOLEAN SbieDll_RegisterDllCallback(void *Callback)
 // Ldr_CallOneDllCallback
 //---------------------------------------------------------------------------
 
-_FX void Ldr_CallOneDllCallback(const UCHAR *ImageNameA, ULONG_PTR ImageBase)
+_FX void Ldr_CallOneDllCallback(const UCHAR *ImageNameA, ULONG_PTR ImageBase, BOOL LoadState)
 {
     ULONG i;
 
@@ -647,7 +577,7 @@ _FX void Ldr_CallOneDllCallback(const UCHAR *ImageNameA, ULONG_PTR ImageBase)
         if (!callback)
             break;
         __try {
-            ((P_LdrDllCallback)callback)(ImageNameA, (HMODULE)ImageBase);
+            ((P_LdrDllCallback)callback)(ImageNameA, (HMODULE)ImageBase, LoadState);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
         }
@@ -655,7 +585,7 @@ _FX void Ldr_CallOneDllCallback(const UCHAR *ImageNameA, ULONG_PTR ImageBase)
 }
 
 
-_FX void Ldr_CallOneDllCallbackXP(const UCHAR *ImageNameA, ULONG_PTR ImageBase)
+_FX void Ldr_CallOneDllCallbackXP(const UCHAR *ImageNameA, ULONG_PTR ImageBase, BOOL LoadState)
 {
     ULONG i;
 
@@ -672,7 +602,7 @@ _FX void Ldr_CallOneDllCallbackXP(const UCHAR *ImageNameA, ULONG_PTR ImageBase)
             break;
 
         __try {
-            ((P_LdrDllCallbackW)callback)(ImageNameW, (HMODULE)ImageBase);
+            ((P_LdrDllCallbackW)callback)(ImageNameW, (HMODULE)ImageBase, LoadState);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
         }
@@ -769,7 +699,8 @@ _FX void Ldr_CallDllCallbacks(void)
 
             if (!found) {
 
-                __my_Ldr_CallOneDllCallback(pOld->Path + pOld->NameOffset, 0);
+                __my_Ldr_CallOneDllCallback(pOld->Path + pOld->NameOffset,
+                    pOld->ImageBaseAddress, FALSE);
             }
         }
     }
@@ -815,7 +746,7 @@ _FX void Ldr_CallDllCallbacks(void)
             RtlFreeUnicodeString(&uni);
 
             __my_Ldr_CallOneDllCallback(pNew->Path + pNew->NameOffset,
-                pNew->ImageBaseAddress);
+                pNew->ImageBaseAddress, TRUE);
 
             if (OldState)
                 Ldr_SetDdagState_W8(pNew->ImageBaseAddress, OldState);
@@ -864,6 +795,38 @@ _FX void Ldr_CallDllCallbacks_WithLock(void)
 
 
 //---------------------------------------------------------------------------
+// Ldr_LdrLoadDllImpl
+//---------------------------------------------------------------------------
+
+
+_FX NTSTATUS Ldr_LdrLoadDllImpl(
+    WCHAR* PathString,
+    ULONG* DllFlags,
+    UNICODE_STRING* ModuleName,
+    HANDLE* ModuleHandle)
+{
+    NTSTATUS status = 0;
+
+    //WCHAR text[4096];
+    //Sbie_snwprintf(text, ARRAYSIZE(text), L"%s (loading...)", (ModuleName && ModuleName->Buffer) ? ModuleName->Buffer : PathString);
+    //SbieApi_MonitorPutMsg(MONITOR_IMAGE, text);
+
+    status = __sys_LdrLoadDll(PathString, DllFlags, ModuleName, ModuleHandle);
+
+    if (!NT_SUCCESS(status)) {
+        WCHAR text[4096];
+        Sbie_snwprintf(text, ARRAYSIZE(text), L"%s (load failed 0x%08X)", (ModuleName && ModuleName->Buffer) ? ModuleName->Buffer : PathString, status);
+        SbieApi_MonitorPutMsg(MONITOR_IMAGE, text);
+    }
+
+    //Sbie_snwprintf(text, ARRAYSIZE(text), L"%s (... 0x%08X)", (ModuleName && ModuleName->Buffer) ? ModuleName->Buffer : PathString, status);
+    //SbieApi_MonitorPutMsg(MONITOR_IMAGE, text);
+
+    return status;
+}
+
+
+//---------------------------------------------------------------------------
 // Ldr_LdrLoadDll
 //---------------------------------------------------------------------------
 
@@ -885,7 +848,7 @@ _FX NTSTATUS Ldr_LdrLoadDll(
     status = __sys_LdrLockLoaderLock(0, &state, &LdrCookie);
     if (NT_SUCCESS(status)) {
 
-        status = __sys_LdrLoadDll(PathString, DllFlags, ModuleName, ModuleHandle);
+        status = Ldr_LdrLoadDllImpl(PathString, DllFlags, ModuleName, ModuleHandle);
 
         if (NT_SUCCESS(status)) {
             Ldr_CallDllCallbacks();
@@ -893,7 +856,6 @@ _FX NTSTATUS Ldr_LdrLoadDll(
         }
         __sys_LdrUnlockLoaderLock(0, LdrCookie);
     }
-    Scm_SecHostDll_W8();
     return status;
 }
 
@@ -912,11 +874,8 @@ _FX NTSTATUS Ldr_Win10_LdrLoadDll(
     //
     // load the DLL 
     //
-    NTSTATUS status = 0;
 
-    status = __sys_LdrLoadDll(PathString, DllFlags, ModuleName, ModuleHandle);
-    Scm_SecHostDll_W8();
-    return status;
+    return Ldr_LdrLoadDllImpl(PathString, DllFlags, ModuleName, ModuleHandle);
 }
 
 //---------------------------------------------------------------------------
@@ -991,8 +950,6 @@ _FX ULONG_PTR Ldr_LdrResolveDelayLoadedAPI(
 
     Ldr_CallDllCallbacks_WithLock();
 
-    Scm_SecHostDll_W8();
-
     return result;
 }
 
@@ -1055,81 +1012,135 @@ _FX ULONG_PTR Ldr_NtApphelpCacheControl(
 
 
 //---------------------------------------------------------------------------
+// Ldr_DetectImageType
+//---------------------------------------------------------------------------
+
+BOOL Ldr_CheckFirefoxDll(const WCHAR* dll_path)
+{
+    //_wcsicmp(dll_path, L"xul.dll") == 0;
+    return _wcsicmp(dll_path, L"mozglue.dll") == 0;
+}
+
+BOOL Ldr_CheckChromeDll(const WCHAR* dll_path)
+{
+    if (_wcsicmp(dll_path, L"chrome_elf.dll") == 0)
+        return TRUE;
+
+    //
+    // Some Chromium based browsers like Microsoft Edge or Vivaldi rename the dll
+    // from chrome_elf.dll to msedge_elf.dll
+    //
+
+    SIZE_T dll_len = wcslen(dll_path);
+    SIZE_T exe_len = wcslen(Dll_ImageName);
+    if ((dll_len - 8) == (exe_len - 4))
+        return _wcsnicmp(Dll_ImageName, dll_path, exe_len - 4) == 0;
+
+    return FALSE;
+}
+
+_FX void Ldr_DetectImageType(const CHAR *ImageName)
+{
+    //
+    // Electron apps can have arbitrary names, but need to be treated like the Chrome browser
+    // hence we try to detect them by the DLL names they load during runtime
+    //
+
+    if (Ldr_DynamicImageDetection && Dll_ImageType == DLL_IMAGE_UNSPECIFIED) // && !Dll_EntryComplete
+    {
+        if (Ldr_CheckFirefoxDll(ImageName)) {
+            Dll_ImageType = DLL_IMAGE_MOZILLA_FIREFOX;
+        }
+        else if (Ldr_CheckChromeDll(ImageName)) {
+            Dll_ImageType = DLL_IMAGE_GOOGLE_CHROME;
+        }
+
+        if (Dll_ImageType != DLL_IMAGE_UNSPECIFIED) {
+
+            WCHAR msg[128];
+            Sbie_snwprintf(msg, 128, L"Detected web browser image");
+            SbieApi_MonitorPutMsg(MONITOR_IMAGE | MONITOR_TRACE, msg);
+
+            SbieApi_QueryProcessInfoEx(0, 'spit', Dll_ImageType);
+
+            if (Dll_RestrictedToken || Dll_AppContainerToken) {
+
+                Dll_ChromeSandbox = TRUE;
+            }
+        }
+    }
+}
+
+
+//---------------------------------------------------------------------------
 // Ldr_MyDllCallbacks (A,W,New)
 //---------------------------------------------------------------------------
 
 
-_FX void Ldr_MyDllCallbackA(const CHAR *ImageName, HMODULE ImageBase)
+_FX void Ldr_MyDllCallbackA(const CHAR *ImageName, HMODULE ImageBase, BOOL LoadState) // Windows Vista, 7, 8.0
 {
-    //
-    // invoke our sub-modules as necessary
-    //
-    if (ImageBase) {
+    WCHAR ImageNameW[128];
+    Sbie_snwprintf(ImageNameW, ARRAYSIZE(ImageNameW), L"%S", ImageName);
 
-        DLL *dll = Ldr_Dlls;
-        while (dll->nameA) {
-            if (_stricmp(ImageName, dll->nameA) == 0) {
-                BOOLEAN ok = dll->init_func(ImageBase);
-                if (!ok)
-                    SbieApi_Log(2318, dll->nameW);
-                break;
-            }
-            ++dll;
-        }
-    }
-}
-
-_FX void Ldr_MyDllCallbackW(const WCHAR *ImageName, HMODULE ImageBase)
-{
-    //
-    // invoke our sub-modules as necessary
-    //
-    if (ImageBase) {
-
-        DLL *dll = Ldr_Dlls;
-        while (dll->nameW) {
-            if (_wcsicmp(ImageName, dll->nameW) == 0) {
-                BOOLEAN ok = dll->init_func(ImageBase);
-                if (!ok)
-                    SbieApi_Log(2318, dll->nameW);
-
-                break;
-            }
-
-            ++dll;
-        }
-    }
+    Ldr_MyDllCallbackNew(ImageNameW, ImageBase, LoadState);
 }
 
 
-_FX void Ldr_MyDllCallbackNew(const WCHAR *ImageName, HMODULE ImageBase)
+_FX void Ldr_MyDllCallbackW(const WCHAR *ImageName, HMODULE ImageBase, BOOL LoadState) // Windows XP
 {
+    Ldr_MyDllCallbackNew(ImageName, ImageBase, LoadState);
+}
+
+
+_FX void Ldr_MyDllCallbackNew(const WCHAR *ImageName, HMODULE ImageBase, BOOL LoadState) // Windows 8.1 and later
+{
+    WCHAR text[4096];
+    if(LoadState)
+        Sbie_snwprintf(text, ARRAYSIZE(text), L"%s (loaded)", ImageName);
+    else
+        Sbie_snwprintf(text, ARRAYSIZE(text), L"%s (unloaded)", ImageName);
+    SbieApi_MonitorPutMsg(MONITOR_IMAGE, text);
+
     //
     // invoke our sub-modules as necessary
     //
+
     DLL *dll = Ldr_Dlls;
-
     while (dll->nameW) {
         BOOLEAN ok;
-        if (_wcsicmp(ImageName, dll->nameW) == 0) {
-            if (ImageBase && !dll->state) {
-                EnterCriticalSection(&Ldr_LoadedModules_CritSec);
-                dll->state = 1;
-                LeaveCriticalSection(&Ldr_LoadedModules_CritSec);
-                ok = dll->init_func(ImageBase);
-                if (!ok)
-                    SbieApi_Log(2318, dll->nameW);
-                break;
+        if (_wcsicmp(ImageName, dll->nameW) == 0 && (dll->state & 2) == 0) {
+            if (LoadState) {
+                if (!dll->state) {
+                    EnterCriticalSection(&Ldr_LoadedModules_CritSec);
+                    dll->state = 1;
+                    LeaveCriticalSection(&Ldr_LoadedModules_CritSec);
+                    ok = dll->init_func(ImageBase);
+                    if (!ok)
+                        SbieApi_Log(2318, dll->nameW);
+                }
             }
             else {
-                EnterCriticalSection(&Ldr_LoadedModules_CritSec);
-                dll->state = 0;
-                LeaveCriticalSection(&Ldr_LoadedModules_CritSec);
+                if (dll->state) {
+                    //SbieDll_UnHookModule(ImageBase);
+                    EnterCriticalSection(&Ldr_LoadedModules_CritSec);
+                    dll->state = 0;
+                    LeaveCriticalSection(&Ldr_LoadedModules_CritSec);
+                }
             }
+            break;
         }
         ++dll;
     }
+
+    if (LoadState)
+        SbieDll_TraceModule(ImageBase);
+    else
+        SbieDll_UnHookModule(ImageBase);
+
+    if (LoadState)
+        Ldr_DetectImageType(ImageName);
 }
+
 
 //---------------------------------------------------------------------------
 // Ldr_GetProcAddr
@@ -1179,12 +1190,12 @@ _FX void *Ldr_GetProcAddrOld(const WCHAR *DllName, const WCHAR *ProcNameW)
 _FX void *Ldr_GetProcAddrNew(const WCHAR *DllName, const WCHAR *ProcNameW, char * ProcNameA)
 {
     NTSTATUS status;
-    void *proc;
+    void *proc = NULL;
     //  char buffer[768];
     //  sprintf(buffer,"GetProcAddrNew: DllName = %S, ProcW = %S, ProcA = %s\n",DllName,ProcNameW,ProcNameA);
     //  OutputDebugStringA(buffer);
 
-    if (Dll_OsBuild < 9600) {
+    if (Dll_OsBuild < 9600) { // Windows 8.0 or earlier
         proc = Ldr_GetProcAddr_2(DllName, ProcNameW);
         if (!proc) {
             ULONG_PTR LdrCookie;
@@ -1215,7 +1226,7 @@ _FX void *Ldr_GetProcAddrNew(const WCHAR *DllName, const WCHAR *ProcNameW, char 
             }
         }
     }
-    else {
+    else { // Windows 8.1 and later
         HMODULE DllBase;
         DllBase = GetModuleHandle(DllName);
         if (!DllBase) {
@@ -1357,205 +1368,54 @@ _FX NTSTATUS Ldr_NtLoadDriver(UNICODE_STRING *RegistryPath)
         }
 
         if (DriverName)
-            SbieApi_Log(2103, L"%S [%S]", DriverName, Dll_BoxName);
+            SbieApi_Log(2103, L"%S [%S] (NtLoadDriver)", DriverName, Dll_BoxName);
     }
 
     return status;
 }
+
 
 //---------------------------------------------------------------------------
+// Ldr_LoadSkipList
+//---------------------------------------------------------------------------
 
-_FX void Ldr_TestToken(HANDLE token, PHANDLE hTokenReal)
+
+_FX void Ldr_LoadSkipList()
 {
-    if ((LONG_PTR)token == LDR_TOKEN_PRIMARY) {
-        NtOpenProcessToken(NtCurrentProcess(), TOKEN_QUERY, hTokenReal);
-    }
-    else if ((LONG_PTR)token == LDR_TOKEN_IMPERSONATION) {
-        NtOpenThreadToken(NtCurrentThread(), TOKEN_QUERY, FALSE, hTokenReal);
-    }
-    else if ((LONG_PTR)token <= LDR_TOKEN_EFFECTIVE) {
-        NtOpenThreadToken(NtCurrentThread(), TOKEN_QUERY, FALSE, hTokenReal);
-        if (!hTokenReal) {
-            NtOpenProcessToken(NtCurrentProcess(), TOKEN_QUERY, hTokenReal);
-        }
-    }
-    return;
-}
-
-_FX NTSTATUS Ldr_NtQueryInformationToken(
-    HANDLE TokenHandle,
-    TOKEN_INFORMATION_CLASS TokenInformationClass,
-    void *TokenInformation,
-    ULONG TokenInformationLength,
-    ULONG *ReturnLength)
-{
-    NTSTATUS status = 0;
-    THREAD_DATA *TlsData = NULL;
-    HANDLE hTokenReal = NULL;
-
-    Ldr_TestToken(TokenHandle, &hTokenReal);
-    status = __sys_NtQueryInformationToken(
-        hTokenReal ? hTokenReal : TokenHandle, TokenInformationClass,
-        TokenInformation, TokenInformationLength, ReturnLength);
-
-    if (hTokenReal)
-    {
-        NtClose(hTokenReal);
-    }
-
-    if (!Secure_Is_IE_NtQueryInformationToken)
-    {
-        return status;
-    }
-
-    TlsData = Dll_GetTlsData(NULL);
-
-    //
-    // NtQueryInformationToken is hooked only for Internet Explorer.
-    //
-    // if the check occurs during CreateProcess, then return the real
-    // information, so UAC elevation may occur for the new process.
-    //
-    // otherwise, this check is related to Protected Mode, so pretend
-    // we are running as Administrator
-    //
-
-    if (NT_SUCCESS(status) && (!TlsData->proc_create_process)) {
-
-        if (TokenInformationClass == TokenElevationType) {
-
-            //
-            // on Vista, fake a return value for a full token
-            //
-
-            *(ULONG *)TokenInformation = TokenElevationTypeFull;
-        }
-
-        if (TokenInformationClass == TokenIntegrityLevel) {
-
-            //
-            // on Vista, fake a high integrity level
-            //
-
-#include "pshpack4.h"
-
-            typedef struct {
-
-                ULONG_PTR Pointer;
-                ULONG_PTR Sixty;
-                ULONG     OneOhOne;
-                ULONG     HighBitSet;
-                ULONG     ThreeK;
-
-            } TOKEN_INTEGRITY_LEVEL;
-
-#include "poppack.h"
-
-            if (TokenInformationLength >= sizeof(TOKEN_INTEGRITY_LEVEL)) {
-
-                TOKEN_INTEGRITY_LEVEL *Info =
-                    (TOKEN_INTEGRITY_LEVEL *)TokenInformation;
-
-                Info->Pointer = (ULONG_PTR)TokenInformation
-                    + sizeof(ULONG_PTR) * 2;
-                Info->Sixty = 0x60;
-                Info->OneOhOne = 0x101;
-                Info->HighBitSet = 0x10000000;
-                Info->ThreeK = 0x3000;
-
-                if (ReturnLength)
-                    *ReturnLength = sizeof(TOKEN_INTEGRITY_LEVEL);
+    WCHAR buf[128];
+    ULONG index = 0;
+    while (1) { // for each setting
+        NTSTATUS status = SbieApi_QueryConfAsIs(NULL, L"DllSkipHook", index, buf, sizeof(buf));
+        ++index;
+        if (NT_SUCCESS(status)) {
+            DLL *dll = Ldr_Dlls;
+            while (dll->nameW) { // find dll entry
+                if (_wcsicmp(buf, dll->nameW) == 0) {
+                    dll->state |= 2;
+                    break;
+                }
+                ++dll;
             }
         }
+        else if (status != STATUS_BUFFER_TOO_SMALL)
+            break;
     }
-
-    return status;
 }
 
-_FX NTSTATUS Ldr_NtQuerySecurityAttributesToken(HANDLE TokenHandle, PUNICODE_STRING Attributes, ULONG NumberOfAttributes, PVOID Buffer, ULONG Length, PULONG ReturnLength)
+
+//---------------------------------------------------------------------------
+// SbieDll_IsDllSkipHook
+//---------------------------------------------------------------------------
+
+
+_FX BOOLEAN SbieDll_IsDllSkipHook(const WCHAR* ImageName)
 {
-    NTSTATUS status = 0;
-    HANDLE hTokenReal = NULL;
-
-    Ldr_TestToken(TokenHandle, &hTokenReal);
-
-    status = __sys_NtQuerySecurityAttributesToken(hTokenReal ? hTokenReal : TokenHandle, Attributes, NumberOfAttributes, Buffer, Length, ReturnLength);
-
-    if (hTokenReal) {
-        NtClose(hTokenReal);
+    DLL *dll = Ldr_Dlls;
+    while (dll->nameW) {
+        if (_wcsicmp(ImageName, dll->nameW) == 0)
+            return (dll->state & 2) != 0;
+        ++dll;
     }
-    return status;
+    return FALSE;
 }
 
-NTSTATUS Ldr_NtAccessCheckByType(PSECURITY_DESCRIPTOR SecurityDescriptor, PSID PrincipalSelfSid, HANDLE ClientToken, ACCESS_MASK DesiredAccess, POBJECT_TYPE_LIST ObjectTypeList, ULONG ObjectTypeListLength, PGENERIC_MAPPING GenericMapping, PPRIVILEGE_SET PrivilegeSet, PULONG PrivilegeSetLength, PACCESS_MASK GrantedAccess, PNTSTATUS AccessStatus)
-{
-    NTSTATUS rc;
-    HANDLE hTokenReal = NULL;
-
-    if (Dll_ImageType == DLL_IMAGE_SANDBOXIE_BITS ||
-        Dll_ImageType == DLL_IMAGE_SANDBOXIE_WUAU ||
-        Dll_ImageType == DLL_IMAGE_WUAUCLT) {
-        *GrantedAccess = 0xFFFFFFFF;
-        *AccessStatus = TRUE;
-        SetLastError(0);
-        return TRUE;
-    }
-
-    Ldr_TestToken(ClientToken, &hTokenReal);
-
-    rc = __sys_NtAccessCheckByType(SecurityDescriptor, PrincipalSelfSid, hTokenReal ? hTokenReal : ClientToken, DesiredAccess, ObjectTypeList, ObjectTypeListLength, GenericMapping, PrivilegeSet, PrivilegeSetLength, GrantedAccess, AccessStatus);
-
-    if (hTokenReal) {
-        NtClose(hTokenReal);
-    }
-
-    return rc;
-}
-
-
-_FX NTSTATUS Ldr_NtAccessCheck(PSECURITY_DESCRIPTOR SecurityDescriptor, HANDLE ClientToken, ACCESS_MASK DesiredAccess, PGENERIC_MAPPING GenericMapping, PPRIVILEGE_SET RequiredPrivilegesBuffer, PULONG BufferLength, PACCESS_MASK GrantedAccess, PNTSTATUS AccessStatus)
-{
-    NTSTATUS status = 0;
-    HANDLE hTokenReal = NULL;
-
-    Ldr_TestToken(ClientToken, &hTokenReal);
-    status = __sys_NtAccessCheck(SecurityDescriptor, hTokenReal ? hTokenReal : ClientToken, DesiredAccess, GenericMapping, RequiredPrivilegesBuffer, BufferLength, GrantedAccess, AccessStatus);
-    if (hTokenReal) {
-        NtClose(hTokenReal);
-    }
-    return status;
-}
-
-_FX NTSTATUS Ldr_NtAccessCheckByTypeResultList(PSECURITY_DESCRIPTOR SecurityDescriptor, PSID PrincipalSelfSid, HANDLE ClientToken, ACCESS_MASK  DesiredAccess, POBJECT_TYPE_LIST ObjectTypeList, ULONG ObjectTypeListLength, PGENERIC_MAPPING GenericMapping, PPRIVILEGE_SET    PrivilegeSet, PULONG PrivilegeSetLength, PACCESS_MASK   GrantedAccess, PNTSTATUS    AccessStatus)
-{
-    NTSTATUS status = 0;
-    HANDLE hTokenReal = NULL;
-
-    Ldr_TestToken(ClientToken, &hTokenReal);
-
-    status = __sys_NtAccessCheckByTypeResultList(SecurityDescriptor, PrincipalSelfSid, ClientToken, DesiredAccess, ObjectTypeList, ObjectTypeListLength, GenericMapping, PrivilegeSet, PrivilegeSetLength, GrantedAccess, AccessStatus);
-
-    if (hTokenReal) {
-        NtClose(hTokenReal);
-    }
-    return status;
-}
-
-BOOL Ldr_NtOpenThreadToken(HANDLE ThreadHandle, DWORD  DesiredAccess, BOOL    OpenAsSelf, PHANDLE TokenHandle)
-{
-    BOOL rc;
-
-    rc = __sys_NtOpenThreadToken(ThreadHandle, DesiredAccess, OpenAsSelf, TokenHandle);
-    if (rc == STATUS_ACCESS_DENIED && OpenAsSelf) {
-        rc = __sys_NtOpenThreadToken(ThreadHandle, DesiredAccess, 0, TokenHandle);
-    }
-    return rc;
-}
-
-BOOL Ldr_RtlEqualSid(void * sid1, void * sid2)
-{
-    if (!sid1 || !sid2) {
-        return FALSE;
-    }
-    return __sys_RtlEqualSid(sid1, sid2);
-}

@@ -551,7 +551,7 @@ _FX void BuildMenu(HMENU hMenu, MENU_DIR *menu, WCHAR *fullpath)
     static WCHAR title[128];
     static WCHAR *_explore = NULL;
     static WCHAR *_cancel = NULL;
-    WCHAR boxname[64];
+    WCHAR boxname[BOXNAME_COUNT];
     MENUINFO menuinfo;
     MENUITEMINFO mii;
     BOOLEAN separator;
@@ -671,7 +671,14 @@ _FX void ScanFolder(MENU_DIR *menu, WCHAR *path, UCHAR source)
         BOOLEAN boxed = FALSE;
 
         if (wcscmp(data.cFileName, L".") != 0 &&
-            wcscmp(data.cFileName, L"..") != 0) {
+            wcscmp(data.cFileName, L"..") != 0 &&
+            // OneDrive On-Demand feature set both FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+            // and FILE_ATTRIBUTE_UNPINNED, to determine an expensive call, it should detect
+            // flags: FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN |
+            // FILE_ATTRIBUTE_OFFLINE.
+            //
+            // This filter only considers the intersection
+            (data.dwFileAttributes & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) == 0) {
 
             wcscpy(path_end + 1, data.cFileName);
 
@@ -721,7 +728,7 @@ _FX void ScanFolder(MENU_DIR *menu, WCHAR *path, UCHAR source)
 
                     MENU_ITEM *menu_item;
                     wcscpy(path_end + 1, data.cFileName);
-                    *ptr = L'\0';
+                    //*ptr = L'\0';
                     menu_item = Insert_MENU_ITEM(
                                     menu, data.cFileName, path, source);
                     if (menu_item)

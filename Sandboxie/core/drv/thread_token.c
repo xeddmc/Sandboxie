@@ -106,7 +106,7 @@ static NTSTATUS Thread_ImpersonateAnonymousToken(
 //---------------------------------------------------------------------------
 
 
-static NTSTATUS Thread_GetKernelHandleForUserHandle(
+NTSTATUS Thread_GetKernelHandleForUserHandle(
     HANDLE *OutKernelHandle, HANDLE InUserHandle);
 
 
@@ -319,8 +319,15 @@ _FX NTSTATUS Thread_SetInformationProcess(
     PROCESS *proc, SYSCALL_ENTRY *syscall_entry, ULONG_PTR *user_args)
 {
     NTSTATUS status;
+
+    ULONG InfoClass = (ULONG)user_args[1];
+
+    if (InfoClass == ProcessBreakOnTermination) {
+        
+        status = STATUS_ACCESS_DENIED;
+    
     //Windows RS5 adds a new "undocumented" Process Information class: 0x5d (93) that is likely ProcessAccessTokenEx
-    if (((user_args[1] == ProcessAccessToken) || (user_args[1] == ProcessAccessTokenEx)) && proc->primary_token) {
+    } else if (((InfoClass == ProcessAccessToken) || (InfoClass == ProcessAccessTokenEx)) && proc->primary_token) {
         HANDLE ProcessHandle = (HANDLE)user_args[0];
         void  *InfoBuffer    = (void *)user_args[2];
         ULONG  InfoLength    = (ULONG)user_args[3];
@@ -640,11 +647,11 @@ _FX void *Thread_SetInformationProcess_PrimaryToken_3(
     }
 
     //
-    // special allowance for MSIServer
+    // special allowance for MSIServer running without system privileges
     //
 
     if (!proc->image_from_box &&
-        _wcsicmp(proc->image_name, L"msiexec.exe") == 0) {
+            _wcsicmp(proc->image_name, L"msiexec.exe") == 0) {
 
         return TokenObject2;
     }
@@ -1151,7 +1158,11 @@ _FX NTSTATUS Thread_SetInformationThread(
 
     ULONG InfoClass = (ULONG)user_args[1];
 
-    if (InfoClass == ThreadImpersonationToken && proc->primary_token) {
+    if (InfoClass == ThreadBreakOnTermination){
+
+        status = STATUS_ACCESS_DENIED;
+
+    } else if (InfoClass == ThreadImpersonationToken && proc->primary_token) {
 
         HANDLE ThreadHandle  = (HANDLE)user_args[0];
         void  *InfoBuffer    = (void *)user_args[2];
@@ -1355,14 +1366,14 @@ _FX NTSTATUS Thread_CheckTokenForImpersonation(
 {
     NTSTATUS status;
 
-	// OpenToken BEGIN
-	if ((Conf_Get_Boolean(proc->box->name, L"OpenToken", 0, FALSE) || Conf_Get_Boolean(proc->box->name, L"UnfilteredToken", 0, FALSE)))
-		return STATUS_SUCCESS;
-	// OpenToken END
-	// OriginalToken BEGIN
-	if (Conf_Get_Boolean(proc->box->name, L"OriginalToken", 0, FALSE))
+    // OriginalToken BEGIN
+	if (proc->bAppCompartment || Conf_Get_Boolean(proc->box->name, L"OriginalToken", 0, FALSE))
 		return STATUS_SUCCESS;
 	// OriginalToken END
+	// UnfilteredToken BEGIN
+	if (Conf_Get_Boolean(proc->box->name, L"UnfilteredToken", 0, FALSE))
+		return STATUS_SUCCESS;
+	// UnfilteredToken END
 
 	BOOLEAN DropRights = proc->drop_rights;
 	ULONG SessionId = proc->box->session_id;
@@ -1467,8 +1478,7 @@ _FX NTSTATUS Thread_SetInformationThread_ChangeNotifyToken(PROCESS *proc)
         //
 
         FilteredTokenObject = Token_Restrict(
-                CurrentToken, DISABLE_MAX_PRIVILEGE, NULL,
-                proc);
+                CurrentToken, DISABLE_MAX_PRIVILEGE, proc);
 
         ObDereferenceObject(CurrentToken);
 
@@ -1594,7 +1604,7 @@ _FX NTSTATUS Thread_CheckTokenObject(
     //
     // this function is called from Syscall_DuplicateHandle_2 to check
     // access granted to a token object.  if none of the special permissions
-    // were requested, we can immmediately approve the request
+    // were requested, we can immediately approve the request
     //
 
     if (! (GrantedAccess & TOKEN_DENIED_ACCESS_MASK))

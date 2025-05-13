@@ -1,6 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
- * Copyright 2020-2021 David Xanatos, xanasoft.com
+ * Copyright 2020-2023 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -66,6 +66,10 @@ static NTSTATUS SysInfo_NtCreateJobObject(
     HANDLE *JobHandle, ACCESS_MASK DesiredAccess,
     OBJECT_ATTRIBUTES *ObjectAttributes);
 
+static NTSTATUS SysInfo_NtOpenJobObject(
+    HANDLE *JobHandle, ACCESS_MASK DesiredAccess,
+    OBJECT_ATTRIBUTES *ObjectAttributes);
+
 static NTSTATUS SysInfo_NtAssignProcessToJobObject(
     HANDLE JobHandle, HANDLE ProcessHandle);
 
@@ -94,6 +98,7 @@ static P_SetLocaleInfo              __sys_SetLocaleInfoW            = NULL;
 static P_SetLocaleInfo              __sys_SetLocaleInfoA            = NULL;
 
 static P_NtCreateJobObject          __sys_NtCreateJobObject         = NULL;
+static P_NtOpenJobObject            __sys_NtOpenJobObject           = NULL;
 static P_NtAssignProcessToJobObject __sys_NtAssignProcessToJobObject = NULL;
 static P_NtSetInformationJobObject  __sys_NtSetInformationJobObject = NULL;
 
@@ -107,6 +112,8 @@ static P_NtTraceEvent  __sys_NtTraceEvent = NULL;
 
 static ULONG_PTR *SysInfo_JobCallbackData = NULL;
 
+BOOLEAN SysInfo_UseSbieJob = FALSE;
+BOOLEAN SysInfo_CanUseJobs = FALSE;
 
 //---------------------------------------------------------------------------
 // SysInfo_Init
@@ -115,6 +122,8 @@ static ULONG_PTR *SysInfo_JobCallbackData = NULL;
 
 _FX BOOLEAN SysInfo_Init(void)
 {
+    HMODULE module = Dll_Ntdll;
+
     void *NtTraceEvent;
 
     if (! Dll_SkipHook(L"ntqsi")) {
@@ -122,16 +131,27 @@ _FX BOOLEAN SysInfo_Init(void)
         SBIEDLL_HOOK(SysInfo_,NtQuerySystemInformation);
     }
 
+    extern BOOLEAN Gui_OpenAllWinClasses;
+    SysInfo_UseSbieJob = !Gui_OpenAllWinClasses && !SbieApi_QueryConfBool(NULL, L"NoAddProcessToJob", FALSE);
+
+    if (Dll_OsBuild >= 8400)
+        SysInfo_CanUseJobs = SbieApi_QueryConfBool(NULL, L"AllowBoxedJobs", FALSE);
+
     SBIEDLL_HOOK(SysInfo_, NtCreateJobObject);
-    if (!SbieApi_QueryConfBool(NULL, L"NoAddProcessToJob", FALSE)) 
-    {
-        SBIEDLL_HOOK(SysInfo_, NtAssignProcessToJobObject);
+    SBIEDLL_HOOK(SysInfo_, NtOpenJobObject);
+    if (SysInfo_UseSbieJob) {
+        if (!SysInfo_CanUseJobs) {
+            SBIEDLL_HOOK(SysInfo_, NtAssignProcessToJobObject);
+        }
         SBIEDLL_HOOK(SysInfo_, NtSetInformationJobObject);
     }
 
+    {
+        HMODULE module = Dll_Kernel32;
 
-    SBIEDLL_HOOK(SysInfo_,SetLocaleInfoW);
-    SBIEDLL_HOOK(SysInfo_,SetLocaleInfoA);
+        SBIEDLL_HOOK(SysInfo_, SetLocaleInfoW);
+        SBIEDLL_HOOK(SysInfo_, SetLocaleInfoA);
+    }
 
     //
     // we don't want to hook NtTraceEvent in kernel mode
@@ -167,6 +187,22 @@ _FX BOOLEAN SysInfo_Init(void)
 // SysInfo_NtQuerySystemInformation
 //---------------------------------------------------------------------------
 
+typedef struct _SYSTEM_FIRMWARE_TABLE_INFORMATION {
+    ULONG ProviderSignature;
+    ULONG Action;
+    ULONG TableID;
+    ULONG TableBufferLength;
+    UCHAR TableBuffer[ANYSIZE_ARRAY];
+} SYSTEM_FIRMWARE_TABLE_INFORMATION, *PSYSTEM_FIRMWARE_TABLE_INFORMATION;
+
+#define FIRMWARE_TABLE_PROVIDER_ACPI  'ACPI'
+#define FIRMWARE_TABLE_PROVIDER_SMBIOS 'RSMB'
+#define FIRMWARE_TABLE_PROVIDER_FIRM   'FIRM'
+
+typedef enum _SYSTEM_FIRMWARE_TABLE_ACTION {
+    SystemFirmwareTable_Enumerate,
+    SystemFirmwareTable_Get
+} SYSTEM_FIRMWARE_TABLE_ACTION;
 
 _FX NTSTATUS SysInfo_NtQuerySystemInformation(
     SYSTEM_INFORMATION_CLASS SystemInformationClass,
@@ -175,6 +211,66 @@ _FX NTSTATUS SysInfo_NtQuerySystemInformation(
     ULONG *ReturnLength)
 {
     NTSTATUS status;
+
+    if ((SystemInformationClass == SystemFirmwareTableInformation) && SbieApi_QueryConfBool(NULL, L"HideFirmwareInfo", FALSE)) {
+
+        PSYSTEM_FIRMWARE_TABLE_INFORMATION firmwareTableInfo = (PSYSTEM_FIRMWARE_TABLE_INFORMATION)Buffer;
+
+        if (firmwareTableInfo->ProviderSignature == FIRMWARE_TABLE_PROVIDER_SMBIOS && firmwareTableInfo->Action == SystemFirmwareTable_Get) {
+
+            typedef LSTATUS(*RegOpenKeyExW_t)(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult);
+            typedef LSTATUS(*RegQueryValueExW_t)(HKEY hKey, LPCWSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData);
+            typedef LSTATUS(*RegCloseKey_t)(HKEY hKey);
+
+            HMODULE advapi32 = LoadLibraryW(DllName_advapi32);
+            if (!advapi32) return STATUS_UNSUCCESSFUL;
+
+            RegOpenKeyExW_t RegOpenKeyExW = (RegOpenKeyExW_t)GetProcAddress(advapi32, "RegOpenKeyExW");
+            RegQueryValueExW_t RegQueryValueExW = (RegQueryValueExW_t)GetProcAddress(advapi32, "RegQueryValueExW");
+            RegCloseKey_t RegCloseKey = (RegCloseKey_t)GetProcAddress(advapi32, "RegCloseKey");
+
+            if (!RegOpenKeyExW || !RegQueryValueExW || !RegCloseKey) {
+                FreeLibrary(advapi32);
+                return STATUS_UNSUCCESSFUL;
+            }
+
+            HKEY hKey = NULL;
+            DWORD dwLen = 0x10000;
+            PVOID lpData = Dll_AllocTemp(dwLen);
+            if (!lpData) {
+                FreeLibrary(advapi32);
+                return STATUS_UNSUCCESSFUL;
+            }
+
+            DWORD type = 0;
+            // if not set we return no information, 0 length
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, L"System\\SbieCustom", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                if (RegQueryValueExW(hKey, L"SMBiosTable", NULL, &type, (LPBYTE)lpData, &dwLen) != ERROR_SUCCESS) {
+                    dwLen = 0; // In case of failure, reset the length
+                }
+                RegCloseKey(hKey);
+            }
+
+            *ReturnLength = dwLen;
+            if (dwLen > 0) {
+                if (dwLen + sizeof(SYSTEM_FIRMWARE_TABLE_INFORMATION) > BufferLength) {
+                    status = STATUS_BUFFER_TOO_SMALL;
+                    goto cleanup;
+                }
+
+                firmwareTableInfo->TableBufferLength = dwLen;
+                memcpy(firmwareTableInfo->TableBuffer, lpData, dwLen);
+            }
+
+            status = STATUS_SUCCESS;
+
+        cleanup:
+            Dll_Free(lpData);
+            FreeLibrary(advapi32);
+
+            return status;
+        }
+    }
 
     status = __sys_NtQuerySystemInformation(
         SystemInformationClass, Buffer, BufferLength, ReturnLength);
@@ -192,6 +288,55 @@ _FX NTSTATUS SysInfo_NtQuerySystemInformation(
 
 
 //---------------------------------------------------------------------------
+// Sysinfo_IsTokenAnySid
+//---------------------------------------------------------------------------
+
+BOOL Terminal_WTSQueryUserToken(ULONG SessionId, HANDLE* pToken);
+
+_FX BOOL Sysinfo_IsTokenAnySid(HANDLE hToken,WCHAR* compare)
+{
+	NTSTATUS status;
+	BOOLEAN return_value = FALSE;
+
+	ULONG64 user_space[88];
+	PTOKEN_USER user = (PTOKEN_USER)user_space;
+	ULONG len;
+
+	len = sizeof(user_space);
+	status = NtQueryInformationToken(
+		hToken, TokenUser, user, len, &len);
+
+	if (status == STATUS_BUFFER_TOO_SMALL) {
+
+		user = Dll_AllocTemp(len);
+		status = NtQueryInformationToken(
+			hToken, TokenUser, user, len, &len);
+	}
+
+	if (NT_SUCCESS(status)) {
+
+		UNICODE_STRING SidString;
+
+		status = RtlConvertSidToUnicodeString(
+			&SidString, user->User.Sid, TRUE);
+
+		if (NT_SUCCESS(status)) {
+
+			if (_wcsicmp(SidString.Buffer, /*L"S-1-5-18" */compare ) == 0)
+				return_value = TRUE;
+
+			RtlFreeUnicodeString(&SidString);
+		}
+	}
+
+	if (user != (PTOKEN_USER)user_space)
+		Dll_Free(user);
+
+	return return_value;
+}
+
+
+//---------------------------------------------------------------------------
 // SysInfo_DiscardProcesses
 //---------------------------------------------------------------------------
 
@@ -200,14 +345,19 @@ _FX void SysInfo_DiscardProcesses(SYSTEM_PROCESS_INFORMATION *buf)
 {
     SYSTEM_PROCESS_INFORMATION *curr = buf;
     SYSTEM_PROCESS_INFORMATION *next;
-    WCHAR boxname[48];
+    WCHAR boxname[BOXNAME_COUNT];
 
 	BOOL hideOther = SbieApi_QueryConfBool(NULL, L"HideOtherBoxes", TRUE);
+    BOOL hideNonSys = SbieApi_QueryConfBool(NULL, L"HideNonSystemProcesses", FALSE);
+    BOOL hideSbie = SbieApi_QueryConfBool(NULL, L"HideSbieProcesses", FALSE);
 
 	WCHAR* hiddenProcesses = NULL;
 	WCHAR* hiddenProcessesPtr = NULL;
-	ULONG hiddenProcessesLen = 100 * 110; // we can hide up to 100 processes, sould be enough
+	ULONG hiddenProcessesLen = 100 * 110; // we can hide up to 100 processes, should be enough
 	WCHAR hiddenProcess[110];
+
+	WCHAR tempSid[96] = {0};
+    ULONG tempSession = 0;
 
 	for (ULONG index = 0; ; ++index) {
 		NTSTATUS status = SbieApi_QueryConfAsIs(NULL, L"HideHostProcess", index, hiddenProcess, 108 * sizeof(WCHAR));
@@ -241,21 +391,32 @@ _FX void SysInfo_DiscardProcesses(SYSTEM_PROCESS_INFORMATION *buf)
         next = (SYSTEM_PROCESS_INFORMATION *) (((UCHAR *)curr) + curr->NextEntryOffset);
         if (next == curr)
             break;
+		
+        WCHAR* imagename = NULL;
+        if (next->ImageName.Buffer) {
+            imagename = wcschr(next->ImageName.Buffer, L'\\');
+			if (imagename)  imagename += 1; // skip L'\\'
+			else			imagename = next->ImageName.Buffer;
+        }
 
-		SbieApi_QueryProcess(next->UniqueProcessId, boxname, NULL, NULL, NULL);
-
+		SbieApi_QueryProcess(next->UniqueProcessId, boxname, NULL, tempSid, &tempSession);
 		BOOL hideProcess = FALSE;
-		if (hideOther) {
-			if(boxname[0] && _wcsicmp(boxname, Dll_BoxName) != 0)
-				hideProcess = TRUE;
-		}
+        if (hideNonSys && !*boxname
+          && _wcsnicmp(tempSid, L"S-1-5-18", 8) != 0
+          && _wcsnicmp(tempSid, L"S-1-5-80", 8) != 0
+          && _wcsnicmp(tempSid, L"S-1-5-20", 8) != 0
+          && _wcsnicmp(tempSid, L"S-1-5-6", 7) != 0) {
+            hideProcess = TRUE;
+        }
+        else if (hideOther && *boxname && _wcsicmp(boxname, Dll_BoxName) != 0) {
+            hideProcess = TRUE;
+        }
+        else if (hideSbie && imagename && (_wcsnicmp(imagename, L"Sandboxie", 9) == 0 || _wcsnicmp(imagename, L"Sbie", 4) == 0)) {
+            hideProcess = TRUE;
+        }
+		else if(hiddenProcesses && imagename) {
 
-		if(hiddenProcesses) {
-			if ((!boxname[0]) && next->ImageName.Buffer) {
-				WCHAR* imagename = wcschr(next->ImageName.Buffer, L'\\');
-				if (imagename)  imagename += 1; // skip L'\\'
-				else			imagename = next->ImageName.Buffer;
-
+			if (!*boxname || _wcsnicmp(imagename, L"Sandboxie", 9) == 0) {
 				for (hiddenProcessesPtr = hiddenProcesses; *hiddenProcessesPtr != L'\0'; hiddenProcessesPtr += wcslen(hiddenProcessesPtr) + 1) {
 					if (_wcsicmp(imagename, hiddenProcessesPtr) == 0) {
 						hideProcess = TRUE;
@@ -376,6 +537,67 @@ _FX void *SysInfo_QueryProcesses(ULONG *out_len)
 
 
 //---------------------------------------------------------------------------
+// SysInfo_GetJobName
+//---------------------------------------------------------------------------
+
+
+_FX NTSTATUS SysInfo_GetJobName(OBJECT_ATTRIBUTES* ObjectAttributes, WCHAR** OutCopyPath)
+{
+    THREAD_DATA *TlsData = Dll_GetTlsData(NULL);
+
+    WCHAR *name;
+    ULONG objname_len;
+    WCHAR *objname_buf;
+    static volatile ULONG JobCounter = 0;
+    WCHAR dummy_name[MAX_PATH];
+
+    *OutCopyPath = NULL;
+
+    if (ObjectAttributes && ObjectAttributes->ObjectName) {
+        objname_len = ObjectAttributes->ObjectName->Length & ~1;
+        objname_buf = ObjectAttributes->ObjectName->Buffer;
+    } else {
+
+        ULONG jobCounter = InterlockedIncrement(&JobCounter);
+        Sbie_snwprintf(dummy_name, MAX_PATH, L"%s_DummyJob_%s_p%d_t%d_c%d",
+                        SBIE, Dll_ImageName, GetCurrentProcessId(), GetCurrentThreadId(), jobCounter);
+        
+        objname_len = wcslen(dummy_name);
+        objname_buf = dummy_name;
+    }
+
+
+    name = Dll_GetTlsNameBuffer(TlsData, COPY_NAME_BUFFER, Dll_BoxIpcPathLen + objname_len);
+
+    *OutCopyPath = name;
+
+    //if (Dll_AlernateIpcNaming)
+    //{
+    //    wmemcpy(name, objname_buf, objname_len);
+    //    name += objname_len;
+    //
+    //    wmemcpy(name, Dll_BoxIpcPath, Dll_BoxIpcPathLen);
+    //    name += Dll_BoxIpcPathLen;
+    //}
+    //else
+    {
+        wmemcpy(name, Dll_BoxIpcPath, Dll_BoxIpcPathLen);
+        name += Dll_BoxIpcPathLen;
+
+        *name = L'\\';
+        name++;
+
+        wmemcpy(name, objname_buf, objname_len);
+        name += objname_len;
+    }
+
+    *name = L'\0';
+
+    return STATUS_SUCCESS;
+}
+
+
+//---------------------------------------------------------------------------
 // SysInfo_NtCreateJobObject
 //---------------------------------------------------------------------------
 
@@ -384,48 +606,56 @@ _FX NTSTATUS SysInfo_NtCreateJobObject(
     HANDLE *JobHandle, ACCESS_MASK DesiredAccess,
     OBJECT_ATTRIBUTES *ObjectAttributes)
 {
-    static volatile ULONG _JobCounter = 0;
+    NTSTATUS status;
     OBJECT_ATTRIBUTES objattrs;
     UNICODE_STRING objname;
-    WCHAR *jobname;
-    ULONG jobname_len;
-    NTSTATUS status;
+    WCHAR* CopyPath;
 
     //
     // the driver requires us to specify a sandboxed path name to a
     // job object, and to not request some specific rights
     //
 
-    if (!SbieApi_QueryConfBool(NULL, L"NoAddProcessToJob", FALSE))
+    if(!SysInfo_CanUseJobs && SysInfo_UseSbieJob)
         DesiredAccess &= ~(JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_TERMINATE);
 
-    jobname_len = Dll_BoxIpcPathLen + wcslen(Dll_ImageName) + 64;
-    jobname = Dll_AllocTemp(jobname_len * sizeof(WCHAR));
-
-    while (1) {
-
-        InterlockedIncrement(&_JobCounter);
-        Sbie_snwprintf(jobname, jobname_len, L"%s\\%s_DummyJob_%s_%d",
-                        Dll_BoxIpcPath, SBIE, Dll_ImageName, _JobCounter);
-        RtlInitUnicodeString(&objname, jobname);
-
-        InitializeObjectAttributes(&objattrs,
-            &objname, OBJECT_ATTRIBUTES_ATTRIBUTES, NULL, Secure_EveryoneSD);
-
-        status = __sys_NtCreateJobObject(
-                                JobHandle, DesiredAccess, &objattrs);
-
-        //
-        // we always start each process with _JobCounter = 0 so we have to
-        // account for the case where a dummy job object was already created
-        // by another process, and not fail the request
-        //
-
-        if (status != STATUS_OBJECT_NAME_COLLISION)
-            break;
+    if (NT_SUCCESS(SysInfo_GetJobName(ObjectAttributes, &CopyPath))) {
+        RtlInitUnicodeString(&objname, CopyPath);
+        InitializeObjectAttributes(&objattrs, &objname, OBJECT_ATTRIBUTES_ATTRIBUTES, NULL, Secure_EveryoneSD);
+        ObjectAttributes = &objattrs;
     }
 
-    Dll_Free(jobname);
+    status = __sys_NtCreateJobObject(JobHandle, DesiredAccess, ObjectAttributes);
+
+    return status;
+}
+
+
+//---------------------------------------------------------------------------
+// SysInfo_NtCreateJobObject
+//---------------------------------------------------------------------------
+
+
+_FX NTSTATUS SysInfo_NtOpenJobObject(
+    HANDLE* JobHandle, ACCESS_MASK DesiredAccess,
+    OBJECT_ATTRIBUTES* ObjectAttributes)
+{
+    NTSTATUS status;
+    OBJECT_ATTRIBUTES objattrs;
+    UNICODE_STRING objname;
+    WCHAR* CopyPath;
+
+    if(!SysInfo_CanUseJobs && SysInfo_UseSbieJob)
+        DesiredAccess &= ~(JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_TERMINATE);
+
+    if (NT_SUCCESS(SysInfo_GetJobName(ObjectAttributes, &CopyPath))) {
+        RtlInitUnicodeString(&objname, CopyPath);
+        InitializeObjectAttributes(&objattrs, &objname, OBJECT_ATTRIBUTES_ATTRIBUTES, NULL, Secure_EveryoneSD);
+        ObjectAttributes = &objattrs;
+    }
+
+    status = __sys_NtOpenJobObject(JobHandle, DesiredAccess, ObjectAttributes);
+
     return status;
 }
 
@@ -461,14 +691,27 @@ _FX NTSTATUS SysInfo_NtSetInformationJobObject(
     HANDLE JobHandle, JOBOBJECTINFOCLASS JobObjectInformationClass,
     void *JobObjectInformtion, ULONG JobObjectInformtionLength)
 {
+    //
+    // Since Windows 8, we can have nested jobs, i.e. we can have all sandboxed processes 
+    // be part of the box isolation job and, for example, also part of a Chrome sandbox job.
+    // However, for both jobs we can not specify UIRestrictions. Since our own job already
+    // specified those restrictions, we do not allow a boxed process to specify its own.
+    //
+
+    if (SysInfo_CanUseJobs && JobObjectInformationClass == JobObjectBasicUIRestrictions)
+        return STATUS_SUCCESS;
+
     NTSTATUS status = __sys_NtSetInformationJobObject(
         JobHandle, JobObjectInformationClass,
         JobObjectInformtion, JobObjectInformtionLength);
 
+    if(SysInfo_CanUseJobs)
+        return status;
+
     if (NT_SUCCESS(status) &&
             JobObjectInformationClass ==
                     JobObjectAssociateCompletionPortInformation) {
-
+    
         SysInfo_JobCallbackData_Set(NULL, JobObjectInformtion);
     }
 

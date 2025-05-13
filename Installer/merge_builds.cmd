@@ -2,9 +2,16 @@
 
 call %~dp0get_openssl.cmd
 
-call %~dp0copy_build.cmd x64
+call %~dp0get_7zip.cmd
 
-call %~dp0copy_build.cmd x86
+REM Moved to main.yml
+REM call %~dp0fix_qt5_languages.cmd
+
+cmd.exe /c %~dp0copy_build.cmd x64
+
+cmd.exe /c %~dp0copy_build.cmd ARM64
+
+cmd.exe /c %~dp0copy_build.cmd x86
 
 
 REM mkdir %rootPath%\SbiePlus64\LogAPI

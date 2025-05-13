@@ -96,7 +96,7 @@ typedef struct _COM_SLAVE {
     LIST_ELEM list_elem;
 
     WCHAR SidString[96];
-    WCHAR BoxName[48];
+    WCHAR BoxName[BOXNAME_COUNT];
     ULONG SessionId;
     BOOLEAN IsWow64;
 
@@ -135,8 +135,6 @@ typedef struct _COM_OBJECT {
 //---------------------------------------------------------------------------
 
 
-typedef BOOL (*P_IsWow64Process)(HANDLE, BOOL *);
-
 
 //---------------------------------------------------------------------------
 // Variables
@@ -156,8 +154,6 @@ static const GUID IID_IWbemClassObject = {
     0xDC12A681, 0x737F, 0x11CF,
                     { 0x88, 0x4D, 0x00, 0xAA, 0x00, 0x4B, 0x2E, 0x24 } };
 
-P_IsWow64Process pIsWow64Process = NULL;
-
 
 //---------------------------------------------------------------------------
 // Constructor
@@ -171,14 +167,13 @@ ComServer::ComServer(PipeServer *pipeServer)
     InitializeCriticalSection(&m_SlavesLock);
     List_Init(&m_SlavesList);
 
-#ifdef _WIN64
-
-    pIsWow64Process = (P_IsWow64Process)
-                            GetProcAddress(_Kernel32, "IsWow64Process");
-
-#endif _WIN64
-
     pipeServer->Register(MSGID_COM, this, Handler);
+}
+
+ComServer::~ComServer()
+{
+	// cleanup CS
+	DeleteCriticalSection(&m_SlavesLock);
 }
 
 
@@ -280,7 +275,7 @@ MSG_HEADER *ComServer::GetClassObjectHandler(
         exc = 0;
         pMap->ProcNum = 0;
         if (req->elevate) {
-            if (CheckDropRights(slave->BoxName))
+            if (CheckDropRights(slave->BoxName, NULL))
                 exc = ERROR_ELEVATION_REQUIRED;
             else
                 pMap->ProcNum = 1;
@@ -683,7 +678,7 @@ void *ComServer::LockSlave(HANDLE idProcess, ULONG msgid)
     ULONG session_id;
     union {
         struct {
-            WCHAR boxname[48];
+            WCHAR boxname[BOXNAME_COUNT];
             WCHAR sid[96];
         } s;
         WCHAR path[192];
@@ -707,36 +702,12 @@ void *ComServer::LockSlave(HANDLE idProcess, ULONG msgid)
 
 #ifdef _WIN64
 
-    if (pIsWow64Process) {
-
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
-                                      FALSE, (ULONG)(ULONG_PTR)idProcess);
-        if (hProcess) {
-
-            BOOL xwow64 = FALSE;
-            if (pIsWow64Process(hProcess, &xwow64) && xwow64) {
-
-                IsWow64 = TRUE;
-            }
-
-            CloseHandle(hProcess);
+    IsWow64 = IsProcessWoW64(idProcess);
 
 #ifdef DEBUG_COMSERVER
-            WCHAR txt[256]; wsprintf(txt, L"LockSlave     idProcess=%d Wow64=%d msgid=%X\n", idProcess, IsWow64, msgid);
-            OutputDebugString(txt);
+    WCHAR txt[256]; wsprintf(txt, L"LockSlave     idProcess=%d Wow64=%d msgid=%X\n", idProcess, IsWow64, msgid);
+    OutputDebugString(txt);
 #endif
-        }
-
-#ifdef DEBUG_COMSERVER
-        else {
-
-            WCHAR txt[256]; wsprintf(txt, L"LockSlave     Cannot determine wow64ness for idProcess=%d\n", idProcess);
-            OutputDebugString(txt);
-        }
-#endif
-
-    }
-
 #endif _WIN64
 
     //
@@ -1377,7 +1348,7 @@ void ComServer::RunSlave(const WCHAR *cmdline)
     // locate IPC objects set up by the parent process SbieSvc
     //
 
-    if (wcslen(cmdline) > 100)
+    if (wcslen(cmdline) > 128)
         return;
 
     if (wcsstr(cmdline, SANDBOXIE L"_ComProxy_ComServer:")) {
@@ -1394,7 +1365,7 @@ void ComServer::RunSlave(const WCHAR *cmdline)
         return;
     }
 
-    WCHAR objname[192];
+    WCHAR objname[256];
     wcscpy(objname, _Global);
     wcscat(objname, cmdline);
     WCHAR *colon = wcsrchr(objname, L':');
@@ -1684,7 +1655,7 @@ void ComServer::DeleteSlaveObject(void *_obj, LIST *ObjectsList)
     while (obj2) {
         if (obj2->pUnknown == obj->pUnknown)
             ++objcount;
-        obj2 = (COM_OBJECT *)List_Next(obj2);;
+        obj2 = (COM_OBJECT *)List_Next(obj2);
     }
 
 #ifdef DEBUG_COMSERVER
@@ -1747,7 +1718,7 @@ void ComServer::GetClassObjectSlave(void *_map, LIST *ObjectsList,
 
         //
         // elevate using CoGetObject
-        // this is primarily inteded for the firewall object
+        // this is primarily intended for the firewall object
         //
 
         typedef struct tagBIND_OPTS3 {

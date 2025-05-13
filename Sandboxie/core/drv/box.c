@@ -55,7 +55,7 @@ _FX BOOLEAN Box_IsValidName(const WCHAR *name)
 {
     int i;
 
-    for (i = 0; i < BOXNAME_MAXLEN; ++i) {
+    for (i = 0; i < (BOXNAME_COUNT - 2); ++i) {
         if (! name[i])
             break;
         if (name[i] >= L'0' && name[i] <= L'9')
@@ -113,6 +113,8 @@ _FX void Box_Free(BOX *box)
             Mem_Free(box->expand_args, sizeof(CONF_EXPAND_ARGS));
         if (box->file_path)
             Mem_Free(box->file_path, box->file_path_len);
+        if (box->file_raw_path)
+            Mem_Free(box->file_raw_path, box->file_raw_path_len);
         if (box->key_path)
             Mem_Free(box->key_path, box->key_path_len);
         if (box->ipc_path)
@@ -333,7 +335,7 @@ _FX BOOLEAN Box_InitPaths(POOL *pool, BOX *box)
     }
 
     // sometimes we get here without a user temp var being set.  Check first to avoid an error popup.
-    swprintf(KeyPath, L"\\REGISTRY\\USER\\%.184s\\Environment", box->sid);
+    RtlStringCbPrintfW(KeyPath, sizeof(KeyPath), L"\\REGISTRY\\USER\\%.184s\\Environment", box->sid);
     if (DoesRegValueExist(RTL_REGISTRY_ABSOLUTE, KeyPath, L"temp"))
         Box_ExpandString(box, L"%temp%", L"", &box->user_temp_path, &box->user_temp_path_len);
 
@@ -526,6 +528,7 @@ _FX BOX *Box_Clone(POOL *pool, const BOX *model)
 
     CLONE_MEMBER(sid);
     CLONE_MEMBER(file_path);
+    CLONE_MEMBER(file_raw_path);
     CLONE_MEMBER(key_path);
     CLONE_MEMBER(ipc_path);
     CLONE_MEMBER(pipe_path);

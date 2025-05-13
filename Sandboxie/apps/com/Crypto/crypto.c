@@ -47,33 +47,7 @@ const WCHAR *ServiceTitle = SANDBOXIE L" Crypto";
 
 
 static ULONG_PTR __sys_DuplicateHandle                          = 0;
-
-
-//---------------------------------------------------------------------------
-// my_CreateFileMapping
-//---------------------------------------------------------------------------
-
-
-HANDLE my_CreateFileMappingW(
-    HANDLE hFile,
-    LPSECURITY_ATTRIBUTES lpAttributes,
-    DWORD flProtect,
-    DWORD dwMaximumSizeHigh,
-    DWORD dwMaximumSizeLow,
-    LPCWSTR lpName)
-{
-    typedef HANDLE (__stdcall *P_CreateFileMappingW)(
-        HANDLE hFile,
-        LPSECURITY_ATTRIBUTES lpAttributes,
-        DWORD flProtect,
-        DWORD dwMaximumSizeHigh,
-        DWORD dwMaximumSizeLow,
-        LPCWSTR lpName);
-
-    return ((P_CreateFileMappingW)__sys_CreateFileMappingW)(
-        hFile, lpAttributes, flProtect,
-        dwMaximumSizeHigh, dwMaximumSizeLow, lpName);
-}
+static ULONG_PTR __sys_CreateFileW                              = 0;
 
 
 //---------------------------------------------------------------------------
@@ -107,7 +81,7 @@ ALIGNED BOOL my_DuplicateHandle(
     if ((! ok) && GetLastError() == ERROR_ACCESS_DENIED) {
 
         //
-        // the client process for the CryptSvc service is ocassionally
+        // the client process for the CryptSvc service is occasionally
         // running under LocalSystem (typically during MSI installations).
         // CryptSvc tries to duplicate an event handle and fails so
         // we fake successful operation.
@@ -125,6 +99,59 @@ ALIGNED BOOL my_DuplicateHandle(
     return ok;
 }
 
+
+//---------------------------------------------------------------------------
+// my_CreateFileW
+//---------------------------------------------------------------------------
+
+ALIGNED HANDLE my_CreateFileW(
+    LPCWSTR               lpFileName,
+    DWORD                 dwDesiredAccess,
+    DWORD                 dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD                 dwCreationDisposition,
+    DWORD                 dwFlagsAndAttributes,
+    HANDLE                hTemplateFile)
+{
+    typedef HANDLE(*P_CreateFileW)(
+        LPCWSTR               lpFileName,
+        DWORD                 dwDesiredAccess,
+        DWORD                 dwShareMode,
+        LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+        DWORD                 dwCreationDisposition,
+        DWORD                 dwFlagsAndAttributes,
+        HANDLE                hTemplateFile);
+
+    //
+    // prevent SandboxieCrypto.exe from causing SBIE1313,
+    // don't even try to access to the device block for raw reading
+    //
+
+    if (wcsnicmp(lpFileName, L"\\\\.\\PhysicalDrive", 17) == 0 && wcschr(lpFileName + 17, L'\\') == NULL) {
+        if (dwDesiredAccess == GENERIC_READ)
+            dwDesiredAccess = 0;
+    }
+
+    //
+    // issue #561 Sandbox with some apps directly uses catdb than blocks access to it
+    // to prevent our instance form locking the real file we request write access
+    // that forces the file to be migrated and our sandboxed copy opened
+    //
+    
+    WCHAR* CatRoot = wcsstr(lpFileName, L"\\system32\\CatRoot2\\");
+    if (CatRoot) { // L"C:\\WINDOWS\\system32\\CatRoot2\\{00000000-0000-0000-0000-000000000000}\\catdb"
+        WCHAR win_dir[MAX_PATH + 64];
+        GetWindowsDirectory(win_dir, MAX_PATH);
+        if (wcsnicmp(win_dir, lpFileName, CatRoot - lpFileName) == 0) {
+            if (dwDesiredAccess == GENERIC_READ)
+                dwDesiredAccess |= GENERIC_WRITE;
+        }
+    }
+
+
+    return ((P_CreateFileW)__sys_CreateFileW)(lpFileName, dwDesiredAccess, dwShareMode,
+        lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+}
 
 //---------------------------------------------------------------------------
 // WinMain
@@ -148,9 +175,11 @@ int __stdcall WinMain(
         return STATUS_LICENSE_QUOTA_EXCEEDED;
     }
 
-    SetupExceptionHandler();
+    Check_Windows_7();
 
     HOOK_WIN32(DuplicateHandle);
+
+    HOOK_WIN32(CreateFileW);
 
     // hook privilege-related functions
     if (! Hook_Privilege())
@@ -165,7 +194,7 @@ int __stdcall WinMain(
     if (!myData) {
         return FALSE;
     }
-    HOOK_WIN32(SetServiceStatus);
+	__sys_SetServiceStatus = Scm_HookSetServiceStatus(my_SetServiceStatus);
     myData->tid = 0;
     myData->initFlag = 0;
 

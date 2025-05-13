@@ -1,6 +1,6 @@
 /*
  * Copyright 2004-2020 Sandboxie Holdings, LLC 
- * Copyright 2020 David Xanatos, xanasoft.com
+ * Copyright 2020-2024 David Xanatos, xanasoft.com
  *
  * This program is free software: you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -79,7 +79,7 @@ typedef struct _MOUNTMGR_VOLUME_PATHS {
 //---------------------------------------------------------------------------
 
 
-static void File_InitPathList(void);
+//static void File_InitPathList(void);
 
 static BOOLEAN File_InitDrives(ULONG DriveMask);
 
@@ -106,8 +106,6 @@ static WCHAR *File_AllocAndInitEnvironment_2(
 static void File_AdjustDrives(
     ULONG path_drive_index, BOOLEAN subst, const WCHAR *path);
 
-static void File_InitSnapshots(void);
-
 
 //---------------------------------------------------------------------------
 // Variables
@@ -129,9 +127,12 @@ static const WCHAR *File_DeviceMap_EnvVar   = ENV_VAR_PFX L"DEVICE_MAP";
 
 _FX BOOLEAN File_Init(void)
 {
+    HMODULE module = Dll_Ntdll;
+
     void *RtlGetFullPathName_UEx;
     void *GetTempPathW;
     void *NtQueryDirectoryFileEx = NULL;
+    void *NtQueryInformationByName = NULL;
     InitializeCriticalSection(&File_CurDir_CritSec);
 
     InitializeCriticalSection(&File_DirHandles_CritSec);
@@ -140,15 +141,74 @@ _FX BOOLEAN File_Init(void)
     File_ProxyPipes = Dll_Alloc(sizeof(ULONG) * 256);
     memzero(File_ProxyPipes, sizeof(ULONG) * 256);
 
-    File_InitPathList();
+    SbieDll_MatchPath(L'f', (const WCHAR *)-1); //File_InitPathList();
+
+    File_DriveAddSN = SbieApi_QueryConfBool(NULL, L"UseVolumeSerialNumbers", FALSE);
+
+    File_UseVolumeGuid = SbieApi_QueryConfBool(NULL, L"UseVolumeGuidWhenNoLetter", FALSE);
 
     if (! File_InitDrives(0xFFFFFFFF))
         return FALSE;
 
+    File_Delete_v2 = SbieApi_QueryConfBool(NULL, L"UseFileDeleteV2", FALSE);
+    if (File_Delete_v2)
+        File_InitDelete_v2();
+
+    // this is here as it requirers file stuff to be set up
+    extern BOOLEAN Key_Delete_v2;
+    BOOLEAN Key_InitDelete_v2();
+    Key_Delete_v2 = SbieApi_QueryConfBool(NULL, L"UseRegDeleteV2", FALSE);
+    if (Key_Delete_v2)
+        Key_InitDelete_v2();
+
+    // this requirers key stuff to be set up
 	if (SbieApi_QueryConfBool(NULL, L"SeparateUserFolders", TRUE)) {
 		if (!File_InitUsers())
 			return FALSE;
 	}
+
+    if (Dll_OsBuild >= 6000) {
+
+        void *GetFinalPathNameByHandleW =
+            GetProcAddress(Dll_KernelBase ? Dll_KernelBase : Dll_Kernel32,
+                "GetFinalPathNameByHandleW");
+        if (GetFinalPathNameByHandleW) {
+            SBIEDLL_HOOK(File_,GetFinalPathNameByHandleW);
+        }
+    }
+
+    
+    Dll_BoxFileDosPath = Dll_Alloc((Dll_BoxFilePathLen + 1) * sizeof(WCHAR));
+    wcscpy((WCHAR *)Dll_BoxFileDosPath, Dll_BoxFilePath);
+    if (!SbieDll_TranslateNtToDosPath((WCHAR *)Dll_BoxFileDosPath) /*|| _wcsnicmp(Dll_BoxFileDosPath, L"\\\\.\\", 4) == 0*/)
+    {
+        Dll_Free((WCHAR *)Dll_BoxFileDosPath);
+        Dll_BoxFileDosPath = NULL;
+
+        //
+        // the root is redirected with a reparse point and the target device does not have a drvie letter
+        // implement workaround, see SbieDll_TranslateNtToDosPath
+        //
+
+        ULONG BoxFileRawPathLen;
+        if (NT_SUCCESS(SbieApi_QueryProcessInfoStr(0, 'root', NULL, &BoxFileRawPathLen))) 
+        {
+            Dll_BoxFileRawPath = Dll_AllocTemp(BoxFileRawPathLen);
+            if (NT_SUCCESS(SbieApi_QueryProcessInfoStr(0, 'root', (WCHAR*)Dll_BoxFileRawPath, &BoxFileRawPathLen))) 
+            {
+                Dll_BoxFileRawPathLen = wcslen(Dll_BoxFileRawPath);
+
+                Dll_BoxFileDosPath = Dll_Alloc(BoxFileRawPathLen);
+                wcscpy((WCHAR*)Dll_BoxFileDosPath, Dll_BoxFileRawPath);
+                if (!SbieDll_TranslateNtToDosPath((WCHAR*)Dll_BoxFileDosPath)) {
+                    Dll_Free((WCHAR *)Dll_BoxFileDosPath);
+                    Dll_BoxFileDosPath = NULL;
+                }
+            }
+        }
+    }
+    if(Dll_BoxFileDosPath)
+        Dll_BoxFileDosPathLen = wcslen(Dll_BoxFileDosPath);
 
 	File_InitSnapshots();
 
@@ -169,6 +229,13 @@ _FX BOOLEAN File_Init(void)
     SBIEDLL_HOOK(File_,NtOpenFile);
     SBIEDLL_HOOK(File_,NtQueryAttributesFile);
     SBIEDLL_HOOK(File_,NtQueryFullAttributesFile);
+
+    NtQueryInformationByName = GetProcAddress(Dll_Ntdll, "NtQueryInformationByName");
+    if (NtQueryInformationByName) {
+
+        SBIEDLL_HOOK(File_, NtQueryInformationByName);
+    }
+
     SBIEDLL_HOOK(File_,NtQueryInformationFile);
     SBIEDLL_HOOK(File_,NtQueryDirectoryFile);
     SBIEDLL_HOOK(File_,NtSetInformationFile);
@@ -180,6 +247,7 @@ _FX BOOLEAN File_Init(void)
     SBIEDLL_HOOK(File_,NtWriteFile);
     SBIEDLL_HOOK(File_,NtFsControlFile);
 
+    if (!Dll_CompartmentMode) // else ping does not work
     if (File_IsBlockedNetParam(NULL)) {
         SBIEDLL_HOOK(File_,NtDeviceIoControlFile);
     }
@@ -214,16 +282,6 @@ _FX BOOLEAN File_Init(void)
         }
     }
 
-    if (Dll_OsBuild >= 6000) {
-
-        void *GetFinalPathNameByHandleW =
-            GetProcAddress(Dll_KernelBase ? Dll_KernelBase : Dll_Kernel32,
-                "GetFinalPathNameByHandleW");
-        if (GetFinalPathNameByHandleW) {
-            SBIEDLL_HOOK(File_,GetFinalPathNameByHandleW);
-        }
-    }
-
     if (Dll_OsBuild >= 8400 && Dll_IsSystemSid) {
         // see File_GetTempPathW in file file_misc.c
         GetTempPathW = GetProcAddress(Dll_KernelBase, "GetTempPathW");
@@ -232,28 +290,20 @@ _FX BOOLEAN File_Init(void)
         }
     }
 
+    // $Workaround$ - 3rd party fix
     //
     // support for Google Chrome flash plugin process
     //
+    // $Workaround$ - 3rd party fix
+    //void *GetVolumeInformationW =
+    //    GetProcAddress(Dll_KernelBase ? Dll_KernelBase : Dll_Kernel32,
+    //        "GetVolumeInformationW");
+    //SBIEDLL_HOOK(File_,GetVolumeInformationW);
 
-    if (Dll_ChromeSandbox) {
-
-        void *GetVolumeInformationW =
-            GetProcAddress(Dll_KernelBase ? Dll_KernelBase : Dll_Kernel32,
-                "GetVolumeInformationW");
-
-        SBIEDLL_HOOK(File_,GetVolumeInformationW);
-    }
-
-
-    if (Dll_ImageType == DLL_IMAGE_MOZILLA_FIREFOX)
-    {
-        void *WriteProcessMemory =
-            GetProcAddress(Dll_KernelBase ? Dll_KernelBase : Dll_Kernel32,
-                "WriteProcessMemory");
-
-        SBIEDLL_HOOK(File_, WriteProcessMemory);
-    }
+    void* WriteProcessMemory =
+        GetProcAddress(Dll_KernelBase ? Dll_KernelBase : Dll_Kernel32,
+            "WriteProcessMemory");
+    SBIEDLL_HOOK(File_, WriteProcessMemory);
 
     return TRUE;
 }
@@ -275,38 +325,96 @@ _FX BOOLEAN File_IsBlockedNetParam(const WCHAR *BoxName)
 //---------------------------------------------------------------------------
 
 
-_FX void File_InitPathList(void)
-{
-    OBJECT_ATTRIBUTES objattrs;
-    UNICODE_STRING objname;
-    IO_STATUS_BLOCK MyIoStatusBlock;
-    HANDLE handle;
-    WCHAR *path;
+//_FX void File_InitPathList(void)
+//{
+//    OBJECT_ATTRIBUTES objattrs;
+//    UNICODE_STRING objname;
+//    IO_STATUS_BLOCK MyIoStatusBlock;
+//    HANDLE handle;
+//    WCHAR *buf, *ptr;
+//
+//    RtlInitUnicodeString(&objname, L"\\SystemRoot");
+//    InitializeObjectAttributes(
+//        &objattrs, &objname, OBJ_CASE_INSENSITIVE, NULL, NULL);
+//    handle = 0;
+//    NtOpenFile(&handle, FILE_READ_DATA, &objattrs,
+//               &MyIoStatusBlock, FILE_SHARE_VALID_FLAGS, 0);
+//
+//    //
+//
+//    const ULONG PATH_BUF_LEN = 1024;
+//    buf = Dll_AllocTemp(PATH_BUF_LEN);
+//
+//    if (NT_SUCCESS(File_GetFileName(handle, PATH_BUF_LEN, buf)) && (ptr = wcsrchr(buf, L'\\')) != NULL) 
+//        ptr[1] = L'\0'; // strip the folder name
+//    else // fallback
+//        wcscpy(buf, L"\\??\\C:\\");
+//
+//    File_SysVolumeLen = wcslen(buf);
+//    File_SysVolume =
+//        Dll_Alloc((File_SysVolumeLen + 1) * sizeof(WCHAR));
+//    wcscpy(File_SysVolume, buf);
+//
+//    Dll_Free(buf);
+//
+//    //
+//
+//    if (handle)
+//        NtClose(handle);
+//
+//    SbieDll_MatchPath(L'f', (const WCHAR *)-1);
+//}
 
-    RtlInitUnicodeString(&objname, L"\\SystemRoot");
+
+//---------------------------------------------------------------------------
+// File_GetVolumeSN
+//---------------------------------------------------------------------------
+
+
+_FX ULONG File_GetVolumeSN(const FILE_DRIVE *drive)
+{
+    ULONG sn = 0;
+    HANDLE handle;
+    IO_STATUS_BLOCK iosb;
+
+    UNICODE_STRING objname;
+    objname.Buffer = Dll_Alloc((drive->len + 4) * sizeof(WCHAR));
+    wmemcpy(objname.Buffer, drive->path, drive->len);
+    objname.Buffer[drive->len    ] = L'\\';
+    objname.Buffer[drive->len + 1] = L'\0';
+    
+    objname.Length = (USHORT)(drive->len + 1) * sizeof(WCHAR);
+    objname.MaximumLength = objname.Length + sizeof(WCHAR);
+
+    OBJECT_ATTRIBUTES objattrs;
     InitializeObjectAttributes(
         &objattrs, &objname, OBJ_CASE_INSENSITIVE, NULL, NULL);
-    handle = 0;
-    NtOpenFile(&handle, FILE_READ_DATA, &objattrs,
-               &MyIoStatusBlock, FILE_SHARE_VALID_FLAGS, 0);
-    if (handle)
+    
+    ULONG OldMode;
+    RtlSetThreadErrorMode(0x10u, &OldMode);
+    NTSTATUS status = NtCreateFile(
+        &handle, GENERIC_READ | SYNCHRONIZE, &objattrs,
+        &iosb, NULL, 0, FILE_SHARE_VALID_FLAGS,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        NULL, 0);
+    RtlSetThreadErrorMode(OldMode, 0i64);
+
+    Dll_Free(objname.Buffer);
+
+    if (NT_SUCCESS(status))
+    {
+        union {
+            FILE_FS_VOLUME_INFORMATION volumeInfo;
+            BYTE volumeInfoBuff[64];
+        } u;
+        if (NT_SUCCESS(NtQueryVolumeInformationFile(handle, &iosb, &u.volumeInfo, sizeof(u), FileFsVolumeInformation)))
+            sn = u.volumeInfo.VolumeSerialNumber;
+
         NtClose(handle);
-
-    SbieDll_MatchPath(L'f', (const WCHAR *)-1);
-
-    //
-    // query Sandboxie home folder to prevent ClosedFilePath
-    //
-
-    path = Dll_AllocTemp(1024 * sizeof(WCHAR));
-    SbieApi_GetHomePath(path, 1020, NULL, 0);
-    if (path[0]) {
-        File_HomeNtPathLen = wcslen(path);
-        File_HomeNtPath =
-            Dll_Alloc((File_HomeNtPathLen + 1) * sizeof(WCHAR));
-        wmemcpy(File_HomeNtPath, path, File_HomeNtPathLen + 1);
     }
-    Dll_Free(path);
+
+    return sn;
 }
 
 
@@ -327,6 +435,7 @@ _FX BOOLEAN File_InitDrives(ULONG DriveMask)
     ULONG file_drive_len;
     ULONG drive;
     ULONG path_len;
+    //ULONG drive_count;
     WCHAR *path;
     WCHAR error_str[16];
     BOOLEAN CallInitLinks;
@@ -356,6 +465,9 @@ _FX BOOLEAN File_InitDrives(ULONG DriveMask)
         File_TempLinks = Dll_Alloc(sizeof(LIST));
         List_Init(File_TempLinks);
 
+        File_GuidLinks = Dll_Alloc(sizeof(LIST));
+        List_Init(File_GuidLinks);
+
         CallInitLinks = TRUE;
 
     } else
@@ -375,6 +487,8 @@ _FX BOOLEAN File_InitDrives(ULONG DriveMask)
 
     InitializeObjectAttributes(
         &objattrs, &objname, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    //drive_count = 0;
 
     for (drive = 0; drive < 26; ++drive) {
 
@@ -436,22 +550,23 @@ _FX BOOLEAN File_InitDrives(ULONG DriveMask)
         status = NtOpenSymbolicLinkObject(
             &handle, SYMBOLIC_LINK_QUERY, &objattrs);
 
-        if (status == STATUS_ACCESS_DENIED) {
+        if (!NT_SUCCESS(status)) {
 
             //
             // if the object is a valid symbolic link but we don't have
-            // acccess rights to open the symbolic link then we ask the
+            // access rights to open the symbolic link then we ask the
             // driver to query the link for us
             //
 
             WCHAR *path2 = Dll_AllocTemp(1024 * sizeof(WCHAR));
             wcscpy(path2, path);
 
-            status = SbieApi_QuerySymbolicLink(path2, 1024 * sizeof(WCHAR));
-            if (NT_SUCCESS(status)) {
+            NTSTATUS status2 = SbieApi_QuerySymbolicLink(path2, 1024 * sizeof(WCHAR));
+            if (NT_SUCCESS(status2)) {
 
                 Dll_Free(path);
                 path = path2;
+                status = status2;
 
                 objname.Length = (USHORT)(wcslen(path) * sizeof(WCHAR));
                 objname.MaximumLength = objname.Length + sizeof(WCHAR);
@@ -463,7 +578,6 @@ _FX BOOLEAN File_InitDrives(ULONG DriveMask)
             } else {
 
                 Dll_Free(path2);
-                status = STATUS_ACCESS_DENIED;
             }
         }
 
@@ -559,8 +673,15 @@ _FX BOOLEAN File_InitDrives(ULONG DriveMask)
                 file_drive->subst = subst;
                 file_drive->len = path_len;
                 wcscpy(file_drive->path, path);
+                *file_drive->sn = 0;
+                if (File_DriveAddSN) {
+                    ULONG sn = File_GetVolumeSN(file_drive);
+                    if(sn != 0)
+                        Sbie_snwprintf(file_drive->sn, 10, L"%04X-%04X", HIWORD(sn), LOWORD(sn));
+                }
 
                 File_Drives[drive] = file_drive;
+                //drive_count++;
 
                 SbieApi_MonitorPut(MONITOR_DRIVE, path);
             }
@@ -581,6 +702,11 @@ _FX BOOLEAN File_InitDrives(ULONG DriveMask)
             SbieApi_Log(2307, error_str);
         }
     }
+
+    //if (drive_count == 0) {
+    //    Sbie_snwprintf(error_str, 16, L"No Drives Found");
+    //    SbieApi_Log(2307, error_str);
+    //}
 
     //
     // initialize list of volumes mounted to directories rather than drives
@@ -621,16 +747,23 @@ _FX void File_InitLinks(THREAD_DATA *TlsData)
     MOUNTMGR_VOLUME_PATHS *Output2;
     ULONG index1;
     WCHAR save_char;
+    FILE_GUID* guid;
+    ULONG alloc_len;
+    WCHAR text[256];
 
     //
-    // IOCTL_MOUNTMGR_QUERY_DOS_VOLUME_PATHS is only available on Windows XP
-    // (and later) where GetVolumePathNamesForVolumeName is also available
+    // cleanup old guid entries
     //
 
-    if (! GetProcAddress(Dll_Kernel32, "GetVolumePathNamesForVolumeNameW")) {
-        File_Windows2000 = TRUE;
-        return;
+    EnterCriticalSection(File_DrivesAndLinks_CritSec);
+    guid = List_Head(File_GuidLinks);
+    while (guid) {
+        FILE_LINK *next_guid = List_Next(guid);
+        List_Remove(File_GuidLinks, guid);
+        Dll_Free(guid);
+        guid = next_guid;
     }
+    LeaveCriticalSection(File_DrivesAndLinks_CritSec);
 
     //
     // open mount point manager device
@@ -686,10 +819,29 @@ _FX void File_InitLinks(THREAD_DATA *TlsData)
         ULONG VolumeNameLen =
             MountPoint->SymbolicLinkNameLength / sizeof(WCHAR);
 
+        Sbie_snwprintf(text, 256, L"Found Mountpoint: %.*s <-> %.*s", VolumeNameLen, VolumeName, DeviceNameLen, DeviceName);
+        SbieApi_MonitorPut2(MONITOR_DRIVE | MONITOR_TRACE, text, FALSE);
+
         if (VolumeNameLen != 48 && VolumeNameLen != 49)
             continue;
         if (_wcsnicmp(VolumeName, L"\\??\\Volume{", 11) != 0)
             continue;
+
+        //
+        // store guid to nt device association
+        //
+
+        alloc_len = sizeof(FILE_GUID)
+              + (VolumeNameLen + 1) * sizeof(WCHAR);
+        guid = Dll_Alloc(alloc_len);
+        wmemcpy(guid->guid, &VolumeName[10], 38);
+        guid->guid[38] = 0;
+        guid->len = DeviceNameLen;
+        wmemcpy(guid->path, DeviceName, DeviceNameLen);
+        guid->path[DeviceNameLen] = 0;
+        EnterCriticalSection(File_DrivesAndLinks_CritSec);
+        List_Insert_Before(File_GuidLinks, NULL, guid);
+        LeaveCriticalSection(File_DrivesAndLinks_CritSec);
 
         //
         // get all the DOS paths where the volume is mounted
@@ -715,7 +867,7 @@ _FX void File_InitLinks(THREAD_DATA *TlsData)
         save_char = DeviceName[DeviceNameLen];
         DeviceName[DeviceNameLen] = L'\0';
 
-        if (Output2->MultiSzLength) {
+        if (Output2->MultiSzLength && *Output2->MultiSz) {
 
             WCHAR *DosPath = Output2->MultiSz;
             ULONG DosPathLen = wcslen(DosPath);
@@ -731,10 +883,35 @@ _FX void File_InitLinks(THREAD_DATA *TlsData)
 
                 DosPath += DosPathLen + 1;
                 while (*DosPath) {
+                    Sbie_snwprintf(text, 256, L"Mountpoint AddLink: %s <-> %s", DosPath, DeviceName);
+                    SbieApi_MonitorPut2(MONITOR_DRIVE | MONITOR_TRACE, text, FALSE);
                     File_AddLink(TRUE, DosPath, DeviceName);
                     DosPath += wcslen(DosPath) + 1;
                 }
 
+			} else if (File_UseVolumeGuid) {
+
+                // handle the case where the volume is not mounted as a
+                // drive letter:
+                //     add reparse points for all mounted directories
+
+                //
+                // This behaviour creates \[BoxRoot]\drive\{guid} folders
+                // instead of using the first mount point on a volume with a letter
+                //
+
+                WCHAR *FirstDosPath = DosPath;
+                Sbie_snwprintf(text, 256, L"Mountpoint AddLink: %s <-> %s", FirstDosPath, DeviceName);
+                SbieApi_MonitorPut2(MONITOR_DRIVE | MONITOR_TRACE, text, FALSE);
+                File_AddLink(TRUE, FirstDosPath, DeviceName);
+                DosPath += DosPathLen + 1;
+                while (*DosPath) {
+                    Sbie_snwprintf(text, 256, L"Mountpoint AddLink: %s <-> %s", DosPath, DeviceName);
+                    SbieApi_MonitorPut2(MONITOR_DRIVE | MONITOR_TRACE, text, FALSE);
+                    File_AddLink(TRUE, DosPath, DeviceName);
+                    DosPath += wcslen(DosPath) + 1;
+                }
+				
             } else {
 
                 //
@@ -746,10 +923,20 @@ _FX void File_InitLinks(THREAD_DATA *TlsData)
                 //     also to the first mounted directory
                 //
 
+                //
+                // Note: this behaviour makes the first mounted directory
+                // the location in the box where all files for that volume will be located
+                // other mount points will be redirected to this folder
+                //
+
                 WCHAR *FirstDosPath = DosPath;
+                Sbie_snwprintf(text, 256, L"Mountpoint AddLink: %s <-> %s", DeviceName, FirstDosPath);
+                SbieApi_MonitorPut2(MONITOR_DRIVE | MONITOR_TRACE, text, FALSE);
                 File_AddLink(TRUE, DeviceName, FirstDosPath);
                 DosPath += DosPathLen + 1;
                 while (*DosPath) {
+                    Sbie_snwprintf(text, 256, L"Mountpoint AddLink: %s <-> %s", DosPath, FirstDosPath);
+                    SbieApi_MonitorPut2(MONITOR_DRIVE | MONITOR_TRACE, text, FALSE);
                     File_AddLink(TRUE, DosPath, FirstDosPath);
                     DosPath += wcslen(DosPath) + 1;
                 }
@@ -891,6 +1078,15 @@ _FX void File_InitWow64(void)
             path[wcslen(path) - 1] = L'\0';
         wcscat(path, L"\\System32");
     }
+
+    path32 = Dll_Alloc((7 + wcslen(path) + 1) * sizeof(WCHAR));
+
+    wcscpy(path32, L"\\drive\\");
+    path32[7] = path[0]; // drive letter
+    wcscpy(&path32[8], &path[2]); // skip :
+
+    File_Wow64System32 = path32;
+    File_Wow64System32Len = wcslen(path32);
 
     path32 = File_TranslateDosToNtPath(path);
     if (path32) {
@@ -1488,14 +1684,29 @@ _FX WCHAR *File_AllocAndInitEnvironment_2(
 
 
 //---------------------------------------------------------------------------
-// File_TranslateDosToNtPath
+// File_ConcatPath2
 //---------------------------------------------------------------------------
 
 
-_FX WCHAR *File_TranslateDosToNtPath(const WCHAR *DosPath)
+_FX WCHAR *File_ConcatPath2(const WCHAR *Path1, ULONG Path1Len, const WCHAR *Path2, ULONG Path2Len)
+{
+    ULONG Length = Path1Len + Path2Len;
+    WCHAR* Path = Dll_Alloc((Length + 1) * sizeof(WCHAR));
+    wmemcpy(Path, Path1, Path1Len);
+    wmemcpy(Path + Path1Len, Path2, Path2Len);
+    Path[Length] = L'\0';
+    return Path;
+}
+
+
+//---------------------------------------------------------------------------
+// File_TranslateDosToNtPath2
+//---------------------------------------------------------------------------
+
+
+_FX WCHAR *File_TranslateDosToNtPath2(const WCHAR *DosPath, ULONG DosPathLen)
 {
     WCHAR *NtPath = NULL;
-    ULONG len_dos;
 
     if (DosPath && DosPath[0] && DosPath[1]) {
 
@@ -1505,11 +1716,7 @@ _FX WCHAR *File_TranslateDosToNtPath(const WCHAR *DosPath)
             // network path
             //
 
-            DosPath += 2;
-            len_dos = wcslen(DosPath) + 1;
-            NtPath = Dll_Alloc((File_MupLen + len_dos) * sizeof(WCHAR));
-            wmemcpy(NtPath, File_Mup, File_MupLen);
-            wmemcpy(NtPath + File_MupLen, DosPath, len_dos);
+            NtPath = File_ConcatPath2(File_Mup, File_MupLen, DosPath + 2, DosPathLen - 2);
 
         } else if (DosPath[1] == L':' &&
                         (DosPath[2] == L'\\' || DosPath[2] == L'\0')) {
@@ -1521,11 +1728,7 @@ _FX WCHAR *File_TranslateDosToNtPath(const WCHAR *DosPath)
             FILE_DRIVE *drive = File_GetDriveForLetter(DosPath[0]);
             if (drive) {
 
-                DosPath += 2;
-                len_dos = wcslen(DosPath) + 1;
-                NtPath = Dll_Alloc((drive->len + len_dos) * sizeof(WCHAR));
-                wmemcpy(NtPath, drive->path, drive->len);
-                wmemcpy(NtPath + drive->len, DosPath, len_dos);
+                NtPath = File_ConcatPath2(drive->path, drive->len, DosPath + 2, DosPathLen - 2);
 
                 LeaveCriticalSection(File_DrivesAndLinks_CritSec);
             }
@@ -1533,6 +1736,17 @@ _FX WCHAR *File_TranslateDosToNtPath(const WCHAR *DosPath)
     }
 
     return NtPath;
+}
+
+
+//---------------------------------------------------------------------------
+// File_TranslateDosToNtPath
+//---------------------------------------------------------------------------
+
+
+_FX WCHAR *File_TranslateDosToNtPath(const WCHAR *DosPath)
+{
+    return File_TranslateDosToNtPath2(DosPath, DosPath ? wcslen(DosPath) : 0);
 }
 
 
@@ -1609,6 +1823,7 @@ _FX void File_GetSetDeviceMap(WCHAR *DeviceMap96)
                 NtCurrentProcess(), ProcessDeviceMap,
                 &info, sizeof(info.Set));
 
+#ifndef _WIN64
             if (status == STATUS_INFO_LENGTH_MISMATCH && Dll_IsWow64) {
 
                 //
@@ -1630,6 +1845,7 @@ _FX void File_GetSetDeviceMap(WCHAR *DeviceMap96)
                     Dll_Free(rpl);
                 }
             }
+#endif
 
             NtClose(info.Set.DirectoryHandle);
 
@@ -1691,58 +1907,4 @@ _FX void File_GetSetDeviceMap(WCHAR *DeviceMap96)
             }
         }
     }
-}
-
-
-//---------------------------------------------------------------------------
-// File_InitSnapshots
-//---------------------------------------------------------------------------
-
-// CRC
-#define CRC_WITH_ADLERTZUK64
-#include "common/crc.c"
-
-_FX void File_InitSnapshots(void)
-{
-	WCHAR ShapshotsIni[MAX_PATH] = { 0 };
-	wcscpy(ShapshotsIni, Dll_BoxFilePath);
-	wcscat(ShapshotsIni, L"\\Snapshots.ini");
-	SbieDll_TranslateNtToDosPath(ShapshotsIni);
-
-	WCHAR Shapshot[16] = { 0 };
-	GetPrivateProfileStringW(L"Current", L"Snapshot", L"", Shapshot, 16, ShapshotsIni);
-
-	if (*Shapshot == 0)
-		return; // not using snapshots
-
-	File_Snapshot = Dll_Alloc(sizeof(FILE_SNAPSHOT));
-	memzero(File_Snapshot, sizeof(FILE_SNAPSHOT));
-	wcscpy(File_Snapshot->ID, Shapshot);
-	File_Snapshot->IDlen = wcslen(Shapshot);
-	FILE_SNAPSHOT* Cur_Snapshot = File_Snapshot;
-	File_Snapshot_Count = 1;
-
-	for (;;)
-	{
-		Cur_Snapshot->ScramKey = CRC32(Cur_Snapshot->ID, Cur_Snapshot->IDlen * sizeof(WCHAR));
-
-		WCHAR ShapshotId[26] = L"Snapshot_";
-		wcscat(ShapshotId, Shapshot);
-		
-		//WCHAR ShapshotName[34] = { 0 };
-		//GetPrivateProfileStringW(ShapshotId, L"Name", L"", ShapshotName, 34, ShapshotsIni);
-		//wcscpy(Cur_Snapshot->Name, ShapshotName);
-
-		GetPrivateProfileStringW(ShapshotId, L"Parent", L"", Shapshot, 16, ShapshotsIni);
-
-		if (*Shapshot == 0)
-			break; // no more snapshots
-
-		Cur_Snapshot->Parent = Dll_Alloc(sizeof(FILE_SNAPSHOT));
-		memzero(Cur_Snapshot->Parent, sizeof(FILE_SNAPSHOT));
-		wcscpy(Cur_Snapshot->Parent->ID, Shapshot);
-		Cur_Snapshot->Parent->IDlen = wcslen(Shapshot);
-		Cur_Snapshot = Cur_Snapshot->Parent;
-		File_Snapshot_Count++;
-	}
 }
